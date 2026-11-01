@@ -581,6 +581,7 @@ mod tests {
             clean_copies: 0,
             target: None,
             created_unix_ms: 0,
+            lifecycle: None,
             proposal_id: ProposalId::new("p").unwrap(),
         }
     }
@@ -1399,6 +1400,7 @@ mod tests {
             clean_copies: 0,
             target: None,
             created_unix_ms: 0,
+            lifecycle: None,
             proposal_id: ProposalId::new("p").unwrap(),
         };
         for shard in ShardRef::all(&document) {

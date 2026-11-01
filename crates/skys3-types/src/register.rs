@@ -29,6 +29,7 @@ use std::collections::BTreeSet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::{LifecycleConfiguration, LifecycleError};
 use crate::policy::trust::TrustPolicy;
 use crate::policy::{Policy, PolicyDocument};
 
@@ -158,6 +159,13 @@ pub enum InvalidRegister {
     /// A role has more policies than [`RoleDocument::MAX_POLICIES`].
     #[error("the role has {0} policies; at most {max} are allowed", max = RoleDocument::MAX_POLICIES)]
     TooManyPolicies(usize),
+    /// A bucket's lifecycle configuration breaks a rule.
+    #[error("invalid lifecycle configuration: {0}")]
+    Lifecycle(#[from] LifecycleError),
+    /// A bucket whose mode has no lifecycle configurations has one: only
+    /// `local` buckets do (§8.7).
+    #[error("a {0} bucket has no lifecycle configuration")]
+    LifecycleNotAllowed(BucketMode),
     /// A document defined outside this crate, such as an OIDC provider
     /// record, breaks one of its rules.
     #[error("{0}")]
@@ -451,6 +459,10 @@ pub struct BucketDocument {
     /// When the bucket was created, in milliseconds since the Unix epoch:
     /// the `CreationDate` that ListBuckets reports.
     pub created_unix_ms: u64,
+    /// The bucket's lifecycle configuration (§8.7), which only `local`
+    /// buckets may have. Written only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<LifecycleConfiguration>,
     /// The proposal ID of the write that stored this document.
     pub proposal_id: ProposalId,
 }
@@ -477,11 +489,18 @@ impl RegisterDocument for BucketDocument {
     fn validate(&self) -> Result<(), InvalidRegister> {
         self.replication().validate()?;
         match (&self.target, self.mode.has_target()) {
-            (None, true) => Err(InvalidRegister::TargetRequired(self.mode)),
-            (Some(_), false) => Err(InvalidRegister::TargetNotAllowed(self.mode)),
-            (Some(target), true) => target.validate(),
-            (None, false) => Ok(()),
+            (None, true) => return Err(InvalidRegister::TargetRequired(self.mode)),
+            (Some(_), false) => return Err(InvalidRegister::TargetNotAllowed(self.mode)),
+            (Some(target), true) => target.validate()?,
+            (None, false) => {}
         }
+        if let Some(lifecycle) = &self.lifecycle {
+            if self.mode != BucketMode::Local {
+                return Err(InvalidRegister::LifecycleNotAllowed(self.mode));
+            }
+            lifecycle.validate()?;
+        }
+        Ok(())
     }
 }
 

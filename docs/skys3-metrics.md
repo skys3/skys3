@@ -18,6 +18,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.5 Clean cache](#35-clean-cache)
   - [3.6 Segment compaction](#36-segment-compaction)
   - [3.7 Hot cache](#37-hot-cache)
+  - [3.8 Lifecycle](#38-lifecycle)
 
 ## 1. Scraping
 
@@ -171,3 +172,16 @@ in progress together.
 | `skys3_hot_cache_hits_total` | counter | none | exported (M2-19) | GETs this node's gateway served from its hot cache. |
 | `skys3_hot_cache_misses_total` | counter | none | exported (M2-19) | GETs this node's gateway looked up in its hot cache without finding the version their read plan names. |
 | `skys3_hot_cache_evictions_total` | counter | none | exported (M2-19) | Objects the hot cache dropped as least recently used. Versions a later one replaced are not counted. |
+
+### 3.8 Lifecycle
+
+Design section 8.7. Each node runs a lifecycle pass every
+`lifecycle_interval_seconds` over the `local` bucket shards it leads, and
+counts what the passes committed. A pass that stops early on a shard, for
+example because the primary stepped down, takes up the rest at the next
+interval.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_lifecycle_expired_total` | counter | none | exported (M5-10) | Object versions that lifecycle rules expired on this node's shard primaries: `DELETE`s its passes committed. |
+| `skys3_lifecycle_aborted_uploads_total` | counter | none | exported (M5-10) | Incomplete multipart uploads that lifecycle rules aborted on this node's shard primaries. |

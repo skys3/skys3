@@ -49,6 +49,7 @@ pub fn sessions_bucket() -> BucketDocument {
         clean_copies: 0,
         target: None,
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::from_u128(0),
     }
 }

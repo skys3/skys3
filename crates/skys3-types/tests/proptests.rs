@@ -140,6 +140,7 @@ fn bucket_document() -> impl Strategy<Value = BucketDocument> {
                     clean_copies: u8::try_from(clean.index(usize::from(replicas) + 1)).unwrap(),
                     target: mode.has_target().then_some(target),
                     created_unix_ms,
+                    lifecycle: None,
                     proposal_id,
                 }
             },

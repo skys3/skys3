@@ -35,6 +35,7 @@ fn bucket(b: u8, shards: u32) -> BucketDocument {
         clean_copies: 1,
         target: None,
         created_unix_ms: 1,
+        lifecycle: None,
         proposal_id: ProposalId::from_u128(u128::from(b)),
     }
 }

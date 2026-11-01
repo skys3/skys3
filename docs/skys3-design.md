@@ -1057,6 +1057,10 @@ Dead fragments are reclaimed by node-local compaction of fragment segments (sect
 
 Local buckets support lifecycle expiration rules and cleanup of abandoned multipart uploads. Each shard primary evaluates them over its index, and expirations commit as ordinary deletes.
 
+- **Where the rules live.** A bucket's lifecycle configuration is a field of its register, `buckets/<bucket-name>.json` (section 6.1), written by PutBucketLifecycleConfiguration with a CAS. Nodes learn of it with the rest of the register, and it survives a control-store rebuild in their local copies (section 6.2). Only `local` buckets take one: a `write_back` bucket's durable home is its remote, whose own rules apply there, and expiring only the local copy would be undone by an import (section 9.1), so it answers `501 NotImplemented`.
+- **Evaluation.** Every `lifecycle_interval_seconds` (default 3600), each node runs a pass over the shards it leads once they serve (section 6.6), so a new primary evaluates the rules only after it applied what its predecessors committed. A pass pages through the index and the open uploads. An object expires when an enabled rule matches it and its due time has passed: `Days` counts from `Last-Modified` and rounds up to the next midnight UTC, as S3 does, and `Date` is a midnight UTC. An upload is aborted `DaysAfterInitiation` days after it began, as an `MPU_ABORT`.
+- **Exactly once.** An expiration is a `DELETE` committed only if the key's entry still holds the version the pass read, so a write that races the pass wins, and a key whose version a previous primary already expired is skipped; its tombstone is then removed as a flushed one. Passes keep no state, so a primary change needs no hand-off: a `DELETE` the old primary appended but never committed is either rolled forward, and the new primary's next pass finds the version gone, or truncated (section 6.6), and that pass finds the version and expires it again.
+
 ### 8.8 Space and I/O
 
 For a large object of size `B` in a 4+2 geometry:
@@ -1344,6 +1348,12 @@ S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, a
 - Every object's owner is the bucket owner, as in a bucket-owner-enforced bucket; its ID is the cluster ID, since SkyS3 has no accounts. V1 returns it always, V2 only with `fetch-owner=true`. Objects report their storage class (`STANDARD` unless the remote reported another) and the algorithms of their stored checksums.
 - During the import of a `write_back` bucket, the listing must also merge the remote's (section 9.1); the import adds that.
 
+**Lifecycle configuration.** PutBucketLifecycleConfiguration, GetBucketLifecycleConfiguration, and DeleteBucketLifecycle behave as in S3 on `local` buckets (section 8.7), with these rules:
+
+- A rule may filter by `Prefix`, `Tag`, `ObjectSizeGreaterThan`, `ObjectSizeLessThan`, or an `And` of them, or by the legacy rule-level `Prefix`. Its actions are `Expiration` with `Days` or a `Date` at midnight UTC, and `AbortIncompleteMultipartUpload`, whose rule may filter by prefix only. A rule without an `ID` gets a random one. At most 1,000 rules, IDs of up to 255 characters, prefixes of up to 1,024 bytes, and 10 tags per filter. A malformed or contradictory configuration answers as S3 does (`400 MalformedXML`, `InvalidArgument`, `InvalidRequest`, or `InvalidTag`).
+- `Transition`, `NoncurrentVersionExpiration`, `NoncurrentVersionTransition`, and `ExpiredObjectDeleteMarker` set to true answer `501 NotImplemented`: SkyS3 has no storage classes and no local versions. A rule left without any action answers `400 InvalidRequest`.
+- The PUT requires `Content-MD5` or an `x-amz-checksum-*` value (`400 InvalidRequest`), as S3 does. A bucket without a configuration answers GET with `404 NoSuchLifecycleConfiguration`. A `write_back` bucket answers PUT with `501 NotImplemented`.
+
 **Rejected features.** Headers that ask for a rejected feature are refused on every operation, so object operations need no checks of their own. Each answer is the one S3 gives where it has one:
 
 | Request | Answer |
@@ -1485,6 +1495,7 @@ compaction_live_threshold = 0.5
 read_registration_ttl_seconds = 30
 read_registration_renew_interval_seconds = 10
 disk_min_free_bytes = 1073741824     # below this, writes get 503 SlowDown (section 13)
+lifecycle_interval_seconds = 3600    # how often shard primaries apply lifecycle rules (section 8.7)
 
 [cache]
 hot_cache_bytes_per_node = 1073741824     # held in memory (section 9.2)

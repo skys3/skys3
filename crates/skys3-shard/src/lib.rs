@@ -28,6 +28,10 @@
 //!   live ratio is low, copying what the index and the shard's members
 //!   still need, and evicting cold clean payload instead of copying it
 //!   (§10.3).
+//! - [`lifecycle`]: a `local` bucket's lifecycle rules, evaluated by each
+//!   shard primary over its index: expirations commit as ordinary
+//!   conditional deletes, and abandoned multipart uploads are aborted
+//!   (§8.7).
 //! - [`reads`]: read plans, which a primary answers a GET with, and the
 //!   read registrations of a node's replicas as holders of the bytes
 //!   (§8.7, §9.2), which pin payload against compaction while a gateway
@@ -71,6 +75,7 @@ mod error;
 mod flush_wait;
 mod leader;
 mod lease;
+pub mod lifecycle;
 pub mod lineage;
 mod machine;
 mod multipart;

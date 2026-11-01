@@ -95,9 +95,10 @@ use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
 pub use delete::MAX_DELETE_KEYS;
 use holders::{HolderReads, Keep};
+pub(crate) use tagging::tags_from_xml;
 pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
-pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
+pub(crate) use tagging::{parse_tagging_header, tagging_header};
 use upload::{Streaming, Upload};
 use write_through::WriteThrough;
 

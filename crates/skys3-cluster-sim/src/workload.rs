@@ -703,6 +703,7 @@ mod tests {
                 clean_copies: 1,
                 target: None,
                 created_unix_ms: 0,
+                lifecycle: None,
                 proposal_id: ProposalIds::seeded(1).next_id(),
             };
             let routes = Routes {

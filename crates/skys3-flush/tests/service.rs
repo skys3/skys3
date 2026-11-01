@@ -33,6 +33,7 @@ fn bucket(mode: BucketMode) -> BucketDocument {
             prefix: Some("team/".to_owned()),
         }),
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p-1").unwrap(),
     }
 }

@@ -23,6 +23,7 @@ use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallCloc
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
 use skys3_remote::aws::{AwsS3, default_credentials};
+use skys3_shard::lifecycle::{self, LifecycleMetrics};
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
     ReadSettings,
@@ -447,6 +448,28 @@ impl Shared {
         }
     }
 
+    /// Runs a lifecycle pass every `lifecycle_interval_seconds` over the
+    /// shards this node leads of each `local` bucket with lifecycle rules
+    /// (§8.7). Each pass starts from the shards' indexes, so a shard this
+    /// node took over is evaluated from what its log holds.
+    async fn follow_lifecycle(self: Arc<Self>, metrics: LifecycleMetrics) {
+        let interval = self.config.storage().lifecycle_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            let buckets = self.gateway.buckets();
+            let now = u64::try_from(self.wall.now().as_millis()).unwrap_or(u64::MAX);
+            let report = lifecycle::run_pass(self.shards.set(), &buckets, now, &metrics).await;
+            if report != lifecycle::LifecycleReport::default() {
+                tracing::debug!(
+                    expired = report.expired,
+                    aborted = report.aborted,
+                    failed = report.failed,
+                    "ran a lifecycle pass"
+                );
+            }
+        }
+    }
+
     /// Removes expired sessions every [`SESSION_SWEEP_INTERVAL`].
     async fn sweep_sessions(self: Arc<Self>, sessions: Sessions) {
         loop {
@@ -753,9 +776,10 @@ struct Opened {
 /// 6. Serve the gateway (HTTPS when `[gateway]` names a certificate) and
 ///    the admin listener, and start the background work: checkpoints,
 ///    control-store polling, session expiry, disk fencing, free-space
-///    checks, and the flushers of `write_back` buckets, which track their
+///    checks, the flushers of `write_back` buckets, which track their
 ///    dirty keys at once and flush them once each target's probe succeeds
-///    (`skys3_flush`).
+///    (`skys3_flush`), and the lifecycle passes of `local` buckets
+///    (`skys3_shard::lifecycle`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
 /// stops the flushers, stops every shard once its sequenced records are
@@ -938,6 +962,8 @@ impl Node {
             },
             CompactionMetrics::register(&metrics.registry),
         );
+        // Lifecycle passes (§8.7) on the shards this node leads.
+        let lifecycle_metrics = LifecycleMetrics::register(&metrics.registry);
         let space = Arc::new(
             DiskSpace::new(config.storage().disk_min_free_bytes).with_cache(cache.clone()),
         );
@@ -1091,6 +1117,7 @@ impl Node {
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
+        background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
         {
             // The policies go in before the cache scans the replicas open
