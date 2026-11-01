@@ -6,17 +6,20 @@ use std::fmt;
 
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
+use skys3_config::ConflictPolicy;
 use skys3_index::{Entry, EntryState, ObjectVersion, Payload};
 use skys3_io::Disk;
-use skys3_log::record::{Metadata, TagSet};
+use skys3_log::RecordBody;
+use skys3_log::record::{Adopt, Metadata, TagSet};
 use skys3_remote::probe::ConditionalOperation;
 use skys3_remote::{
     CompleteMultipartUpload, DeleteObject, HeadObject, ObjectInfo, ObjectStore, PutObject, S3Error,
     S3ErrorKind, UserMetadata, WriteOutput, WritePrecondition,
 };
-use skys3_shard::Shard;
+use skys3_shard::{Outcome as Applied, Shard};
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
+use crate::import::loaded_metadata;
 use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
@@ -67,6 +70,12 @@ pub(crate) enum Outcome {
     Settled,
     /// The remote changed out of band.
     Conflict(Conflict),
+    /// The `discard_local` policy dropped the version for the remote's
+    /// out-of-band write, which an `ADOPT` made the key's version (§7.2).
+    Discarded {
+        /// The version dropped.
+        version: EpochSeq,
+    },
     /// A retryable failure: back off and try again.
     Retry(String),
 }
@@ -102,6 +111,11 @@ pub(crate) struct Attempt<'a, S, D: Disk> {
     pub(crate) key: &'a str,
     /// The streams of the shard's uploads (§7.3).
     pub(crate) streams: &'a Streams,
+    /// How the key's conflict was resolved, if it was in one (§7.2):
+    /// `overwrite` sends the version unconditionally, `discard_local`
+    /// adopts the remote's write if it is still there, and `hold` flushes
+    /// as usual.
+    pub(crate) resolution: Option<ConflictPolicy>,
 }
 
 impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
@@ -122,6 +136,13 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         {
             return Outcome::Settled;
         }
+        if self.resolution == Some(ConflictPolicy::DiscardLocal) {
+            match self.discard(&entry).await {
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                Err(error) => return Outcome::Retry(error.to_string()),
+            }
+        }
         let known = match pending {
             Some(remote) => remote.etag.clone(),
             None => entry.remote_etag.clone(),
@@ -137,8 +158,52 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         format!("{}{}", self.target.prefix, self.key)
     }
 
+    /// Whether `operation` is sent with its precondition: the target
+    /// honors it, and the key's conflict was not resolved by overwriting
+    /// the remote's write (§7.2).
     fn protected(&self, operation: ConditionalOperation) -> bool {
-        self.target.writes.operation(operation).is_protected()
+        self.resolution != Some(ConflictPolicy::Overwrite)
+            && self.target.writes.operation(operation).is_protected()
+    }
+
+    /// Resolves the key's conflict under `discard_local` (§7.2): HEADs the
+    /// key and, if it still holds a write SkyS3 did not make, commits an
+    /// `ADOPT` of that write naming `entry`'s version, which drops the
+    /// version, an acknowledged write. Returns `None` if the remote holds
+    /// no such write any more: there is nothing to adopt, and the version
+    /// is flushed as any other.
+    async fn discard(&self, entry: &Entry) -> Result<Option<Outcome>, Failure> {
+        let version = entry.version;
+        let written = entry.object.as_ref().and_then(|o| o.write_identity);
+        let identity = self
+            .target
+            .identity(self.shard.shard(), written.unwrap_or(version));
+        let info = match self.inspect(&identity, version, None).await? {
+            Found::Foreign(info) => info,
+            Found::Mine(info) => return Ok(Some(flushed(version, Some(info), true))),
+            Found::Missing | Found::Supersede(_) => return Ok(None),
+        };
+        let last_modified_ms = info.last_modified_ms.unwrap_or_else(|| {
+            u64::try_from(self.target.wall.now().as_millis()).unwrap_or(u64::MAX)
+        });
+        let adopt = Adopt {
+            key: self.key.to_owned(),
+            expected_seq: version.seq,
+            size: info.size,
+            last_modified_ms,
+            remote_etag: info.etag.clone(),
+            remote_version_id: info.version_id.clone().map(|id| id.0),
+            metadata: loaded_metadata(&info),
+            checksums: Default::default(),
+        };
+        let committed = self.shard.commit(RecordBody::Adopt(adopt)).await?;
+        match committed.outcome {
+            Applied::Applied(_) => Ok(Some(Outcome::Discarded { version })),
+            // A write committed after the version: it is the one to resolve.
+            Applied::Rejected(rejection) => Err(Failure::Local(format!(
+                "the remote's write was not adopted: {rejection}"
+            ))),
+        }
     }
 
     /// Flushes an object version (§7.2): `If-Match` on the known remote
@@ -270,6 +335,16 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     ) -> Result<Outcome, Failure> {
         let version = entry.version;
         if test_hooks::forgets_deletes() {
+            return Ok(flushed(version, None, record));
+        }
+        if self.resolution == Some(ConflictPolicy::Overwrite) {
+            // The local delete wins over whatever the remote holds.
+            let request = DeleteObject::new(self.remote_key());
+            self.target
+                .store
+                .delete_object(request)
+                .await
+                .map_err(Failure::Remote)?;
             return Ok(flushed(version, None, record));
         }
         let mut expected = known;

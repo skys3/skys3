@@ -7,7 +7,8 @@
 //! - [`StateMachine`]: the deterministic `apply(record)`. It moves entries
 //!   through the object states of §4.2 and decides the conditional
 //!   records: `IMPORT` only for a key with no entry (§9.1), `ADOPT` only
-//!   for an entry still clean at the named `seq` (§9.2), and `FLUSHED`,
+//!   for an entry still at the named `seq`, clean after a fill (§9.2) or
+//!   dirty when a conflict policy discards it (§7.2), and `FLUSHED`,
 //!   which cleans an entry only at its current `seq` (§7.1). It depends on
 //!   nothing but the record and the index, so every replica, and replay
 //!   after a crash, reaches the same index. It plugs into the index as its

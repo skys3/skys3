@@ -204,14 +204,16 @@ pub struct Import {
     pub storage_class: Option<String>,
 }
 
-/// Adopts a remote version that changed out of band (§9.2):
+/// Adopts a remote version that changed out of band (§9.2, §7.2):
 /// `ADOPT(key, remote_etag, remote_version_id, metadata)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Adopt {
     /// The object key.
     pub key: String,
-    /// The sequence number of the clean version the read plan named. The
-    /// record applies only if the entry is still clean at it.
+    /// The sequence number of the version the remote's replaces: the clean
+    /// version a fill's read plan named (§9.2), or the dirty version the
+    /// `discard_local` conflict policy drops (§7.2). The record applies
+    /// only if the entry is still at it.
     pub expected_seq: Seq,
     /// The remote object's size in bytes.
     pub size: u64,
