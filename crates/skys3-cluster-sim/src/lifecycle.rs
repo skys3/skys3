@@ -24,12 +24,13 @@ use std::time::Duration;
 use ::http::{Method, Request, Response, StatusCode};
 use bytes::Bytes;
 use http_body_util::Full;
+use skys3_config::BucketsConfig;
 use skys3_gateway::{Gateway, ShardRef, TrustAll};
 use skys3_io::SimMount;
 use skys3_log::record::truncated_by;
 use skys3_log::{LogRecord, RecordBody};
 use skys3_shard::ShardSet;
-use skys3_shard::lifecycle::{LifecycleMetrics, run_pass};
+use skys3_shard::lifecycle::{LifecycleMetrics, Tombstones, run_pass};
 use skys3_types::lifecycle::{DAY_MS, LifecycleConfiguration};
 use skys3_types::{BucketDocument, BucketMode, EpochSeq};
 
@@ -157,17 +158,23 @@ impl Lifecycle {
 
 /// Runs a lifecycle pass every [`Lifecycle::interval`] over the shards of
 /// `set` this node leads, of the buckets `gateway` knows, as the node
-/// binary does, once the workload started.
+/// binary does, once the workload started. The tombstones of buckets with
+/// a backup target in `settings` stay for its flusher (§8.9).
 pub(crate) async fn follow(
     lifecycle: &Lifecycle,
     gateway: &Gateway<TrustAll>,
     set: &ShardSet<SimMount>,
+    settings: &BucketsConfig,
 ) {
     let metrics = LifecycleMetrics::default();
+    let tombstones = |bucket: &BucketDocument| match settings.get(&bucket.name).backup_target {
+        Some(_) => Tombstones::Keep,
+        None => Tombstones::Remove,
+    };
     loop {
         tokio::time::sleep(lifecycle.interval).await;
         if let Some(now) = lifecycle.now_ms() {
-            run_pass(set, &gateway.buckets(), now, &metrics).await;
+            run_pass(set, &gateway.buckets(), now, &metrics, tombstones).await;
         }
     }
 }

@@ -33,7 +33,7 @@ use skys3_sts::{
     StsEndpoint, StsSettings, ValidatorSettings,
 };
 use skys3_types::Generation;
-use skys3_types::{BucketDocument, BucketId, Label, NodeId};
+use skys3_types::{BucketDocument, BucketId, BucketMode, Label, NodeId};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -417,12 +417,15 @@ impl Shared {
     }
 
     /// Gives the clean cache each bucket's `clean_copies` (§9.3). The
-    /// cache keeps every copy of a bucket until it is told.
+    /// cache keeps every copy of a bucket until it is told, and is never
+    /// told of a `local` bucket, whose replicas are its durable home even
+    /// once a backup target made its entries clean (§8.9).
     fn install_clean_copies(&self, buckets: &[BucketDocument]) {
         if let Some(cache) = self.shards.set().cache() {
             cache.set_clean_copies(
                 buckets
                     .iter()
+                    .filter(|bucket| bucket.mode != BucketMode::Local)
                     .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
             );
         }
@@ -458,7 +461,18 @@ impl Shared {
             tokio::time::sleep(interval).await;
             let buckets = self.gateway.buckets();
             let now = u64::try_from(self.wall.now().as_millis()).unwrap_or(u64::MAX);
-            let report = lifecycle::run_pass(self.shards.set(), &buckets, now, &metrics).await;
+            // A backup target's flusher removes the tombstones (§8.9).
+            let tombstones = |bucket: &BucketDocument| match self
+                .config
+                .buckets()
+                .get(&bucket.name)
+                .backup_target
+            {
+                Some(_) => lifecycle::Tombstones::Keep,
+                None => lifecycle::Tombstones::Remove,
+            };
+            let report =
+                lifecycle::run_pass(self.shards.set(), &buckets, now, &metrics, tombstones).await;
             if report != lifecycle::LifecycleReport::default() {
                 tracing::debug!(
                     expired = report.expired,

@@ -78,9 +78,15 @@
 //!   only once the remote store holds them, so that losing every node
 //!   after an acknowledgement loses none, under takeovers and remote
 //!   faults.
+//! - [`backup`]: `local` buckets backed up to the remote store: every
+//!   committed change reaches the backup and no member drops a backed-up
+//!   payload, and with `backup_ack = "write_through"` losing every node
+//!   after an acknowledgement loses no write, under takeovers and remote
+//!   faults, with seeded bugs caught.
 
 mod acks;
 mod backfill;
+mod backup;
 mod buckets;
 mod cache;
 mod coding;

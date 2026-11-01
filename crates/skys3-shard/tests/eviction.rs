@@ -16,8 +16,16 @@ use support::{
     apply, at, delete, extent, flushed, index_config, open_log, pool, put, record, runtime, shard,
 };
 
-/// A cache of at most `max_bytes`, with no disk space to account.
+/// A cache of at most `max_bytes`, with no disk space to account, that
+/// evicts the shards' bucket and keeps up to three copies of it.
 fn cache(max_bytes: u64) -> CleanCache {
+    let cache = untold(max_bytes);
+    cache.set_clean_copies([(shard(0).bucket.clone(), 3)]);
+    cache
+}
+
+/// A cache as [`cache`] makes, not told the bucket's `clean_copies`.
+fn untold(max_bytes: u64) -> CleanCache {
     CleanCache::new(
         CacheSettings {
             max_bytes,
@@ -274,15 +282,20 @@ fn a_member_opened_before_the_bucket_policy_keeps_its_copies() {
             Arc::new(Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap());
         apply(&index, &record(at(1), put("a", 20, 1)));
         apply(&index, &record(at(2), flushed("a", 1, false)));
-        let cache = cache(1000);
+        let cache = untold(1000);
         let set = set(&index, &log, &cache).await;
-        // Node 2 ranks 1, within two copies.
+        // Node 2 ranks 1, within two copies. Until the cache is told the
+        // policy, it keeps the copy and does not count it.
         let node = "node-2".parse::<NodeId>().unwrap();
         let replica = set.open_replica(&replicated(), &node).await.unwrap();
         assert_eq!(cache.reclaim(&set).await, 0);
-        assert_eq!(cache.usage().bytes, 20);
+        assert_eq!(cache.usage().bytes, 0);
+        assert!(!replica.evicts_clean());
         cache.set_clean_copies([(shard(0).bucket.clone(), 2)]);
+        assert!(replica.evicts_clean());
+        // Told, the cache scans the replica again.
         assert_eq!(cache.reclaim(&set).await, 0);
+        assert_eq!(cache.usage().bytes, 20);
         assert_eq!(state(&replica, "a").await.0, EntryState::Clean);
         // The policy lowered to one copy evicts it.
         cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);

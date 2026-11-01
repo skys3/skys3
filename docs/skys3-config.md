@@ -187,10 +187,10 @@ Erasure coding of `local` buckets (§8).
 | `ec_min_object_bytes` | integer | `4194304` (4 MiB) | Positive (§8.2). |
 | `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. Each fragment of a stripe in the narrowest geometry (`k = min_eligible_nodes − parity_fragments`, from 1 to `max_data_fragments`), `⌈ec_stripe_data_bytes / k⌉` rounded up to 64 bytes, is at most 256 MiB, the fragment store's limit: 768 MiB with the defaults. |
 | `ec_after_seconds` | integer | `600` | May be 0. |
-| `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). |
+| `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). `"write_through"` answers a write once the backup holds it, with `flush.write_through_timeout_seconds` as for `ack_policy` (§7.5). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
 | `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. |
-| `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets have dirty data. |
+| `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets take one: what a `local` bucket's backup lacks is not charged (§8.9). |
 
 Keys allowed only in a `[buckets.<name>]` table:
 
@@ -198,7 +198,7 @@ Keys allowed only in a `[buckets.<name>]` table:
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `flush.ack_policy` | §7.5. |
 | `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. |
-| `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). |
+| `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). Every node needs the same table: each follows the bucket's backup with what its own configuration says. |
 | `snapshot_target` | target URL | `backup_target` | Where index snapshots go (§8.9). |
 | `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's, with a `[peering.peers.<cluster-id>]` table. Not for a `read_only` bucket. A `COMMIT` applies only to a bucket whose `peer_source` is its source cluster, and the bucket is read-only to this cluster's own clients: their object writes get `403 AccessDenied`. |
 | `peer_local_writes` | boolean | `false` | Only with `peer_source`. `true` lets this cluster's own clients write the bucket too. Their versions carry this cluster's write identity, so a source `COMMIT` that expects its own fails its precondition (§7.8). |

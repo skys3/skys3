@@ -88,7 +88,9 @@ planned metric decides its labels and records them here.
 ### 3.2 Flush and loss exposure
 
 Design sections 7.1 and 7.6. Together these measure the loss exposure (RPO)
-under `ack_policy = "local"`.
+under `ack_policy = "local"`. A `local` bucket with a backup target has them
+too (design section 8.9, M4-09): there the remote target is its backup, and
+they measure what the backup lacks.
 
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|

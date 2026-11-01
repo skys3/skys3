@@ -278,20 +278,22 @@ fn flush_status(status: &BucketStatus) -> Value {
         "conflicts": conflicts,
         "orphaned_uploads": gauges.orphaned_uploads,
         "errors": errors,
-        "import": json!({
-            "state": match status.import.checkpoint {
+        "backup": status.backup,
+        // A backup target imports nothing (§8.9).
+        "import": status.import.as_ref().map(|import| json!({
+            "state": match import.checkpoint {
                 ImportCheckpoint::Running { .. } => "running",
                 ImportCheckpoint::Done => "done",
             },
-            "after": match &status.import.checkpoint {
+            "after": match &import.checkpoint {
                 ImportCheckpoint::Running { after } => after.clone(),
                 ImportCheckpoint::Done => None,
             },
-            "ranges": status.import.ranges.ranges().len(),
-            "ranges_done": status.import.ranges.done(),
-            "imported": status.import.imported,
-            "error": status.import.error,
-        }),
+            "ranges": import.ranges.ranges().len(),
+            "ranges_done": import.ranges.done(),
+            "imported": import.imported,
+            "error": import.error,
+        })),
     })
 }
 

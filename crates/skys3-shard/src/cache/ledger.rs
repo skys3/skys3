@@ -101,12 +101,18 @@ impl CacheMetrics {
 /// - **Copies.** A replica keeps a clean payload only if its rank is below
 ///   its bucket's `clean_copies` ([`CleanCache::set_clean_copies`]): the
 ///   primary, or a replica alone, is rank 0, and the other members follow
-///   in the order of the configuration. Learners keep none. Until the
-///   cache is told a bucket's `clean_copies`, its members keep every copy:
-///   a node opens its replicas, and receives `FLUSHED` records of a new
-///   bucket, before it reads the bucket's policy, and a copy evicted then
-///   would be lost for good. A clean entry whose bytes are not on the node
-///   is evicted too, so that its state says so.
+///   in the order of the configuration. Learners keep none. A clean entry
+///   whose bytes are not on the node is evicted too, so that its state
+///   says so.
+/// - **Buckets not told.** Only the buckets the cache is told a
+///   `clean_copies` for are evicted ([`CleanCache::evicts`]). The others
+///   keep every payload, and the cache neither counts nor evicts it: a
+///   `local` bucket, whose replicas are its durable home even once a
+///   backup target made its entries clean (§8.9), and a bucket whose
+///   policy the node has not read yet, since it opens its replicas, and
+///   receives `FLUSHED` records of a new bucket, before it reads the
+///   bucket's policy, and a copy evicted then would be lost for good. A
+///   bucket's replicas are scanned once it is told.
 /// - **Bounds.** The payloads kept are evicted least recently used first
 ///   while they hold more than `cache_max_bytes_per_node`, or while one
 ///   disk's hold more than its room. A disk's room is what clean payload
@@ -265,30 +271,47 @@ impl CleanCache {
         cache
     }
 
-    /// Sets each bucket's `clean_copies`, replacing what was set before.
+    /// Sets each bucket's `clean_copies`, replacing what was set before:
+    /// the buckets whose clean payload the node evicts. Leave out every
+    /// `local` bucket.
     ///
     /// The setting applies to entries as they become clean, to a replica's
-    /// entries when it opens, and, for a bucket whose setting is new or
-    /// changed, to the copies kept already: those of replicas ranked at or
-    /// beyond it are evicted. A copy evicted is not brought back when the
-    /// setting grows. Until a bucket is set, or after it is left out, its
-    /// replicas keep every copy they rank for; learners still keep none.
+    /// entries when it opens, and, for a bucket whose setting changed, to
+    /// the copies kept already: those of replicas ranked at or beyond it
+    /// are evicted. A copy evicted is not brought back when the setting
+    /// grows. The replicas of a bucket set for the first time are scanned
+    /// at the next reclaim. A bucket left out is no longer evicted: its
+    /// replicas keep every payload, which the cache stops counting.
     pub fn set_clean_copies(&self, copies: impl IntoIterator<Item = (BucketId, u8)>) {
         let mut ledger = self.ledger();
         let copies: HashMap<BucketId, u8> = copies.into_iter().collect();
-        let changed: Vec<(BucketId, u8)> = copies
-            .iter()
-            .filter(|&(bucket, copies)| ledger.clean_copies.get(bucket) != Some(copies))
-            .map(|(bucket, copies)| (bucket.clone(), *copies))
+        let mut new = Vec::new();
+        let mut changed = Vec::new();
+        for (bucket, &count) in &copies {
+            match ledger.clean_copies.get(bucket) {
+                None => new.push(bucket.clone()),
+                Some(&old) if old != count => changed.push((bucket.clone(), count)),
+                Some(_) => {}
+            }
+        }
+        let gone: Vec<BucketId> = ledger
+            .clean_copies
+            .keys()
+            .filter(|bucket| !copies.contains_key(*bucket))
+            .cloned()
             .collect();
         ledger.clean_copies = copies;
+        for bucket in gone {
+            ledger.keep_all(&bucket);
+        }
         for (bucket, copies) in changed {
             ledger.doom_beyond(&bucket, copies);
         }
-        let over = ledger.over();
+        let scans = ledger.rescan(&new);
+        let wake = scans || ledger.over();
         self.publish(&ledger);
         drop(ledger);
-        if over {
+        if wake {
             self.inner.wake.notify_one();
         }
     }
@@ -297,6 +320,14 @@ impl CleanCache {
     #[must_use]
     pub fn clean_copies(&self, bucket: &BucketId) -> Option<u8> {
         self.ledger().clean_copies.get(bucket).copied()
+    }
+
+    /// Whether the node evicts clean payload of `bucket`: whether the cache
+    /// was told its `clean_copies` ([`CleanCache::set_clean_copies`]).
+    /// The replicas of other buckets keep every payload.
+    #[must_use]
+    pub fn evicts(&self, bucket: &BucketId) -> bool {
+        self.ledger().clean_copies.contains_key(bucket)
     }
 
     /// Records the space of `disk`, as last read: the room it has for
@@ -395,18 +426,17 @@ impl CleanCache {
             return;
         }
         let mut ledger = self.ledger();
+        // A bucket not told keeps every payload, which the cache does not
+        // count; it is scanned once told.
+        let Some(&copies) = ledger.clean_copies.get(&shard.bucket) else {
+            return;
+        };
         let Some(held) = ledger.shards.get_mut(shard) else {
             return;
         };
         held.rank = rank;
         let disk = held.disk.clone();
-        // A bucket whose `clean_copies` is not known yet keeps every copy,
-        // until `set_clean_copies` evicts the extra ones.
-        let keeps = match (rank, ledger.clean_copies.get(&shard.bucket)) {
-            (None, _) => false,
-            (Some(rank), Some(&copies)) => rank < copies,
-            (Some(_), None) => true,
-        };
+        let keeps = rank.is_some_and(|rank| rank < copies);
         for note in notes {
             match note {
                 Note::Clean {
@@ -665,6 +695,34 @@ impl Ledger {
                 }
             }
         }
+    }
+
+    /// Stops counting and evicting the payload of `bucket`, whose replicas
+    /// now keep all of it.
+    fn keep_all(&mut self, bucket: &BucketId) {
+        let kept: Vec<(ShardRef, String)> = self
+            .shards
+            .iter()
+            .filter(|(shard, _)| &shard.bucket == bucket)
+            .flat_map(|(shard, held)| held.keys.keys().map(|key| (shard.clone(), key.clone())))
+            .collect();
+        for (shard, key) in kept {
+            self.remove(&shard, &key);
+        }
+        self.doomed.retain(|victim| &victim.shard.bucket != bucket);
+    }
+
+    /// Queues a scan of every replica of `buckets`, and returns whether it
+    /// queued any.
+    fn rescan(&mut self, buckets: &[BucketId]) -> bool {
+        let mut queued = false;
+        for shard in self.shards.keys() {
+            if buckets.contains(&shard.bucket) && !self.scans.contains(shard) {
+                self.scans.push_back(shard.clone());
+                queued = true;
+            }
+        }
+        queued
     }
 
     fn forget_shard(&mut self, shard: &ShardRef) {

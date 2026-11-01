@@ -30,8 +30,17 @@ fn gone(key: &str) -> Note {
     }
 }
 
-/// A cache of at most `max_bytes`, with shards 0 and 1 on disks 0 and 1.
+/// A cache of at most `max_bytes`, with shards 0 and 1 on disks 0 and 1,
+/// whose bucket keeps up to three copies.
 fn cache(max_bytes: u64) -> CleanCache {
+    let cache = untold(max_bytes);
+    cache.set_clean_copies([(shard(0).bucket.clone(), 3)]);
+    cache.ledger().scans.clear();
+    cache
+}
+
+/// A cache as [`cache`] makes, not told its bucket's `clean_copies`.
+fn untold(max_bytes: u64) -> CleanCache {
     let cache = CleanCache::new(
         CacheSettings {
             max_bytes,
@@ -146,25 +155,44 @@ fn copies_beyond_clean_copies_and_entries_without_bytes_are_evicted_at_once() {
 }
 
 #[test]
-fn a_bucket_keeps_every_copy_until_its_clean_copies_is_known() {
+fn a_bucket_keeps_every_payload_until_its_clean_copies_is_known() {
     // A node opens its replicas, and a bucket made at runtime gets
-    // `FLUSHED` records, before the node reads the bucket's policy.
-    let cache = cache(1000);
+    // `FLUSHED` records, before the node reads the bucket's policy; a
+    // `local` bucket's is never told (§8.9).
+    let cache = untold(1000);
+    let bucket = shard(0).bucket.clone();
+    assert!(!cache.evicts(&bucket));
     cache.note(&shard(0), Some(1), vec![clean("member", 1, 10)]);
     cache.note(&shard(1), Some(2), vec![clean("third", 1, 10)]);
     cache.note(&shard(1), None, vec![clean("learner", 2, 10)]);
-    assert_eq!(victims(&cache), [named(1, "learner")]);
-    assert_eq!(cache.usage().bytes, 20);
-    // Shards 0 and 1 are of the same bucket: rank 1 is within two
-    // copies, rank 2 is not.
-    cache.set_clean_copies([(shard(0).bucket.clone(), 2)]);
-    assert_eq!(victims(&cache), [named(1, "third")]);
+    assert!(victims(&cache).is_empty());
+    assert_eq!(cache.usage().bytes, 0);
+    // Told, the bucket's replicas are scanned again, and their notes
+    // count. Shards 0 and 1 are of the same bucket: rank 1 is within two
+    // copies, rank 2 is not, and a learner keeps none.
+    cache.set_clean_copies([(bucket.clone(), 2)]);
+    assert!(cache.evicts(&bucket));
+    assert_eq!(cache.ledger().scans.len(), 2);
+    cache.ledger().scans.clear();
+    cache.note(&shard(0), Some(1), vec![clean("member", 1, 10)]);
+    cache.note(&shard(1), Some(2), vec![clean("third", 1, 10)]);
+    cache.note(&shard(1), None, vec![clean("learner", 2, 10)]);
+    assert_eq!(victims(&cache), [named(1, "third"), named(1, "learner")]);
     assert_eq!(cache.usage().bytes, 10);
-    // A bucket left out keeps every copy again, and no eviction follows.
+    assert_eq!(cache.clean_copies(&bucket), Some(2));
+    // Told again unchanged, nothing is scanned or evicted.
+    cache.set_clean_copies([(bucket.clone(), 2)]);
+    assert!(cache.ledger().scans.is_empty());
+    // A bucket left out keeps every payload again: the cache stops
+    // counting it, and no eviction follows.
+    cache.note(&shard(1), Some(2), vec![clean("third", 3, 10)]);
     cache.set_clean_copies([]);
+    assert!(!cache.evicts(&bucket));
+    assert!(victims(&cache).is_empty());
+    assert_eq!(cache.usage().bytes, 0);
     cache.note(&shard(1), Some(2), vec![clean("third", 3, 10)]);
     assert!(victims(&cache).is_empty());
-    assert_eq!(cache.usage().bytes, 20);
+    assert_eq!(cache.usage().bytes, 0);
 }
 
 #[test]
@@ -281,6 +309,7 @@ fn metrics_follow_the_cache() {
         CacheMetrics::register(&registry),
     );
     cache.attach(&shard(0), &disk(0));
+    cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);
     cache.note(&shard(0), Some(0), vec![clean("a", 1, 48)]);
     cache.inner.metrics.evictions.inc();
     let text = registry.encode().unwrap();

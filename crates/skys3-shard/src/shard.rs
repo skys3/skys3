@@ -2136,7 +2136,9 @@ impl<D: Disk> Shard<D> {
     /// [`CleanCache`] decides what to evict and when.
     ///
     /// Any replica that runs may evict, a member too: the transition only
-    /// drops a payload of its own, which no other replica reads.
+    /// drops a payload of its own, which no other replica reads. A replica
+    /// whose cache keeps its bucket's payload ([`Shard::evicts_clean`])
+    /// refuses with [`CacheRefusal::Kept`].
     ///
     /// # Errors
     ///
@@ -2148,6 +2150,14 @@ impl<D: Disk> Shard<D> {
         key: &str,
         version: EpochSeq,
     ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        if self
+            .inner
+            .cache
+            .get()
+            .is_some_and(|cache| !cache.evicts(&self.shard().bucket))
+        {
+            return Ok(Err(CacheRefusal::Kept));
+        }
         let note = Note::Gone {
             key: key.to_owned(),
         };
@@ -2198,6 +2208,21 @@ impl<D: Disk> Shard<D> {
     /// and from then on every entry that becomes clean or stops being so is
     /// reported. A replica reports to one cache; attaching it again changes
     /// nothing.
+    /// Whether this node evicts the shard's clean payload: whether its
+    /// clean cache was told the bucket's `clean_copies`
+    /// ([`CleanCache::evicts`]). A replica of a `local` bucket keeps every
+    /// payload, also of entries a backup target made clean (§8.9), and so
+    /// does a replica on a node without a cache, or whose cache has not
+    /// read the bucket's policy yet. A learner's snapshot and backfill
+    /// leave out only the clean payload of buckets evicted.
+    #[must_use]
+    pub fn evicts_clean(&self) -> bool {
+        self.inner
+            .cache
+            .get()
+            .is_some_and(|cache| cache.evicts(&self.shard().bucket))
+    }
+
     pub(crate) fn attach_cache(&self, cache: &CleanCache, disk: &Label) {
         if self.inner.cache.set(cache) {
             cache.attach(self.shard(), disk);
