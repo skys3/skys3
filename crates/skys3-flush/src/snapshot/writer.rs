@@ -345,6 +345,9 @@ fn unflushed(rows: Rows) -> Result<Rows, SnapshotError> {
             }
             ShardTable::RemoteUploads | ShardTable::RemoteParts => true,
             ShardTable::Fragments => false,
+            // How far the import has passed: what drops a late `IMPORT` of a
+            // key whose tombstone is gone (§9.1).
+            ShardTable::ImportProgress => true,
         };
         if keep {
             kept.push((table, (key, value)));

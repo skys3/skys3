@@ -141,6 +141,10 @@
 //!   written after the latest snapshot included, are re-indexed from
 //!   fragment headers and read back, the lost-key report matches the
 //!   history, and seeded bugs of re-indexing are caught.
+//! - [`primary_work`]: primaries that fail over or hand off in the middle
+//!   of flushes and of a namespace import, against a faulty remote store,
+//!   with the flushes and the import finished and checked after the run
+//!   settles.
 
 mod acks;
 mod backfill;
@@ -168,6 +172,7 @@ mod lifecycle;
 mod origin;
 mod peer;
 mod peer_protocol;
+mod primary_work;
 mod reads;
 mod rebalancing;
 mod rebuild;

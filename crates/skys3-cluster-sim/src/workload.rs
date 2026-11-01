@@ -697,6 +697,16 @@ impl Client {
     }
 
     async fn delete(&mut self, bucket: &BucketDocument, key: &str) -> turmoil::Result {
+        self.delete_acknowledged(bucket, key).await.map(drop)
+    }
+
+    /// Deletes `key` and records the answer. Returns whether the delete
+    /// was acknowledged.
+    async fn delete_acknowledged(
+        &mut self,
+        bucket: &BucketDocument,
+        key: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
         let host = self.host(bucket, key);
@@ -706,7 +716,7 @@ impl Client {
             .await
         else {
             self.time(bucket, key, sent, &Outcome::Unknown);
-            return Ok(());
+            return Ok(false);
         };
         let outcome = match answer {
             Ok(response) => match response.status() {
@@ -716,8 +726,33 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        let acknowledged = outcome == Outcome::Done;
         self.time(bucket, key, sent, &outcome);
         self.answer_write(pending, outcome, &name);
+        Ok(acknowledged)
+    }
+
+    /// Deletes each of `keys`, as [`Routes::keys`] lists them, once the
+    /// faults have healed, retrying a key until a delete of it is
+    /// acknowledged.
+    pub(crate) async fn delete_each(
+        &mut self,
+        keys: &[(String, BucketDocument, String)],
+        attempts: usize,
+    ) -> turmoil::Result {
+        for (name, bucket, key) in keys {
+            let mut acknowledged = false;
+            for _ in 0..attempts {
+                if self.delete_acknowledged(bucket, key).await? {
+                    acknowledged = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if !acknowledged {
+                return Err(format!("no delete of {name} was acknowledged").into());
+            }
+        }
         Ok(())
     }
 

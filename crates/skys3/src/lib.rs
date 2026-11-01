@@ -16,6 +16,8 @@
 //!   does not answer.
 //! - [`storage`]: recovery of the storage engine, the part of startup the
 //!   cluster simulation shares with the node.
+//! - [`remote`]: the gateway's reads of `write_back` targets through the
+//!   flush service, which the cluster simulation shares with the node.
 //! - [`sessions`]: STS session records in the internal system bucket.
 //! - [`admin`]: the admin API under `/v1/`: health and bucket status.
 //! - [`rebuild`]: the operator's rebuild of a lost control store from the

@@ -59,7 +59,7 @@ pub struct Forward {
     /// The call.
     #[prost(
         oneof = "Op",
-        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
     )]
     pub op: Option<Op>,
 }
@@ -119,6 +119,9 @@ pub enum Op {
     /// Wait for a version of a key to reach the remote target.
     #[prost(message, tag = "20")]
     Flushed(FlushQuery),
+    /// The namespace import progress the shard applied last.
+    #[prost(bool, tag = "21")]
+    ImportProgress(bool),
 }
 
 /// A write-through write's wait for its version's flush (design §7.5).
@@ -343,7 +346,7 @@ pub struct Answer {
     /// The answer, by the call it answers.
     #[prost(
         oneof = "Result",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
     )]
     pub result: Option<Result>,
 }
@@ -399,6 +402,10 @@ pub enum Result {
     /// Where the version waited for is: see the `FLUSH_*` constants.
     #[prost(uint32, tag = "16")]
     Flushed(u32),
+    /// The import progress, encoded as the index stores it (its number,
+    /// then its ranges); empty for none.
+    #[prost(bytes = "vec", tag = "17")]
+    ImportProgress(Vec<u8>),
 }
 
 /// The remote holds the version waited for, or a later one.
@@ -634,6 +641,7 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         }
         Request::Seal => Op::Seal(true),
         Request::Unseal => Op::Unseal(true),
+        Request::ImportProgress => Op::ImportProgress(true),
     };
     let forward = Forward {
         bucket_id: shard.bucket.as_str().to_owned(),
@@ -785,6 +793,7 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 | RecordBody::Delete(_)
                 | RecordBody::Tags(_)
                 | RecordBody::Flushed(_)
+                | RecordBody::ImportProgress(_)
                 | RecordBody::MpuCreate(_)
                 | RecordBody::MpuPart(_)
                 | RecordBody::MpuComplete(_)
@@ -800,6 +809,7 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
         },
         Op::Seal(_) => Request::Seal,
         Op::Unseal(_) => Request::Unseal,
+        Op::ImportProgress(_) => Request::ImportProgress,
         Op::Plan(key) => Request::Plan { key },
         Op::Register(query) => Request::Register {
             key: query.key,
@@ -1042,6 +1052,12 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
             // A state added later is reported as not flushed yet.
             _ => FLUSH_PENDING,
         }),
+        Response::ImportProgress(progress) => Result::ImportProgress(
+            progress
+                .as_ref()
+                .map(|(update, ranges)| encoded(codec::encode_import_progress(*update, ranges)))
+                .unwrap_or_default(),
+        ),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -1215,6 +1231,10 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             FLUSH_PENDING => FlushState::Pending,
             other => return Err(format!("flush state {other}")),
         }),
+        Result::ImportProgress(bytes) if bytes.is_empty() => Response::ImportProgress(None),
+        Result::ImportProgress(bytes) => {
+            Response::ImportProgress(Some(codec::decode_import_progress(&bytes).map_err(codec)?))
+        }
     })
 }
 

@@ -19,6 +19,7 @@ use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums};
 use crate::features;
+use crate::imports::ImportProgress;
 use crate::limits::{BodyKind, RequestLimits, RequestShape, Target};
 use crate::listing::Listings;
 use crate::objects::{self, Objects};
@@ -172,8 +173,11 @@ impl<A: Authenticator> Gateway<A> {
         let limits = config.limits;
         let anonymous = config.anonymous.clone();
         let hashing_pool = config.hashing_pool.clone();
-        let objects = Objects::new(shards.clone(), &config);
-        let listings = Listings::new(shards.clone(), &config);
+        // What the object and listing operations learn of the shards'
+        // namespace imports (§9.1), which both read through by.
+        let imports = ImportProgress::default();
+        let objects = Objects::new(shards.clone(), &config, imports.clone());
+        let listings = Listings::new(shards.clone(), &config, imports);
         let peers = (config.peer_access.clone(), config.descriptors.clone());
         let buckets = Arc::new(Buckets::load(store, shards, config, ids).await?);
         let api = Api::new(Arc::clone(&buckets), objects, listings, peers);

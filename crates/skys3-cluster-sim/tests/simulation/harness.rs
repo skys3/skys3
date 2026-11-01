@@ -15,7 +15,7 @@ use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
     ShardSummary, Shards, UploadParts,
 };
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::SimMount;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
@@ -96,6 +96,13 @@ impl Shards for LosingShards {
 
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
         self.inner.entry(shard, key).await
+    }
+
+    async fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        self.inner.import_progress(shard).await
     }
 
     async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {

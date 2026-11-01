@@ -47,6 +47,7 @@ use skys3_types::{BucketDocument, BucketMode, EpochSeq};
 use tokio::task::JoinSet;
 
 use super::Objects;
+use super::namespace::conditional_entry;
 use super::write_through::reach_remote;
 use crate::authz::{KeyDecisions, access_denied};
 use crate::buckets::shard_error;
@@ -78,6 +79,9 @@ impl<H: Shards> Objects<H> {
         }
         let condition = Precondition::of_write(input.if_match.as_ref(), None)?.apply_by(apply_by);
         let shard = ShardRef::for_key(bucket, &input.key);
+        if condition != Precondition::None {
+            self.conditional_entry(bucket, &shard, &input.key).await?;
+        }
         let delete = self.removal(bucket);
         delete
             .remove(&self.shards, shard, input.key, condition)
@@ -155,8 +159,19 @@ impl<H: Shards> Objects<H> {
                 let shards = self.shards.clone();
                 let shard = ShardRef::for_key(bucket, &object.key);
                 let key = object.key.clone();
+                let (remote, bucket) = (self.remote.clone(), bucket.clone());
+                let imports = self.imports.clone();
                 pending.spawn(async move {
-                    (index, removal.remove(&shards, shard, key, condition).await)
+                    let mut outcome = Ok(None);
+                    if condition != Precondition::None {
+                        let remote = remote.as_ref().map(|remote| (remote, &imports));
+                        outcome = conditional_entry(&shards, remote, &bucket, &shard, &key).await;
+                    }
+                    let outcome = match outcome {
+                        Ok(_) => removal.remove(&shards, shard, key, condition).await,
+                        Err(error) => Err(error),
+                    };
+                    (index, outcome)
                 });
             }
             let Some(joined) = pending.join_next().await else {
