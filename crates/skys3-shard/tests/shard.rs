@@ -136,6 +136,36 @@ fn reopening_continues_the_sequence_and_adopts_newer_epochs() {
 }
 
 #[test]
+fn a_record_commits_in_an_epoch_only_while_the_shard_sequences_in_it() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard0 = node.open(1).await.unwrap();
+        let committed = shard0
+            .commit_in(Epoch::new(1), put("a", 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(committed.position, at(1));
+        drop(shard0);
+
+        // In a newer epoch, nothing is appended for the older one.
+        let shard0 = node.open(3).await.unwrap();
+        let applied = shard0.applied();
+        let error = shard0
+            .commit_in(Epoch::new(1), put("b", 1, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ShardError::Unavailable { .. }), "{error}");
+        assert_eq!(shard0.last_sequenced(), applied.seq);
+        let committed = shard0
+            .commit_in(Epoch::new(3), put("b", 1, 3))
+            .await
+            .unwrap();
+        let next = Seq::new(applied.seq.get() + 1);
+        assert_eq!(committed.position, EpochSeq::new(Epoch::new(3), next));
+    });
+}
+
+#[test]
 fn only_a_single_member_configuration_opens() {
     runtime().block_on(async {
         let node = Node::new().await;

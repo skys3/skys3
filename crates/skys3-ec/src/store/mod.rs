@@ -157,6 +157,14 @@ pub enum FragmentError {
         /// What is wrong with it.
         source: FragmentDecodeError,
     },
+    /// A segment whose fragments were all reclaimed could not be removed.
+    #[error("cannot remove fragment segment {name}: {source}")]
+    Remove {
+        /// The segment's file name.
+        name: String,
+        /// The error.
+        source: io::Error,
+    },
 }
 
 /// A fragment segment: its number and length.
@@ -221,6 +229,8 @@ pub enum SeededBug {
 pub(crate) struct Shared<F> {
     segments: Mutex<BTreeMap<u64, Arc<F>>>,
     map: Mutex<BTreeMap<FragmentId, Located>>,
+    /// The bytes of reclaimed records in each segment, in this life.
+    dead: Mutex<BTreeMap<u64, u64>>,
     failure: OnceLock<Arc<io::Error>>,
 }
 
@@ -233,6 +243,11 @@ impl<F> Shared<F> {
     fn map(&self) -> MutexGuard<'_, BTreeMap<FragmentId, Located>> {
         // As for `segments`.
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn dead(&self) -> MutexGuard<'_, BTreeMap<u64, u64>> {
+        // As for `segments`.
+        self.dead.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn add_segment(&self, id: u64, file: Arc<F>) {
@@ -264,6 +279,7 @@ impl<F> Shared<F> {
 /// committer stops once every handle is dropped.
 pub struct FragmentStore<D: Disk> {
     shared: Arc<Shared<D::File>>,
+    disk: Arc<D>,
     requests: mpsc::Sender<Request>,
     max_fragment_bytes: u64,
 }
@@ -272,6 +288,7 @@ impl<D: Disk> Clone for FragmentStore<D> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
+            disk: Arc::clone(&self.disk),
             requests: self.requests.clone(),
             max_fragment_bytes: self.max_fragment_bytes,
         }
@@ -331,13 +348,15 @@ impl<D: Disk> FragmentStore<D> {
         let shared = Arc::new(Shared {
             segments: Mutex::new(recovered.segments),
             map: Mutex::default(),
+            dead: Mutex::default(),
             failure: OnceLock::new(),
         });
         shared.insert(recovered.fragments);
         let (requests, receiver) = mpsc::channel(QUEUE_LEN);
         let max_fragment_bytes = config.max_fragment_bytes.min(MAX_FRAGMENT_LEN);
+        let disk = Arc::new(disk);
         let committer = Committer::new(
-            Arc::new(disk),
+            Arc::clone(&disk),
             Arc::clone(&shared),
             receiver,
             config,
@@ -347,6 +366,7 @@ impl<D: Disk> FragmentStore<D> {
         tokio::spawn(committer.run());
         let store = Self {
             shared,
+            disk,
             requests,
             max_fragment_bytes,
         };
@@ -457,6 +477,53 @@ impl<D: Disk> FragmentStore<D> {
     pub async fn header(&self, id: FragmentId) -> Result<FragmentHeader, FragmentError> {
         let (located, file) = self.locate(id)?;
         Ok(Self::read_header(id, located, &file).await?.header)
+    }
+
+    /// Reclaims fragment `id`, an orphan (§8.4) or, later, a released
+    /// fragment (§8.7): it is no longer read or listed, and once every
+    /// record of its segment is reclaimed and the segment is not the last,
+    /// the segment file is removed. Returns whether the store held the
+    /// fragment.
+    ///
+    /// Reclaiming is not recorded on the disk. A fragment whose segment
+    /// survives a restart is found again by recovery, and is reclaimed
+    /// again once its node asks about it; segments that hold live
+    /// fragments too wait for fragment-segment compaction (plan M5-07).
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentError::Remove`] if a segment file could not be removed;
+    /// the fragment is reclaimed all the same, and the file stays until
+    /// the next life finds it again.
+    pub async fn reclaim(&self, id: FragmentId) -> Result<bool, FragmentError> {
+        let Some(located) = self.shared.map().remove(&id) else {
+            return Ok(false);
+        };
+        let removable = {
+            let mut segments = self.shared.segments();
+            let mut dead = self.shared.dead();
+            let bytes = dead.entry(located.segment).or_default();
+            *bytes += located.record_len();
+            let last = segments.keys().next_back().copied();
+            let whole = segments
+                .get(&located.segment)
+                .is_some_and(|file| file.len() <= *bytes);
+            // Only the committer appends, and only to the last segment.
+            let removable = whole && last != Some(located.segment);
+            if removable {
+                dead.remove(&located.segment);
+                segments.remove(&located.segment);
+            }
+            removable
+        };
+        if removable {
+            let name = segment_name(located.segment);
+            self.disk
+                .remove(&name)
+                .await
+                .map_err(|source| FragmentError::Remove { name, source })?;
+        }
+        Ok(true)
     }
 
     /// The length of fragment `id`'s payload, or `None` if the store holds
