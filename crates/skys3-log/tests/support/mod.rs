@@ -10,9 +10,9 @@ use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
-    EcPublish, Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
-    MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody, RemoteStep, ShardRef,
-    TagSet, Tags, UploadBegin, UploadChecksum,
+    EcPublish, EcRelocate, Extent, ExtentRef, Flushed, FragmentMove, Import, LogRecord,
+    MAX_PAYLOAD_LEN, Metadata, MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed, Put,
+    PutData, RecordBody, RemoteStep, ShardRef, TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
     AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
@@ -338,6 +338,41 @@ pub fn ec_publish(position: EpochSeq) -> impl Strategy<Value = EcPublish> {
         })
 }
 
+/// A valid `EC_RELOCATE` at `position`: one to eight moves, in stripe and
+/// index order, each to a location other than its own.
+pub fn ec_relocate(position: EpochSeq) -> impl Strategy<Value = EcRelocate> {
+    let location = || {
+        (node_id(), any::<u128>()).prop_map(|(node, id)| FragmentLocation {
+            node,
+            fragment: FragmentId::new(id),
+        })
+    };
+    let moved =
+        (location(), location()).prop_filter("a move goes somewhere else", |(from, to)| from != to);
+    (
+        (key(), position_before(position), etag()),
+        (any::<u64>(), any::<u64>()),
+        btree_map((any::<u32>(), any::<u8>()), moved, 1..=8),
+    )
+        .prop_map(
+            |((key, version, etag), (epoch, number), moves)| EcRelocate {
+                key,
+                version,
+                etag,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                moves: moves
+                    .into_iter()
+                    .map(|((stripe, index), (from, to))| FragmentMove {
+                        stripe,
+                        index,
+                        from,
+                        to,
+                    })
+                    .collect(),
+            },
+        )
+}
+
 fn node_id() -> impl Strategy<Value = NodeId> {
     label(NodeId::MAX_LEN).prop_map(|s| NodeId::new(s).unwrap())
 }
@@ -448,6 +483,7 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
                 }
             ),
         ec_publish(position).prop_map(RecordBody::EcPublish),
+        ec_relocate(position).prop_map(RecordBody::EcRelocate),
         shard_config(shard, position.epoch).prop_map(RecordBody::Config),
         Just(RecordBody::Truncate),
     ]

@@ -19,6 +19,7 @@ test-util = []
 [dependencies]
 bytes.workspace = true
 crc32c.workspace = true
+prometheus-client.workspace = true
 prost.workspace = true
 reed-solomon-simd.workspace = true
 skys3-config.workspace = true
@@ -27,6 +28,7 @@ skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
 skys3-net.workspace = true
+skys3-obs.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true

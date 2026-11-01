@@ -16,16 +16,17 @@
 //! which nothing can reach (see the `multipart` module).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use skys3_index::{
     Applier, Coded, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload,
 };
 use skys3_log::record::{
-    Adopt, Delete, EcPublish, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags,
+    Adopt, Delete, EcPublish, EcRelocate, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags,
 };
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
-use skys3_types::{EpochSeq, Seq};
+use skys3_types::{CodedStripe, EpochSeq, FragmentLocation, Seq};
 
 use crate::multipart;
 use crate::seeded::{SeededBug, is_seeded};
@@ -104,6 +105,9 @@ pub enum Effect {
     UploadBegun,
     /// An `EC_PUBLISH` marked the key's current version coded (§8.4).
     Published,
+    /// An `EC_RELOCATE` moved fragments of the current version's layout to
+    /// new locations (§8.6).
+    Relocated,
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -180,6 +184,22 @@ pub enum Rejection {
     /// already: an attempt that outlived its primary's life.
     #[error("the version is coded already")]
     AlreadyCoded,
+    /// An `EC_RELOCATE` names a version that is not coded.
+    #[error("the version is not coded")]
+    NotCoded,
+    /// An `EC_RELOCATE` moves a fragment that the layout no longer locates
+    /// where the record says it was, such as one another repair or move
+    /// relocated first, or would put two fragments of a stripe on one node.
+    /// Its new fragments become orphans.
+    #[error(
+        "the layout no longer locates fragment {index} of stripe {stripe} where the record moves it from"
+    )]
+    Moved {
+        /// The stripe's number.
+        stripe: u32,
+        /// The fragment's index.
+        index: u8,
+    },
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -241,6 +261,7 @@ impl StateMachine {
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
             RecordBody::EcPublish(publish) => publish_coded(index, shard, position, publish)?,
+            RecordBody::EcRelocate(relocate) => relocate_coded(index, shard, relocate)?,
             // A replica's own bookkeeping: the configuration it adopted,
             // which the index keeps as the replica's local copy of it
             // (§6.2), or where reconciliation cut its log (§6.6).
@@ -602,6 +623,89 @@ fn publish_coded(
     object.coded = Some(coded);
     index.put_entry(shard, &publish.key, &entry)?;
     Ok(Ok(Effect::Published))
+}
+
+/// `EC_RELOCATE`: the fragments the record moves get their new locations
+/// in the layout of the version it names, if that is still the key's
+/// current version, coded, and the layout still locates each fragment where
+/// the record moves it from (§8.6). The shard's index from node to
+/// fragments follows. Otherwise nothing changes, and the new fragments are
+/// orphans. The entry keeps everything else, its `EC_PUBLISH` position
+/// included, which is what replicas drop their copies by.
+fn relocate_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    relocate: &EcRelocate,
+) -> Result<Rule, IndexError> {
+    let Some(mut entry) = index.entry(shard, &relocate.key)? else {
+        return Ok(Err(Rejection::NoEntry));
+    };
+    let Some(object) = &mut entry.object else {
+        return Ok(Err(Rejection::Deleted));
+    };
+    if entry.version != relocate.version || object.local_etag != relocate.etag {
+        return Ok(Err(Rejection::Superseded));
+    }
+    let Some(coded) = &mut object.coded else {
+        return Ok(Err(Rejection::NotCoded));
+    };
+    // Every move of a stripe lands before the stripe is checked, so two
+    // fragments may trade nodes.
+    let mut moved_stripes: BTreeMap<usize, Vec<FragmentLocation>> = BTreeMap::new();
+    for moved in &relocate.moves {
+        let rejected = Rejection::Moved {
+            stripe: moved.stripe,
+            index: moved.index,
+        };
+        let Some(number) = usize::try_from(moved.stripe)
+            .ok()
+            .filter(|number| *number < coded.stripes.len())
+        else {
+            return Ok(Err(rejected));
+        };
+        let fragments = moved_stripes
+            .entry(number)
+            .or_insert_with(|| coded.stripes[number].fragments().to_vec());
+        match fragments.get_mut(usize::from(moved.index)) {
+            Some(location) if *location == moved.from => *location = moved.to.clone(),
+            _ => return Ok(Err(rejected)),
+        }
+    }
+    let mut stripes = coded.stripes.clone();
+    for (number, fragments) in moved_stripes {
+        let stripe = &stripes[number];
+        let Ok(relocated) = CodedStripe::new(
+            stripe.number(),
+            stripe.offset(),
+            stripe.data_len(),
+            stripe.geometry(),
+            stripe.codec(),
+            fragments,
+        ) else {
+            let index = relocate
+                .moves
+                .iter()
+                .find(|moved| moved.stripe == stripe.number())
+                .map_or(0, |moved| moved.index);
+            return Ok(Err(Rejection::Moved {
+                stripe: stripe.number(),
+                index,
+            }));
+        };
+        stripes[number] = relocated;
+    }
+    for moved in &relocate.moves {
+        index.move_fragment(
+            shard,
+            &relocate.key,
+            (moved.stripe, moved.index),
+            &moved.from,
+            &moved.to,
+        )?;
+    }
+    coded.stripes = stripes;
+    index.put_entry(shard, &relocate.key, &entry)?;
+    Ok(Ok(Effect::Relocated))
 }
 
 /// Removes the fragments of `prior`'s coded layout, if it has one, from the

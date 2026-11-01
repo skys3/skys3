@@ -14,6 +14,7 @@ use skys3_ec::{
     rebuild_layouts,
 };
 use skys3_io::{SimDisk, SimMount};
+use skys3_log::record::IDENTITY_METADATA;
 use skys3_types::{Epoch, NodeId};
 use support::{object, position, runtime, sample, shard, small_config};
 
@@ -297,13 +298,22 @@ fn complete_headers_rebuild_the_published_stripes() {
 #[test]
 fn later_attempts_win_where_copies_overlap() {
     let mut all = complete(attempt(4, 1));
-    // A repair rebuilt fragment 2 of stripe 0 on node 9, after a tag change.
+    // A repair rebuilt fragment 2 of stripe 0 on node 9, after a tag change,
+    // which made the TAGS record the write identity and dropped the one
+    // carried from another cluster.
+    for fragment in &mut all {
+        let metadata = &mut fragment.header.object.metadata;
+        metadata.insert(IDENTITY_METADATA.into(), "carried".into());
+    }
     let mut repaired = found(0, 2, attempt(5, 1), 9);
     repaired.header.object.tags = BTreeMap::from([("team".into(), "video".into())]);
+    repaired.header.object.identity = position(1, 90);
     all.push(repaired.clone());
     let layout = rebuild_one(all).unwrap();
     assert_eq!(layout.stripes[0].fragments[2], Some(repaired.location));
     assert_eq!(layout.object.tags, repaired.header.object.tags);
+    assert_eq!(layout.object.identity, position(1, 90));
+    assert!(!layout.object.metadata.contains_key(IDENTITY_METADATA));
     assert_eq!(
         layout.stripes[1].fragments[2].as_ref().unwrap().node,
         node(2)

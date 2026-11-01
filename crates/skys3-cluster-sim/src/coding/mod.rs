@@ -55,11 +55,13 @@
 //!
 //! Runs may also read the coded objects through every node's gateway
 //! while fragment holders fail ([`CodingConfig::reads`], plan M5-06):
-//! see [`ReadConfig`].
+//! see [`ReadConfig`]. And they may lose holders once every object is
+//! coded, for the shard primary's repairer to make every stripe whole
+//! again ([`CodingConfig::repair`], plan M5-08): see [`RepairConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -74,9 +76,10 @@ use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topolog
 use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::orphans::{JudgeBug, PrimariesOf, Reclaimed};
 use skys3_ec::{
-    Attempts, EncodeEvent, EncodeStep, Encoder, EncoderSettings, FragmentClient, FragmentServer,
-    FragmentStore, FragmentStoreConfig, FragmentWriter, OrphanClient, OrphanJudge, OrphanReclaimer,
-    OrphanServer, SeededBug as StoreBug, TransferError, codec,
+    Attempts, EncodeEvent, EncodeStep, Encoder, EncoderSettings, FragmentClient,
+    FragmentReadClient, FragmentServer, FragmentStore, FragmentStoreConfig, FragmentWriter,
+    OrphanClient, OrphanJudge, OrphanReclaimer, OrphanServer, SeededBug as StoreBug, TransferError,
+    codec,
 };
 use skys3_index::{Entry, Index, IndexConfig, IndexReader};
 use skys3_io::{
@@ -93,16 +96,18 @@ use skys3_shard::{
 };
 use skys3_sim::SimContext;
 use skys3_types::{
-    AttemptId, BucketId, ClusterId, ETag, Epoch, FragmentId, Label, NodeAddress, NodeId,
-    ProposalId, ShardConfig, ShardId,
+    AttemptId, BucketId, ClusterId, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, Label,
+    NodeAddress, NodeId, ProposalId, ShardConfig, ShardId,
 };
 
 use crate::node::{BoxError, TRANSPORT_PORT};
 use crate::pki::Pki;
 
 mod reads;
+mod repair;
 
 pub use reads::{ReadConfig, ReadFault, ReadReport};
+pub use repair::{Loss, RepairConfig, RepairCrash, RepairOutcome, RepairPoint, RepairTarget};
 
 /// Where in an attempt the driver crashes nodes: at the first time the
 /// encoder reports the step.
@@ -231,6 +236,10 @@ pub struct CodingConfig {
     /// Reads through the gateways once every object is coded, while
     /// fragment holders fail (plan M5-06).
     pub reads: Option<ReadConfig>,
+    /// The `[ec]` policy of the six nodes, which shapes their stripes.
+    pub ec: EcConfig,
+    /// Holders lost once every object is coded, and repaired (plan M5-08).
+    pub repair: Option<RepairConfig>,
 }
 
 impl Default for CodingConfig {
@@ -246,6 +255,8 @@ impl Default for CodingConfig {
             write_delay: Duration::ZERO,
             takeover: false,
             reads: None,
+            ec: EcConfig::default(),
+            repair: None,
         }
     }
 }
@@ -284,6 +295,8 @@ pub struct CodingReport {
     pub epoch: u64,
     /// What the readers saw, in a run with reads.
     pub reads: Option<ReadReport>,
+    /// What the repairs did, in a run that loses holders.
+    pub repair: Option<RepairOutcome>,
 }
 
 const NODES: usize = 6;
@@ -345,12 +358,63 @@ struct World {
     register: Mutex<ShardConfig>,
     /// Whether each node is cut off from the register.
     cut_off: Vec<AtomicBool>,
-    /// Every fragment reclaimed, by node and ID.
-    reclaimed: Mutex<BTreeSet<(NodeId, FragmentId)>>,
-    /// The attempt of every fragment whose write was acknowledged.
-    fragments: Mutex<HashMap<(NodeId, FragmentId), AttemptId>>,
+    /// Every fragment reclaimed, by node, disk generation, and ID.
+    reclaimed: Mutex<BTreeSet<OnDisk>>,
+    /// Every fragment whose write was acknowledged, by node, disk
+    /// generation, and ID: a new disk hands out the IDs of the old one
+    /// again.
+    fragments: Mutex<HashMap<OnDisk, Written>>,
     /// The reads through the gateways, in a run with reads.
     reads: Option<reads::Reads>,
+    /// Whether each node is lost for good.
+    lost: Vec<AtomicBool>,
+    /// Whether each node is to start its next life on a new, empty
+    /// fragment disk.
+    lose_disk: Vec<AtomicBool>,
+    /// Whether each node's fragment disk is lost and the node has not come
+    /// up on its new one yet: it holds none of the fragments it held.
+    disk_gone: Vec<AtomicBool>,
+    /// How many fragment disks each node has lost.
+    generation: Vec<AtomicU64>,
+    /// How many lives each node has started.
+    lives: Vec<AtomicU64>,
+    /// Whether each node is to lose power at the sync after the next
+    /// repair write reaches it.
+    cut_at_repair_write: Vec<AtomicBool>,
+    /// What the repairers did.
+    repair: repair::RepairLog,
+}
+
+/// A fragment on one of a node's disks: the node, the disk's generation,
+/// and the fragment's ID on it.
+type OnDisk = (NodeId, u64, FragmentId);
+
+/// A fragment whose write was acknowledged: the attempt that wrote it, and
+/// what its header says it is.
+#[derive(Debug, Clone)]
+struct Written {
+    attempt: AttemptId,
+    key: String,
+    version: EpochSeq,
+    stripe: u32,
+    index: u8,
+}
+
+/// What a layout names a fragment as: its key, the version its header must
+/// name (the layout's, which a retag leaves behind the entry's), and its
+/// stripe and index.
+type Named<'a> = (&'a str, EpochSeq, u32, usize);
+
+impl Written {
+    /// The key, version, stripe, and index of the fragment.
+    fn identity(&self) -> Named<'_> {
+        (
+            self.key.as_str(),
+            self.version,
+            self.stripe,
+            usize::from(self.index),
+        )
+    }
 }
 
 impl World {
@@ -365,6 +429,28 @@ impl World {
     /// The position of `node` in the cluster.
     fn position(&self, node: &NodeId) -> Option<usize> {
         self.nodes.iter().position(|slot| slot.id == *node)
+    }
+
+    /// The generation of `node`'s current fragment disk.
+    fn generation_of(&self, node: &NodeId) -> u64 {
+        self.position(node)
+            .map_or(0, |n| self.generation[n].load(Ordering::SeqCst))
+    }
+
+    /// The disk generation of the fragment `location` names as fragment
+    /// `named` (key, version, stripe, index): the latest whose write under that ID
+    /// was of that fragment, if any was.
+    fn named_generation(
+        &self,
+        written: &HashMap<OnDisk, Written>,
+        location: &FragmentLocation,
+        named: Named<'_>,
+    ) -> Option<u64> {
+        (0..=self.generation_of(&location.node)).rev().find(|&g| {
+            written
+                .get(&(location.node.clone(), g, location.fragment))
+                .is_some_and(|record| record.identity() == named)
+        })
     }
 }
 
@@ -411,6 +497,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         reading: false,
         read_faults: Vec::new(),
         healing: Vec::new(),
+        repair: repair::Phase::default(),
     };
     let mut next_check = CHECK_INTERVAL;
     loop {
@@ -419,14 +506,19 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         let now = sim.elapsed();
         driver.advance(&mut sim, now);
         driver.read_faults(&mut sim, now);
+        driver.repair_crash(now);
         if now >= next_check {
             next_check = now + CHECK_INTERVAL;
             driver.check()?;
+            driver.repair_progress(now);
             match driver.settled() {
-                Ok(()) if driver.reads_pending(&mut sim, &world, now) => {}
                 Ok(()) => {
-                    driver.report.settled_at = now;
-                    break;
+                    let repairing = driver.repair_pending(&mut sim, &world, now);
+                    let reading = driver.reads_pending(&mut sim, &world, now);
+                    if !repairing && !reading {
+                        driver.report.settled_at = now;
+                        break;
+                    }
                 }
                 Err(why) if now > SETTLE_LIMIT => {
                     return Err(format!(
@@ -464,6 +556,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     if let Some(reads) = &world.reads {
         driver.report.reads = Some(reads.report()?);
     }
+    driver.report.repair = driver.repair_outcome()?;
     let report = driver.report.clone();
     drop(sim);
     final_check(&world)?;
@@ -527,6 +620,13 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         reclaimed: Mutex::default(),
         fragments: Mutex::default(),
         reads,
+        lost: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        lose_disk: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        disk_gone: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        generation: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
+        lives: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
+        cut_at_repair_write: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        repair: repair::RepairLog::default(),
         config: shard_config,
         run: config.clone(),
         sizes,
@@ -567,8 +667,8 @@ fn replication_config() -> ReplicationConfig {
 }
 
 /// The fixed topology of the six nodes, each a domain of its own, under
-/// the default `[ec]` policy.
-fn planner() -> FragmentPlanner {
+/// the `[ec]` policy `ec`.
+fn planner(ec: &EcConfig) -> FragmentPlanner {
     let candidates = (0..NODES).map(|n| Candidate {
         node: format!("n{n}").parse().expect("a valid node ID"),
         zone: None,
@@ -578,7 +678,7 @@ fn planner() -> FragmentPlanner {
         shards: 0,
         primaries: 0,
     });
-    let policy = GeometryPolicy::from_config(&EcConfig::default()).expect("the default policy");
+    let policy = GeometryPolicy::from_config(ec).expect("a valid policy");
     FragmentPlanner::new(Topology::new(FailureDomain::Node, candidates), policy)
 }
 
@@ -623,11 +723,8 @@ async fn open_storage(
 async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     let slot = &world.nodes[index];
     *lock(&slot.view) = None;
-    if world
-        .reads
-        .as_ref()
-        .is_some_and(|reads| reads.takes_new_disk(index))
-    {
+    let life_number = world.lives[index].fetch_add(1, Ordering::SeqCst);
+    if world.lose_disk[index].swap(false, Ordering::SeqCst) {
         // The node's fragment disk was lost: it starts on an empty one.
         let disk = SimDisk::new(world.seed ^ (index as u64) << 8 ^ slot.log_disk.crashes());
         disk.set_power(&slot.power);
@@ -698,6 +795,7 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         shard: shard.clone(),
         fragments: fragments.clone(),
     });
+    world.disk_gone[index].store(false, Ordering::SeqCst);
     let checkpointer = Arc::clone(&storage.checkpointer);
     let checkpoints = tokio::spawn(async move { checkpointer.run(CHECKPOINT_INTERVAL).await });
     let settings = CompactionSettings {
@@ -730,7 +828,8 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         );
         let observed = Arc::clone(world);
         let observer = Arc::new(move |reclaimed: &Reclaimed| {
-            let fragment = (reclaimed.node.clone(), reclaimed.suspect.id);
+            let generation = observed.generation_of(&reclaimed.node);
+            let fragment = (reclaimed.node.clone(), generation, reclaimed.suspect.id);
             lock(&observed.reclaimed).insert(fragment);
         });
         let reclaimer = OrphanReclaimer::new(
@@ -746,13 +845,33 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     if let Some(shard) = shard
         && (index == 0 || world.run.takeover)
     {
-        let client = FragmentClient::new(transport, world.peers.clone())
-            .with_local(slot.id.clone(), fragments);
-        let writer = Writer {
-            inner: client,
+        let writer = |repairer| Writer {
+            inner: FragmentClient::new(transport.clone(), world.peers.clone())
+                .with_local(slot.id.clone(), fragments.clone()),
             world: Arc::clone(world),
+            repairer,
         };
-        tokio::spawn(primary(Arc::clone(world), index, shard, writer, attempts));
+        let reads =
+            FragmentReadClient::new(slot.id.clone(), transport.clone(), world.peers.clone())
+                .with_local(fragments.clone());
+        let repairer = writer(Some((index, life_number)));
+        let shared = attempts.clone();
+        repair::start(
+            world,
+            index,
+            life_number,
+            shard.clone(),
+            reads,
+            repairer,
+            shared,
+        );
+        tokio::spawn(primary(
+            Arc::clone(world),
+            index,
+            shard,
+            writer(None),
+            attempts,
+        ));
     }
     let error = checkpoints.await;
     tracing::warn!(node = index, ?error, "a checkpoint failed; the node stops");
@@ -867,10 +986,12 @@ fn primaries(world: &World, index: usize) -> PrimariesOf {
 }
 
 /// A primary's fragment writes: each waits the run's `write_delay` first,
-/// and the driver learns the attempt of every fragment acknowledged.
+/// and the driver learns every fragment acknowledged, and the transfers of
+/// the repairer of a node and life, if the writes are a repairer's.
 struct Writer {
     inner: FragmentClient<TurmoilNetwork, SimMount>,
     world: Arc<World>,
+    repairer: Option<(usize, u64)>,
 }
 
 impl FragmentWriter for Writer {
@@ -880,11 +1001,45 @@ impl FragmentWriter for Writer {
         header: &FragmentHeader,
         data: Bytes,
     ) -> Result<FragmentId, TransferError> {
+        if let Some((repairer, life)) = self.repairer {
+            let len = data.len() as u64;
+            self.world.repair.transfer(repairer, life, len);
+        }
         if !self.world.run.write_delay.is_zero() {
             tokio::time::sleep(self.world.run.write_delay).await;
         }
+        let position = self.world.position(node);
+        let generation = |n: usize| self.world.generation[n].load(Ordering::SeqCst);
+        let before = position.map(generation);
+        if let Some(n) = position.filter(|_| self.repairer.is_some())
+            && self.world.cut_at_repair_write[n].swap(false, Ordering::SeqCst)
+        {
+            let power = &self.world.nodes[n].power;
+            power.cut_at_sync(power.syncs(), SyncCut::Before);
+        }
         let id = self.inner.write(node, header, data).await?;
-        lock(&self.world.fragments).insert((node.clone(), id), header.attempt);
+        // A fragment written to a disk that failed meanwhile is not on the
+        // node's current one.
+        if let Some(generation) = before.filter(|before| position.map(generation) == Some(*before))
+        {
+            let written = Written {
+                attempt: header.attempt,
+                key: header.key.clone(),
+                version: header.version,
+                stripe: header.stripe.number,
+                index: header.index,
+            };
+            lock(&self.world.fragments).insert((node.clone(), generation, id), written);
+        }
+        let ack_delay = self
+            .world
+            .run
+            .repair
+            .as_ref()
+            .map(|repair| repair.ack_delay);
+        if let Some(delay) = ack_delay.filter(|_| self.repairer.is_some()) {
+            tokio::time::sleep(delay).await;
+        }
         Ok(id)
     }
 }
@@ -908,10 +1063,11 @@ async fn primary(
         world.written.store(true, Ordering::SeqCst);
     }
     let events = Arc::clone(&world);
+    let ec = world.run.ec.clone();
     let encoder = Encoder::new(
         shard.clone(),
         Arc::new(writer),
-        Arc::new(planner),
+        Arc::new(move || planner(&ec)),
         Arc::new(SimWallClock),
         EncoderSettings {
             min_object_bytes: 1,
@@ -1064,6 +1220,8 @@ struct Driver<'a> {
     read_faults: Vec<(Duration, usize, ReadFault)>,
     /// When each node sending corrupted fragments stops.
     healing: Vec<(Duration, usize)>,
+    /// The repair phase.
+    repair: repair::Phase,
 }
 
 impl Driver<'_> {
@@ -1282,7 +1440,8 @@ impl Driver<'_> {
             self.check_key(&views, key)
                 .map_err(|e| format!("{key}: {e}"))?;
         }
-        self.check_reclaimed(&views, &keys)
+        self.check_reclaimed(&views, &keys)?;
+        self.check_held()
     }
 
     /// Checks one object over every node that was ever a member: one that
@@ -1320,11 +1479,12 @@ impl Driver<'_> {
             return Ok(());
         }
         let present = |node: &NodeId, id| {
-            let n = self.world.nodes.iter().position(|slot| slot.id == *node);
-            match n.map(|n| &views[n]) {
-                Some(Some(view)) => view.fragments.stores()[0].len(id).is_some(),
-                // Down: it holds what it held.
-                Some(None) => true,
+            let n = self.world.position(node);
+            match n.map(|n| (n, &views[n])) {
+                Some((_, Some(view))) => view.fragments.stores()[0].len(id).is_some(),
+                // Down: it holds what it held, unless it is lost for good
+                // or lost its fragment disk.
+                Some((n, None)) => !repair::holds_nothing(self.world, n),
                 None => false,
             }
         };
@@ -1349,6 +1509,7 @@ impl Driver<'_> {
     /// applied only committed records, has a coded layout naming a
     /// reclaimed fragment.
     fn check_reclaimed(&self, views: &[Option<View>], keys: &[String]) -> Result<(), String> {
+        let written = lock(&self.world.fragments);
         let reclaimed = lock(&self.world.reclaimed);
         if reclaimed.is_empty() {
             return Ok(());
@@ -1360,7 +1521,7 @@ impl Driver<'_> {
             });
             if leads {
                 let reader = view.index.read().map_err(|e| e.to_string())?;
-                no_reclaimed_fragment(&reader, &self.world.shard, keys, &reclaimed)
+                no_reclaimed_fragment(self.world, &written, &reader, keys, &reclaimed)
                     .map_err(|e| format!("the serving primary n{n}: {e}"))?;
             }
         }
@@ -1375,7 +1536,12 @@ impl Driver<'_> {
         if !self.world.written.load(Ordering::SeqCst) {
             return Err("the objects are not written".to_owned());
         }
-        if self.down.iter().any(Option::is_some)
+        let lost = |n: usize| self.world.lost[n].load(Ordering::SeqCst);
+        if self
+            .down
+            .iter()
+            .enumerate()
+            .any(|(n, down)| down.is_some() && !lost(n))
             || self.isolated.iter().any(Option::is_some)
             || self.crashes.is_some()
             || !self.due.is_empty()
@@ -1385,7 +1551,7 @@ impl Driver<'_> {
             return Err("crashes are pending".to_owned());
         }
         let views = self.views();
-        if let Some(n) = views.iter().position(Option::is_none) {
+        if let Some(n) = (0..NODES).find(|&n| views[n].is_none() && !lost(n)) {
             return Err(format!("n{n} has not recovered"));
         }
         let shard = &self.world.shard;
@@ -1442,16 +1608,23 @@ impl Driver<'_> {
             .map(|event| event.attempt)
             .collect();
         let written = lock(&self.world.fragments);
-        for (view, slot) in views.iter().zip(&self.world.nodes) {
+        for (n, (view, slot)) in views.iter().zip(&self.world.nodes).enumerate() {
             let Some(view) = view else {
+                if self.world.lost[n].load(Ordering::SeqCst) {
+                    continue;
+                }
                 return Err(format!("{} has not recovered", slot.id));
             };
+            let generation = self.world.generation[n].load(Ordering::SeqCst);
             for id in view.fragments.stores()[0].ids() {
                 let fragment = (slot.id.clone(), id);
-                let attempt = written.get(&fragment);
-                if !referenced.contains(&fragment)
-                    && !attempt.is_some_and(|attempt| published.contains(attempt))
-                {
+                let attempt = written
+                    .get(&(slot.id.clone(), generation, id))
+                    .map(|written| written.attempt);
+                let published = attempt.is_some_and(|attempt| {
+                    published.contains(&attempt) || self.world.repair.relocated(attempt)
+                });
+                if !referenced.contains(&fragment) && !published {
                     return Err(format!(
                         "{} holds orphan {id} of attempt {attempt:?}",
                         slot.id
@@ -1464,21 +1637,27 @@ impl Driver<'_> {
 }
 
 /// Checks that no coded layout of `keys` in `reader` names a fragment in
-/// `reclaimed`.
+/// `reclaimed`: the one of the disk generation it was written to, or, if
+/// no record says, of the node's current disk.
 fn no_reclaimed_fragment(
+    world: &World,
+    written: &HashMap<OnDisk, Written>,
     reader: &IndexReader,
-    shard: &ShardRef,
     keys: &[String],
-    reclaimed: &BTreeSet<(NodeId, FragmentId)>,
+    reclaimed: &BTreeSet<OnDisk>,
 ) -> Result<(), String> {
     for key in keys {
-        let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+        let entry = reader.entry(&world.shard, key).map_err(|e| e.to_string())?;
         let Some(coded) = entry.and_then(|e| e.object).and_then(|o| o.coded) else {
             continue;
         };
         for stripe in &coded.stripes {
-            for location in stripe.fragments() {
-                if reclaimed.contains(&(location.node.clone(), location.fragment)) {
+            for (index, location) in stripe.fragments().iter().enumerate() {
+                let named = (key.as_str(), coded.version, stripe.number(), index);
+                let generation = world
+                    .named_generation(written, location, named)
+                    .unwrap_or_else(|| world.generation_of(&location.node));
+                if reclaimed.contains(&(location.node.clone(), generation, location.fragment)) {
                     return Err(format!(
                         "the committed layout of {key} at {} names fragment {} on {}, \
                          which was reclaimed",
@@ -1523,20 +1702,24 @@ fn final_check(world: &World) -> Result<(), String> {
     runtime.block_on(async {
         let mut storages = Vec::new();
         let mut stores = BTreeMap::new();
-        for slot in &world.nodes {
+        for (n, slot) in world.nodes.iter().enumerate() {
             let (storage, store) = open_storage(slot, None)
                 .await
                 .map_err(|e| format!("{} does not recover: {e}", slot.id))?;
             storages.push(storage);
-            stores.insert(slot.id.clone(), store);
+            // A node lost for good serves no fragment.
+            if !world.lost[n].load(Ordering::SeqCst) {
+                stores.insert(slot.id.clone(), store);
+            }
         }
         let expected = lock(&world.expected).clone();
         let members = world.members();
         let keys: Vec<String> = expected.keys().cloned().collect();
+        let written = lock(&world.fragments).clone();
         let reclaimed = lock(&world.reclaimed).clone();
         for &member in &members {
             let reader = storages[member].index.read().map_err(|e| e.to_string())?;
-            no_reclaimed_fragment(&reader, &world.shard, &keys, &reclaimed)
+            no_reclaimed_fragment(world, &written, &reader, &keys, &reclaimed)
                 .map_err(|e| format!("member n{member}: {e}"))?;
         }
         for (key, data) in &expected {
@@ -1579,10 +1762,15 @@ async fn read_back(
             for (index, location) in stripe.fragments().iter().enumerate() {
                 // A fragment counts only if it is the one the layout names:
                 // readable, verified, and with a header of this stripe of
-                // the version the layout's fragments were written for.
-                let store = &stores[&location.node];
-                let len = store.len(location.fragment).unwrap_or(0);
-                let read = store.read(location.fragment, 0..len).await.ok();
+                // the version the layout's fragments were written for, on a
+                // node not lost for good.
+                let read = match stores.get(&location.node) {
+                    Some(store) => {
+                        let len = store.len(location.fragment).unwrap_or(0);
+                        store.read(location.fragment, 0..len).await.ok()
+                    }
+                    None => None,
+                };
                 slots.push(
                     read.filter(|read| {
                         let header = &read.header;

@@ -79,7 +79,7 @@ pub enum RecordKind {
     Adopt,
     /// Publishes an erasure-coded object version's layout (defined).
     EcPublish,
-    /// Moves erasure-coded fragments (reserved for M5).
+    /// Moves erasure-coded fragments to new locations (defined).
     EcRelocate,
     /// Releases a replicated copy after encoding (reserved for M5).
     EcRelease,
@@ -189,6 +189,7 @@ impl RecordKind {
                 | Self::Import
                 | Self::Adopt
                 | Self::EcPublish
+                | Self::EcRelocate
                 | Self::Truncate
                 | Self::Config
         )

@@ -170,6 +170,7 @@ Erasure coding of `local` buckets (§8).
 | `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. |
 | `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). Also how long compaction keeps payload no entry names before it drops it (§10.3). |
 | `fragment_orphan_after_seconds` | integer | `3600` | Positive (§8.4). |
+| `fragment_repair_after_seconds` | integer | `600` | Positive (§8.6). How long a node may leave a shard primary's fragment checks unanswered before the primary rebuilds the node's fragments elsewhere. A node that answers but no longer holds a fragment has it rebuilt at once. |
 | `repair_bytes_per_second_per_node` | integer | `104857600` (100 MiB/s) | Positive (§8.6). |
 
 ## `[buckets.defaults]` and `[buckets.<name>]` {#buckets}

@@ -328,6 +328,7 @@ fn durations_and_sizes_must_be_positive() {
         ("flush", "import_max_keys_per_second"),
         ("ec", "max_data_fragments"),
         ("ec", "fragment_orphan_after_seconds"),
+        ("ec", "fragment_repair_after_seconds"),
         ("ec", "repair_bytes_per_second_per_node"),
         ("peering", "peer_connect_timeout_ms"),
         ("peering", "peer_connections_per_shard"),
