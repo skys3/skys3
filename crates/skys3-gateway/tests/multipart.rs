@@ -416,6 +416,31 @@ async fn an_upload_without_an_algorithm_gets_crc64nvme_and_keeps_listed_parts() 
     assert!(located.is_disjoint(&skipped_positions), "{located:?}");
 }
 
+/// A gateway whose smallest part is lowered, as simulations lower it,
+/// completes uploads of small parts, and still refuses smaller ones.
+#[tokio::test]
+async fn the_smallest_part_can_be_lowered() {
+    let mut lowered = mib_extents();
+    lowered.min_part_bytes = 10;
+    let setup = setup_with(lowered).await;
+    setup.create_local("photos").await;
+    let id = setup.create_upload("k", &[]).await;
+    let first = setup.part("k", &id, 1, filled(10, b'a')).await;
+    let short = setup.part("k", &id, 2, filled(9, b'b')).await;
+    let last = setup.part("k", &id, 3, filled(1, b'c')).await;
+    setup
+        .complete("k", &id, &[], &[(2, short.as_str()), (3, last.as_str())])
+        .await
+        .assert(400, Some("EntityTooSmall"));
+    setup
+        .complete("k", &id, &[], &[(1, first.as_str()), (3, last.as_str())])
+        .await
+        .assert(200, None);
+    let got = setup.get("k", &[], "").await;
+    got.assert(200, None);
+    assert_eq!(got.body.as_bytes(), b"aaaaaaaaaac");
+}
+
 #[tokio::test]
 async fn completions_check_their_parts() {
     let (setup, _) = local().await;

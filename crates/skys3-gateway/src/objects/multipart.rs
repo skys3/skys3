@@ -360,7 +360,7 @@ impl<H: Shards> Objects<H> {
                 "You must specify at least one part"
             ));
         }
-        let parts = match_parts(listed, &stored, checksum.algorithm)?;
+        let parts = match_parts(listed, &stored, checksum.algorithm, self.min_part_bytes)?;
 
         let mut etag = MultipartEtag::new();
         let mut object_checksum =
@@ -622,11 +622,13 @@ impl<H: Shards> Objects<H> {
 ///
 /// `400 InvalidPartOrder` for part numbers out of order, `400 InvalidPart`
 /// for a part that is missing or whose ETag or checksum differs, and `400
-/// EntityTooSmall` for a part under [`MIN_PART_BYTES`] before the last.
+/// EntityTooSmall` for a part under `min_part_bytes` (S3's
+/// [`MIN_PART_BYTES`]) before the last.
 fn match_parts<'a>(
     listed: &[s3s::dto::CompletedPart],
     stored: &'a [(u16, Part)],
     algorithm: ChecksumAlgorithm,
+    min_part_bytes: u64,
 ) -> S3Result<Vec<(u16, &'a Part)>> {
     let mut parts: Vec<(u16, &Part)> = Vec::with_capacity(listed.len());
     for (index, entry) in listed.iter().enumerate() {
@@ -661,7 +663,7 @@ fn match_parts<'a>(
         if !etag_matches || !checksum_matches {
             return Err(invalid_part());
         }
-        if index + 1 < listed.len() && part.size < MIN_PART_BYTES {
+        if index + 1 < listed.len() && part.size < min_part_bytes {
             return Err(s3_error!(
                 EntityTooSmall,
                 "Your proposed upload is smaller than the minimum allowed object size."

@@ -110,6 +110,15 @@ pub enum Fault {
         /// How long the nodes stay down.
         downtime: Duration,
     },
+    /// The node's link to the remote store drops: its requests there are
+    /// lost, and so are the answers of those in progress, while the rest
+    /// of the cluster reaches the store.
+    RemoteLink {
+        /// The node.
+        node: usize,
+        /// How long the link stays down.
+        duration: Duration,
+    },
     /// Not a fault: a node held back from the start
     /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)) starts
     /// for the first time, as a newly provisioned node with valid
@@ -131,7 +140,8 @@ impl Fault {
             | Fault::MessageLoss { duration, .. }
             | Fault::ControlOutage { duration }
             | Fault::ControlLatency { duration, .. }
-            | Fault::LostCasResponses { duration, .. } => Some(*duration),
+            | Fault::LostCasResponses { duration, .. }
+            | Fault::RemoteLink { duration, .. } => Some(*duration),
             Fault::RebuildControlStore { downtime, .. } => Some(*downtime),
             Fault::FailSync { .. } | Fault::Join { .. } | Fault::LoseControlStore => None,
         }
@@ -326,6 +336,11 @@ mod tests {
         assert_eq!(Fault::FailSync { node: 0, disk: 0 }.duration(), None);
         assert_eq!(Fault::Join { node: 3 }.duration(), None);
         assert_eq!(Fault::LoseControlStore.duration(), None);
+        let link = Fault::RemoteLink {
+            node: 0,
+            duration: Duration::from_secs(2),
+        };
+        assert_eq!(link.duration(), Some(Duration::from_secs(2)));
         let rebuild = Fault::RebuildControlStore {
             power_loss: true,
             downtime: Duration::from_secs(1),
@@ -376,8 +391,11 @@ mod tests {
                     }
                     Fault::Join { .. }
                     | Fault::LoseControlStore
-                    | Fault::RebuildControlStore { .. } => {
-                        panic!("a random plan joins no node and loses no store")
+                    | Fault::RebuildControlStore { .. }
+                    | Fault::RemoteLink { .. } => {
+                        panic!(
+                            "a random plan joins no node, loses no store, and drops no remote link"
+                        )
                     }
                 };
                 kinds[kind] += 1;

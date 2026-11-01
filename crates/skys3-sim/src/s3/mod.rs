@@ -41,6 +41,25 @@
 //!   flush concurrency to adapt to (design §7.7). [`SimS3Stats`] keeps the
 //!   most requests and request-body bytes the store had in progress at
 //!   once.
+//! - **Sources.** A handle may name the source of its requests
+//!   ([`SimS3::from_source`]), such as the node that sends them. A
+//!   source's link to the store can drop ([`SimS3::set_source_down`]):
+//!   while it is down, its requests are lost before they are applied, and
+//!   a request in progress when it drops loses its answer, applied or not.
+//! - **Faults per operation** ([`SimS3::set_operation_faults`]): one
+//!   operation, such as `CompleteMultipartUpload`, can fail or lose its
+//!   answers more often than the rest.
+//! - **Observers** ([`SimS3::observe`]): a function the store calls after
+//!   each request it applied, with the operation, its source, and for a
+//!   write the key's current object, so that a test can audit every state
+//!   the store passes through, including those no read would see.
+//! - **Chosen lost answers** ([`SimS3::lose_answers`]): a function that
+//!   picks, among the requests the store applied, those whose answers it
+//!   loses, such as every `CompleteMultipartUpload` of some keys, while
+//!   it answers the requests it refused.
+//!
+//! None of these changes what a store does until it is used, so seeds
+//! recorded before them replay unchanged.
 //!
 //! Faults come from a generator seeded at creation, and the store never
 //! reads the wall clock, so a simulation seed replays them exactly. Delays
@@ -234,7 +253,35 @@ pub struct SimS3Stats {
     /// The most request-body bytes (`PutObject`, `UploadPart`) in progress
     /// at once.
     pub max_in_flight_bytes: u64,
+    /// Requests lost because their source's link was down when they
+    /// arrived, and answers lost because it dropped while their request
+    /// was in progress ([`SimS3::set_source_down`]).
+    pub cut_off: u64,
 }
+
+/// A request the store applied, as an observer sees it
+/// ([`SimS3::observe`]).
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct Applied<'a> {
+    /// The operation.
+    pub operation: Operation,
+    /// The source of the handle that sent it ([`SimS3::from_source`]).
+    pub source: Option<&'a str>,
+    /// The key it wrote, for `PutObject`, `CopyObject`,
+    /// `CompleteMultipartUpload`, and `DeleteObject`.
+    pub key: Option<&'a str>,
+    /// For a write, the key's current object once it was applied: `None`
+    /// if the key has none, or for any other request.
+    pub current: Option<&'a GetOutput>,
+}
+
+/// What [`SimS3::observe`] calls after each request the store applied.
+pub type Observer = Arc<dyn Fn(&Applied<'_>) + Send + Sync>;
+
+/// What [`SimS3::lose_answers`] asks of each request the store applied:
+/// whether to lose its answer.
+pub type AnswerLoss = Arc<dyn Fn(&Applied<'_>) -> bool + Send + Sync>;
 
 /// A simulated S3 bucket.
 ///
@@ -245,6 +292,8 @@ pub struct SimS3 {
     shared: Arc<Shared>,
     /// The credentials this handle's requests are made with, if any.
     credentials: Option<Arc<str>>,
+    /// The source this handle's requests come from, if it names one.
+    source: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -271,6 +320,70 @@ struct State {
     denied: BTreeSet<(String, String)>,
     /// Every write the store applied, in order: its operation and key.
     applied: Vec<(Operation, String)>,
+    /// The links of the sources whose link dropped at least once.
+    sources: BTreeMap<String, SourceLink>,
+    /// What is called after each request the store applied.
+    observer: Option<Observed>,
+    /// What picks the applied requests whose answers are lost.
+    losing: Option<Losing>,
+}
+
+/// The observer of a store, which `Debug` shows by its presence alone.
+#[derive(Clone)]
+struct Observed(Observer);
+
+impl std::fmt::Debug for Observed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Observer")
+    }
+}
+
+/// The [`AnswerLoss`] of a store, which `Debug` shows by its presence
+/// alone.
+#[derive(Clone)]
+struct Losing(AnswerLoss);
+
+impl std::fmt::Debug for Losing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnswerLoss")
+    }
+}
+
+impl State {
+    fn new(bucket: Bucket, injector: Injector) -> Self {
+        State {
+            bucket,
+            injector,
+            in_flight: BTreeMap::new(),
+            next_request: 0,
+            stats: SimS3Stats::default(),
+            link: Link::default(),
+            in_progress: (0, 0),
+            unanswered: HashMap::new(),
+            denied: BTreeSet::new(),
+            applied: Vec::new(),
+            sources: BTreeMap::new(),
+            observer: None,
+            losing: None,
+        }
+    }
+
+    /// The link of `source`, up and never dropped if it has none.
+    fn source_link(&self, source: Option<&str>) -> SourceLink {
+        source
+            .and_then(|source| self.sources.get(source))
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+/// The state of one source's link to the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SourceLink {
+    /// Whether it is down now.
+    down: bool,
+    /// How many times it went down.
+    drops: u64,
 }
 
 /// A request's effect on conflict detection, and its body.
@@ -298,21 +411,14 @@ impl SimS3 {
     pub fn new(seed: u64, config: SimS3Config) -> Self {
         SimS3 {
             shared: Arc::new(Shared {
-                state: Mutex::new(State {
-                    bucket: Bucket::new(config.clone()),
-                    injector: Injector::new(SmallRng::seed_from_u64(seed)),
-                    in_flight: BTreeMap::new(),
-                    next_request: 0,
-                    stats: SimS3Stats::default(),
-                    link: Link::default(),
-                    in_progress: (0, 0),
-                    unanswered: HashMap::new(),
-                    denied: BTreeSet::new(),
-                    applied: Vec::new(),
-                }),
+                state: Mutex::new(State::new(
+                    Bucket::new(config.clone()),
+                    Injector::new(SmallRng::seed_from_u64(seed)),
+                )),
                 config,
             }),
             credentials: None,
+            source: None,
         }
     }
 
@@ -326,33 +432,88 @@ impl SimS3 {
         let bucket = self.state().bucket.clone();
         SimS3 {
             shared: Arc::new(Shared {
-                state: Mutex::new(State {
+                state: Mutex::new(State::new(
                     bucket,
-                    injector: Injector::new(SmallRng::seed_from_u64(0)),
-                    in_flight: BTreeMap::new(),
-                    next_request: 0,
-                    stats: SimS3Stats::default(),
-                    link: Link::default(),
-                    in_progress: (0, 0),
-                    unanswered: HashMap::new(),
-                    denied: BTreeSet::new(),
-                    applied: Vec::new(),
-                }),
+                    Injector::new(SmallRng::seed_from_u64(0)),
+                )),
                 config: self.shared.config.clone(),
             }),
             credentials: None,
+            source: None,
         }
     }
 
     /// A handle on the same bucket whose requests are made with the
     /// credentials named `credentials`, which [`SimS3::deny`] may refuse
-    /// keys.
+    /// keys. It keeps this handle's source.
     #[must_use]
     pub fn with_credentials(&self, credentials: &str) -> Self {
         SimS3 {
             shared: Arc::clone(&self.shared),
             credentials: Some(credentials.into()),
+            source: self.source.clone(),
         }
+    }
+
+    /// A handle on the same bucket whose requests come from `source`, such
+    /// as a node: their link to the store drops with
+    /// [`SimS3::set_source_down`], and observers learn their source. It
+    /// keeps this handle's credentials.
+    #[must_use]
+    pub fn from_source(&self, source: &str) -> Self {
+        SimS3 {
+            shared: Arc::clone(&self.shared),
+            credentials: self.credentials.clone(),
+            source: Some(source.into()),
+        }
+    }
+
+    /// Drops, or with `down` false restores, the link between `source` and
+    /// the store. While it is down, the source's requests are lost before
+    /// the store applies them. A request in progress when it drops loses
+    /// its answer, whether the store applied it or not, as when a
+    /// connection breaks: the caller gets [`S3ErrorKind::Timeout`]. Other
+    /// sources are unaffected.
+    pub fn set_source_down(&self, source: &str, down: bool) {
+        let mut state = self.state();
+        let link = state.sources.entry(source.to_owned()).or_default();
+        if down && !link.down {
+            link.drops += 1;
+        }
+        link.down = down;
+    }
+
+    /// Replaces the random faults of the requests of `operation`, or with
+    /// `None` makes them follow [`SimS3::set_faults`] again: their error
+    /// faults and delays are drawn from `faults` instead. Scripted faults
+    /// ([`SimS3::inject`]) still come first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `faults` is not valid, as [`SimS3::set_faults`] does.
+    pub fn set_operation_faults(&self, operation: Operation, faults: Option<SimS3Faults>) {
+        if let Some(faults) = &faults {
+            faults.validate();
+        }
+        self.state().injector.set_operation(operation, faults);
+    }
+
+    /// Calls `observer` after each request the store applies from now on,
+    /// in place of any earlier one, or with `None` stops calling it. It is
+    /// called once the request took effect, before its answer is delayed or
+    /// lost, outside the store's lock; it must not wait for the store.
+    pub fn observe(&self, observer: Option<Observer>) {
+        self.state().observer = observer.map(Observed);
+    }
+
+    /// Loses the answer of each request the store applies from now on for
+    /// which `lose` returns true, as [`Fault::LostResponse`] does, in place
+    /// of any earlier function, or with `None` stops. The store answers
+    /// every request it refused, unless a random or scripted fault loses
+    /// the answer. `lose` is called after the observer, outside the store's
+    /// lock; it must not wait for the store.
+    pub fn lose_answers(&self, lose: Option<AnswerLoss>) {
+        self.state().losing = lose.map(Losing);
     }
 
     /// Refuses, or with `denied` false allows again, reads of `key` made
@@ -513,7 +674,8 @@ impl SimS3 {
         tracking: Tracking<'_>,
         apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
     ) -> S3Result<T> {
-        let (plan, in_flight, arrival, _progress) = {
+        let source = self.source.as_deref();
+        let (plan, in_flight, arrival, _progress, drops) = {
             let mut state = self.state();
             state.stats.requests += 1;
             let plan = state.injector.plan(operation);
@@ -528,11 +690,26 @@ impl SimS3 {
                 }
                 _ => None,
             };
-            (plan, in_flight, arrival, progress)
+            let drops = state.source_link(source).drops;
+            (plan, in_flight, arrival, progress, drops)
         };
         sleep_until(arrival).await;
         sleep(plan.request_delay).await;
-        let result = self.process(operation, plan, in_flight, tracking.writes, apply);
+        let cut = {
+            let mut state = self.state();
+            let down = state.source_link(source).down;
+            state.stats.cut_off += u64::from(down);
+            down
+        };
+        let (result, chosen) = if cut {
+            let lost = S3Error::new(
+                S3ErrorKind::Timeout,
+                "the request was lost: the link to the store is down",
+            );
+            (Err(lost), false)
+        } else {
+            self.process(operation, plan, in_flight, tracking.writes, apply)
+        };
         let unanswered = result.is_ok().then(|| Unanswered {
             store: self,
             operation,
@@ -541,7 +718,7 @@ impl SimS3 {
         let delivery = self.state().link.delivery(Instant::now(), bytes);
         sleep_until(delivery).await;
         sleep(plan.response_delay).await;
-        if plan.fault == Some(Fault::LostResponse) {
+        if chosen || plan.fault == Some(Fault::LostResponse) {
             self.state().stats.lost_responses += 1;
             let kind = if plan.lost_as_timeout {
                 S3ErrorKind::Timeout
@@ -550,12 +727,25 @@ impl SimS3 {
             };
             return Err(S3Error::new(kind, "the response was lost"));
         }
+        if !cut {
+            let mut state = self.state();
+            let link = state.source_link(source);
+            if link.down || link.drops != drops {
+                state.stats.cut_off += 1;
+                return Err(S3Error::new(
+                    S3ErrorKind::Timeout,
+                    "the response was lost: the link to the store dropped",
+                ));
+            }
+        }
         std::mem::forget(unanswered);
         result
     }
 
     /// The store's side of a request: ends its conflict window, and applies it
-    /// unless a fault or a conflict stops it.
+    /// unless a fault or a conflict stops it. Tells the observer, if any, of
+    /// a request it applied. Returns the result, and whether the store's
+    /// [`AnswerLoss`] chose to lose its answer.
     fn process<T>(
         &self,
         operation: Operation,
@@ -563,7 +753,7 @@ impl SimS3 {
         in_flight: Option<InFlight<'_>>,
         writes: Option<&str>,
         apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
-    ) -> S3Result<T> {
+    ) -> (S3Result<T>, bool) {
         let mut state = self.state();
         let conflicted = in_flight.is_some_and(|in_flight| in_flight.finish(&mut state));
         let limited = !state.link.admit(Instant::now());
@@ -603,7 +793,7 @@ impl SimS3 {
             _ => None,
         };
         if let Some((kind, message)) = injected {
-            return Err(S3Error::new(kind, message));
+            return (Err(S3Error::new(kind, message)), false);
         }
         let result = match writes {
             Some(key) => state
@@ -619,7 +809,27 @@ impl SimS3 {
             }
             state.applied.push((operation, key.to_owned()));
         }
-        result
+        let observer = state.observer.clone().filter(|_| result.is_ok());
+        let losing = state.losing.clone().filter(|_| result.is_ok());
+        let mut chosen = false;
+        if observer.is_some() || losing.is_some() {
+            let current =
+                writes.and_then(|key| state.bucket.get_object(&GetObject::new(key), false).ok());
+            drop(state);
+            let applied = Applied {
+                operation,
+                source: self.source.as_deref(),
+                key: writes,
+                current: current.as_ref(),
+            };
+            if let Some(Observed(observer)) = observer {
+                observer(&applied);
+            }
+            if let Some(Losing(lose)) = losing {
+                chosen = lose(&applied);
+            }
+        }
+        (result, chosen)
     }
 
     /// Applies `support` to a precondition that is `present` on a request:

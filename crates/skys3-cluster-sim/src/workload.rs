@@ -34,7 +34,12 @@ use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
 use skys3_types::{BucketDocument, NodeId, ShardConfig};
 
 use crate::cluster::WriteTiming;
+use crate::large_objects::Versions;
 use crate::s3::{self, NoAnswer};
+
+mod large;
+
+pub(crate) use large::single_put_etags;
 
 /// The shape of the client workload.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,11 +146,21 @@ pub(crate) fn etag_of(body: &[u8]) -> String {
 /// The ETag S3 gives a multipart object of the single part `body`: the
 /// MD5 of the part's MD5, in hex, and the part count.
 pub(crate) fn multipart_etag_of(body: &[u8]) -> String {
-    let mut hex = String::with_capacity(34);
-    for byte in Md5::digest(Md5::digest(body)) {
+    multipart_etag(&[body])
+}
+
+/// The ETag S3 gives a multipart object of `parts`: the MD5 of the parts'
+/// MD5s, in hex, and the part count (§7.4).
+pub(crate) fn multipart_etag(parts: &[&[u8]]) -> String {
+    let mut digests = Md5::new();
+    for part in parts {
+        digests.update(Md5::digest(part));
+    }
+    let mut hex = String::with_capacity(36);
+    for byte in digests.finalize() {
         let _ = write!(hex, "{byte:02x}");
     }
-    hex.push_str("-1");
+    let _ = write!(hex, "-{}", parts.len());
     hex
 }
 
@@ -259,6 +274,14 @@ pub(crate) struct Client {
     timings: Option<Timings>,
     /// What the client tells of each acknowledged write, if anything.
     on_ack: Option<OnAck>,
+    /// With the large-object mix, where the client registers each version
+    /// it may make before it sends it ([`ClusterConfig::large_objects`]).
+    ///
+    /// [`ClusterConfig::large_objects`]: crate::ClusterConfig::large_objects
+    large: Option<Versions>,
+    /// The multipart uploads of the large-object mix not known to be
+    /// completed or aborted, which the client aborts once it is done.
+    uploads: Vec<large::OpenUpload>,
 }
 
 impl Client {
@@ -278,12 +301,21 @@ impl Client {
             seen: BTreeMap::new(),
             timings: None,
             on_ack: None,
+            large: None,
+            uploads: Vec::new(),
         }
     }
 
     /// The same client, telling `on_ack` of each acknowledged write.
     pub(crate) fn with_acks(mut self, on_ack: Option<OnAck>) -> Self {
         self.on_ack = on_ack;
+        self
+    }
+
+    /// The same client, sending the large-object mix and registering each
+    /// version it may make in `versions`, if given.
+    pub(crate) fn with_large_objects(mut self, versions: Option<Versions>) -> Self {
+        self.large = versions;
         self
     }
 
@@ -327,6 +359,10 @@ impl Client {
             let bucket = self.rng.random_range(0..self.routes.buckets.len());
             let bucket = self.routes.buckets[bucket].clone();
             let key = format!("key-{}", self.rng.random_range(0..self.workload.keys));
+            if let Some(versions) = self.large.clone() {
+                self.large_operation(&versions, &bucket, &key, n).await?;
+                continue;
+            }
             if self.workload.get_percent > 0
                 && self.rng.random_range(0..100) < self.workload.get_percent
             {
@@ -356,7 +392,9 @@ impl Client {
                 _ => self.delete(&bucket, &key).await?,
             }
         }
-        Ok(())
+        // Uploads the client left open are aborted, as a transfer manager
+        // aborts the uploads it gives up on.
+        self.abort_open_uploads().await
     }
 
     /// The node to send a request on `key` in `bucket` to: its primary,
@@ -448,8 +486,24 @@ impl Client {
         condition: Condition,
     ) -> turmoil::Result {
         let body = self.body(n);
+        self.put_body(bucket, key, body, condition, &[]).await
+    }
+
+    /// Sends a `PUT` of `body` to `key` in `bucket` with `condition` and
+    /// the `headers` given, and records it.
+    async fn put_body(
+        &mut self,
+        bucket: &BucketDocument,
+        key: &str,
+        body: Bytes,
+        condition: Condition,
+        headers: &[(&str, &str)],
+    ) -> turmoil::Result {
         let value = etag_of(&body);
         let mut request = Request::put(format!("/{}/{key}", bucket.name));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         match &condition {
             Condition::None => {}
             Condition::IfAbsent => request = request.header("if-none-match", "*"),
@@ -600,7 +654,7 @@ impl Client {
                         .and_then(|etag| etag.to_str().ok())
                         .map(|etag| unquote(etag).to_owned())
                         .ok_or_else(|| unexpected("a read without an ETag", &response))?;
-                    if method == Method::GET && !body_matches(response.body(), &etag) {
+                    if method == Method::GET && !self.read_matches(&response, &etag) {
                         return Err(unexpected("a GET whose body does not match", &response));
                     }
                     self.seen.insert(name, etag.clone());
@@ -621,6 +675,25 @@ impl Client {
         let definite = matches!(outcome, Outcome::Read(_));
         self.history.answer(pending, outcome);
         Ok(definite)
+    }
+
+    /// Whether the body of `response`, a `GET`, is the object its `etag`
+    /// names: by the ETag's own rule for a single part, and for more parts
+    /// by the version of the large-object mix its metadata names.
+    fn read_matches(&self, response: &Response<Bytes>, etag: &str) -> bool {
+        let several = etag
+            .rsplit_once('-')
+            .is_some_and(|(_, parts)| parts.parse::<u32>().is_ok_and(|parts| parts >= 2));
+        match &self.large {
+            Some(versions) if several => {
+                let op = response
+                    .headers()
+                    .get(large::OP_HEADER)
+                    .and_then(|op| op.to_str().ok());
+                op.is_some_and(|op| versions.matches(op, response.body(), etag))
+            }
+            _ => body_matches(response.body(), etag),
+        }
     }
 
     async fn delete(&mut self, bucket: &BucketDocument, key: &str) -> turmoil::Result {
@@ -692,6 +765,9 @@ impl Client {
             if !answered {
                 return Err(format!("the primary of {}/{key} never answered", bucket.name).into());
             }
+        }
+        if self.large.is_some() {
+            self.abort_listed_uploads(attempts).await?;
         }
         Ok(())
     }
