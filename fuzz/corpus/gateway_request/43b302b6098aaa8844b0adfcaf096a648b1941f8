@@ -1,0 +1,1 @@
+‡<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>atus><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>

@@ -1,0 +1,2 @@
+
+Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=arn:aws:iam::yToken=a.b.c

@@ -1,0 +1,2 @@
+sujject
+{"Version": "2012-10-17", "Id": "t12-10-17", "Id": "t", "Statemnet": [{"Sid": "a", "Effect": "Allow", "Principal": {"FederaringLike": {"idp.example:sub": ["$p", "?b"], "idp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.exampli"}, "Action": "sts:*"}]}

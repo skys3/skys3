@@ -1,0 +1,2 @@
+repo:example/app:ref:refs/heads/main
+{"Version": "8872-10-17", "Statement": {"Effect": "AlleRoleWithWebIdentity", "Condition": {"StringEquals": {"token.actioken.actions.githubusercontent.com:aud": "sts.amazonaws.com"}, "StringLike": {"token.actionj.githubuserconLLLLLLLLLLLLLLLLLLLL.com:aud": "sts.amazonaws.com"}, "StringLike": {"torcontent.com:sub": "repo:examp p:*"}}}}

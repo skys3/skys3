@@ -1,0 +1,2 @@
+le/app:rdf:refs/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow","Principal": {"Federated": "arn:aws:iam::0  actions.githubuser#ontent.ckm"}, "Action": "sts:AssumeRole", "Condition": {"StringtringLike": {"ctions.gb": "repo:example/app:*"}}}}

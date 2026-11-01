@@ -1,0 +1,9 @@
+/fuzz
+content-type: multipart/form-data; boundary=x
+
+--x
+Content-Disposition: fprm-data; name="key"
+
+k'
+--x--
+~

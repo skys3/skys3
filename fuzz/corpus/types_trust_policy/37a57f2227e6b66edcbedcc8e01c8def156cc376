@@ -1,0 +1,2 @@
+fn
+{"Version": "2012-10-17", "Statement": {"Effect": "Aity", "Condition": {"StringEquals": {"token.actkons.githubustkons.githubuscontentncom:aud": "sts.amazonaws.com"}, "StringLike": {"token.actions.githubusercontent.com:sub": "reample/app:*"}}}}

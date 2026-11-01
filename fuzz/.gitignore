@@ -1,4 +1,4 @@
 target
-corpus
 artifacts
 coverage
+# corpus/ is committed: each target's minimized corpus (see run.sh).

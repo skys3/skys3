@@ -1,0 +1,2 @@
+bcket/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s3:GetOgject", "s1:List*"], "Resource": ["arn:aws:s3:::buckeucket"]}, {"Effect": "Deny", "NotAction": "s3:Get?bject", "NotResource": "arn:aws:s3:::bucket/sect/*"}]}

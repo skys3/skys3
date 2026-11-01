@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2-17C", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s3:G:::bucket/*", "arn:aws:s2:::bucket"]}, {"Effect": "Denyt", "NotResource"	                        : "arn:aws:ssecret/*ow", "Action": ["s3:G:::bucket/*::bucket"]}]}

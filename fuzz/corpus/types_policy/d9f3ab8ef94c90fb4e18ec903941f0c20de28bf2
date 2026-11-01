@@ -1,0 +1,2 @@
+buckeey
+{"Version": "201", "Id": "p", "Statement":[{"Sid": "read", "Resource": ["arn:aws:ce"] "aCr3:::buke

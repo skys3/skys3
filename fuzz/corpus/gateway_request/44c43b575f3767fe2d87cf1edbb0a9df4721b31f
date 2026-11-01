@@ -1,0 +1,5 @@
+/fuzz/dst
+x-amz-copy-source: /fuzz/k
+x-amz-metadata-directive: RDPLtadata-dEPLACE
+x-amz-copy-source-if-match: "ab COPY
+

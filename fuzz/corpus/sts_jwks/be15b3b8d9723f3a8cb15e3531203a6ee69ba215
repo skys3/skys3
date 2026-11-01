@@ -1,0 +1,1 @@
+{"keys": [{"kty": "RSA", "kid": "rsa-1", "use": "sig", "alg": "nnRS256", "n": "u8q86gh3mM76", "crv": "P-256", "x": "9pnnO-VproeMl8NbhfvcileuE8qvHw", "e": "vHw", "%": "AQAB", "x5c": ["MIIB"], "x5t": "abc", "key_ops": [""]}]}

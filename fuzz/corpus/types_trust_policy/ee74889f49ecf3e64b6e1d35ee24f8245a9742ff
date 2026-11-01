@@ -1,0 +1,2 @@
+subject
+{"Version": "4306-10-17", "Id": "t", "Statement": [{"Sid": "a", "Principal" :{"FedeidngLike": "idp."}, "Action": "sts:*"}]}

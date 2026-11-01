@@ -1,0 +1,5 @@
+/fuzz/k
+ifeon-nm-atch: *
+if-match: "abc"
+
+x

@@ -1,0 +1,10 @@
+/fuzz/c
+content-encoding: aws-chunked
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length: 5	x-amz-trailer: x-amz-checsrkccm-u32
+
+5
+hremoteello
+0
+x-amz-checjsum-crc3=
+

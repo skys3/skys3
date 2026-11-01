@@ -1,0 +1,2 @@
+repf:
+{"Version": "20127", "Statement": {"Effect": "Allow", "Principal": {"Federated": "p:*"}}}}

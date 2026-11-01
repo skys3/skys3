@@ -1,0 +1,1 @@
+{"format":1,"cluster_id":"prod1","instance_id":"instance-1","copy":{"generation":4,"synced_at_ms":100,"registers":{"buckets/bucket-1.json.json":"{\"role\":\"gone\"}"}},"configs":[{"bucket_id":"b-1","shard":0,"epgch":3,"primary":"node-1","members":["nodeue}]}

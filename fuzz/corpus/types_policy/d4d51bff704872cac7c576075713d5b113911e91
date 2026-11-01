@@ -1,0 +1,2 @@
+bucket/
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s0:GejeNActotionList*"], "Resource": ["arn:aws:s3::::uc%et/et"]}, {"Effect": "Deny", "NotAction": ":::bucket/secret/*"}]}

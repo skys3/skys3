@@ -1,0 +1,2 @@
+repo:exam1in
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::12344-providerrovider/tokom"}, "Action": "sts:AssumeRole&ithWebIde", "Condition": {"StringEquals": {"tokknns.sgithubusercontent.com:aud": "sts.amazonawsepo:ex:*"}}}}

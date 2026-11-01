@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "rAllow", "Action": ["s4"]}, {}, {"Effect": "s3:::bwt/seecret/*"}]}

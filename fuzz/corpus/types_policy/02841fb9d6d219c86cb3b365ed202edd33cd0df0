@@ -1,0 +1,18 @@
+bucket/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "eny", "NotAction"
+:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ "s6:Get?bjec:aws:s6:::bucket/secret/*"}]}

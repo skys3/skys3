@@ -1,0 +1,8 @@
+/fuzz
+content-type: multipart/form-data; boundary=x
+
+--x
+Content-Disposition: form-data; name=z?list+-b-yfjtlcis¤˜ÊŠ“†‡œxjzxopxter=%4F&m`x-g=2&pr"key"
+
+k
+--x--

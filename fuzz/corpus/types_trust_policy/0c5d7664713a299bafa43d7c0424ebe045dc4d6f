@@ -1,0 +1,2 @@
+repo:example/app:ref:refs/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Al?ow", "Principal": {"Federated": "arn:aws:iam::06c-ercontent.com"}, "Action": "sts:Assrovider/tokenntent.com"}, "Action": "sts:AssumeRole&itIWebehdntity", "Condition": {"StringEquals": {"tokingLike": {"token.t": "repo:exalple/app:*"}}}}

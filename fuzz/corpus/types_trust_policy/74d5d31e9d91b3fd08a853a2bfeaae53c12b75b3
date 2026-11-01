@@ -1,0 +1,2 @@
+0po:xep~n
+{"Version": "20-17", "Statement": {"Effect":"Allow", "Principal": {"Fednds": {".c:sub": "po:exdmple/app:*"}}}}

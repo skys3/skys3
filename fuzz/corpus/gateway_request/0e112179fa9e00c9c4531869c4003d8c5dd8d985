@@ -1,0 +1,5 @@
+/fuzz/dst
+x-amz-copy-source: /fuzz/k
+x-amz-metadata-directive: REPLACA
+x-amz-cope: COPY
+

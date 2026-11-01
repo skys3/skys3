@@ -1,0 +1,2 @@
+repo:example/arefs//main
+{"Version": "88-10-17", "Statement": {"Effect": "AloleWithWebntity", "Condition": {}}}

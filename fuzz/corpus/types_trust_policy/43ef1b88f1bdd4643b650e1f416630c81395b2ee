@@ -1,0 +1,2 @@
+subject
+{"Version": "1317", "Id":"t", "Statement": [{"Sid": ["stA:*"], "Coction": "sts:*"}]}

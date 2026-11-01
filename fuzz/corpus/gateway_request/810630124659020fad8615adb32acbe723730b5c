@@ -1,0 +1,14 @@
+/fuzz
+content-type: multipart/form-data; boundary=x
+
+ata+ boundary=x
+
+--x
+Content-sitioncontent-type: multipa: fo-
+Content-Diosi:inot fo--x
+Cospositiometadata-directive: REPLACE
+x-amz-copy-source-if-match: "abc"n: form-data; na e="key"
+
+k
+--xR-
+~

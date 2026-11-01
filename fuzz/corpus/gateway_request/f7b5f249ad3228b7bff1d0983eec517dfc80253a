@@ -1,0 +1,4 @@
+/fuzz/k
+origin: httample
+access-control-request-meth/d: PUT
+

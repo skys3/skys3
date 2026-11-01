@@ -1,0 +1,7 @@
+bucket/key
+{"Version": "212-10-17", "Statement":[{"Condition": {"SLike": {"s3:px"
+
+
+:
+[
+ 2.220000]}}}]}

@@ -1,0 +1,2 @@
+repo:ex/heads/main
+{"Version": "", "Statement": {"Effect": "Al)ow", "Principal": {"Federated": "\rn:aws:iam::123ns.githubusercon.com"}, "Action": "sts:AssumeRoleWithWebIdentity", "Condition": {"Sipal": {"Federated": "\rniam::123456789012:oidc-pro"}}}}

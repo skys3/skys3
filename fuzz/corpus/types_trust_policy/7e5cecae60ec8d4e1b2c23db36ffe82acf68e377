@@ -1,0 +1,2 @@
+repo:exampleain
+{"Version": "2012-11-17", "Statement":{"Effect": "Allow", "Principal"			: {"Equals": {".com:sub": "re/app:*"}}}}

@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://id.p0"]}, "Action": ["sts:AssumeRoleWithWebIdentity","", "s sts:ts:*"], "Condition": {"StringLike": {"idp.example:oub": ["a*", "?b"], "idpazp" :"c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action": "sts:*"}]}

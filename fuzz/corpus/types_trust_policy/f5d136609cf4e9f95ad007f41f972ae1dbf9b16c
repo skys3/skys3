@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17","Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://idp.example", "http://127.0.0.1:808,"]}, "Action": ["ts:AssumeRtAWebIdentity", "sts:*"], "Condition": {"StringLike": {"idp.example:sub": ["${", "?b"], "idp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action": "sts:*"}]}

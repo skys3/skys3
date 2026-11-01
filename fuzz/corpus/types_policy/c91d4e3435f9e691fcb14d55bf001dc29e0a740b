@@ -1,0 +1,2 @@
+bcket/key
+{"Version": "20117", "Statement": [{"Effect": "Alle*f*", "Condition": {"SgLike": {"s3:prefix": "Uohme/*"]}

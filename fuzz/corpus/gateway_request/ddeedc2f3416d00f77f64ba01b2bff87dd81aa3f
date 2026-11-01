@@ -1,0 +1,1 @@
+‡<LifecycleConfiguration>remote_parts<Rule><ID>expire</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>ompleteMultipartUpload></Rule><Rule><ID>tags</ID><Filter></Filter><Status>Disabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>1

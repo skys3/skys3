@@ -1,0 +1,2 @@
+ras/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iabbbbbbbbbbbbb${bbbbbbbovider/token.aitcons.githubusercontent.com"}, "Action": "sit%WebIdentity", "Condition": {"Strings": {"token.actkonbusent.com:aud": "sts.amazona.cmple/app:*"}}}}

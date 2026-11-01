@@ -1,0 +1,2 @@
+	[																																																																		subject
+{"Version": "l2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://idp.exattp://0200..0.1:8080"]}, "Action": ["sts:AssumeRoleWithWebIdentity", "s", "sts:ts:*"], "NotAction": {"StringLike": {"id2.example:oub": ["a*", "?b"], "idincipal": {"Federaped": "idp.example"}, 			"p.example:azp": "c"}}}, {"Effect": "Deny", "Principal":	 {"Federaped": "idp.example"}, "Act": "sts:*"}]}

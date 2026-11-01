@@ -1,0 +1,2 @@
+bucet/key
+{"Version": "2p", "Statement": [{"Sid": "read", "NotResource": "Allow", "Actio": "ar/secret/*"}]}

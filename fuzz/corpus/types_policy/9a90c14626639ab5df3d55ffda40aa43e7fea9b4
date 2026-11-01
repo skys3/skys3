@@ -1,0 +1,2 @@
+aa
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:*ck", "Resource": "arn:aws:s3:::*a*a*a*a*aza*-*a*c"}}

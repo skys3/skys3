@@ -1,0 +1,2 @@
+rapp:ref:refs/.heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:abbbbbbbbbbbbbbbbbbbbbbbb`bbbbbbbbb${bbbbbbbovider/token.aitcons.githubuserntent.com"}, "Action": "sit%WebIdentity", "Condition": {"Strings": {"token.actkons.githubustkons.githuud": "st:*"}}}}

@@ -1,0 +1,2 @@
+red"
+{"Version": "t", "Statement": [{"Sid": "at", "Effect": "Allow", "Principal": {"Federated": ["httpsample",

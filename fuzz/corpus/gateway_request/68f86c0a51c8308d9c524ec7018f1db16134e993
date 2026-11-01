@@ -1,0 +1,8 @@
+/fuzz
+content-type: multipart/form-data; boundary=x
+
+--x
+Content-Disposition: foÿÿÿÿatq; néÿž’šÂÝ”ey"
+
+k
+--x--

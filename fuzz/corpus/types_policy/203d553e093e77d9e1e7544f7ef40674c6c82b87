@@ -1,0 +1,2 @@
+btcektey
+{"Version": "2", "Statement": [{"Effect": "All:aws:s3**f*", "Condition": {"sion":

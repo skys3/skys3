@@ -1,0 +1,7 @@
+/fuzz/key
+host: fu††le
+x-amz-date: 20261001T000001Z
+x-amz-~ontent-sha256: STcksum-crc32c
+authorization: AWS4-HMAC-SHA256 Credential=AKIDFUZZ/20261001/us-jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjqjjjast-1/s3w/sa4_request, SignedHeaders=host~x-amz-content-sha256;x-amz-date, Signature=00000}000000000000000000000000018446744073709551615X-Amz-Signau0000000000000
+
+5;ch0000000000000000000000000000000000

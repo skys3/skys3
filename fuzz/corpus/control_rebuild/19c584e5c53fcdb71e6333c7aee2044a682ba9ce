@@ -1,0 +1,1 @@
+{"format":1,"cluster_id":"prod","node_id":"node-1","instance_id":"instance-1","copy":{"generation":4,"synced_at_ms":100,"registers":{"buckets/bucket-1.json":"{\"bucket_id\":\"b?1\",\"name\":\"bucket-1l_ide\"}"}},"configs":[{"bucket_id":"b-1","shard":0}],"rmat":1,"clus

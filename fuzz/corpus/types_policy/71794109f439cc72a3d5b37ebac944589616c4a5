@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "/012-10-17", "Id": "p", "Statement": [{ "Action": ["s3:GetObject", "s3:List*"], "Resource": ["arn:aws:s3cket"]}, {"Effect": "Deny", "NotAction": "s3bu2ket/ZZZZZZZny", "NotAction": "s3:GeZZZret/*"}]}

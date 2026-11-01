@@ -1,0 +1,3 @@
+‚<AccessControlPolicy><Owner><ID>o</ID></Owner><AccessControlList><Grant><Grantee xmlns:xssource: /ufzz/k
+x-amz-metadata-directive: REPLACE
+x-amz-copy-source-if-matci="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>o</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>

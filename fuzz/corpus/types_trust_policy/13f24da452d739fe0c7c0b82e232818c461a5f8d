@@ -1,0 +1,20 @@
+su&
+{"Version": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+: {"Federated": "idp.e1xample"}, "Action": "Ats:*"}]}

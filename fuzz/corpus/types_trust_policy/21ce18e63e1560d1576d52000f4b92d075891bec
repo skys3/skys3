@@ -1,0 +1,3 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://8080"]}, "Action": ["sts:AssumeRoldentity", "sts:*"], "Condition": {"StringLike": {"idp.xjmple:azp": "c"}}}, {"Effect": "Deny", "Principal":
+{"Federated": "idp.example"}, "Action": "sts:*"}]}

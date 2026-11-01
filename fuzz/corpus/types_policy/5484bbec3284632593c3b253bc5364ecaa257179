@@ -1,0 +1,5 @@
+bucket/key
+{"Version": "2-17", "Statement": [{"Resource": "n*", "Condition": {"SLike": {"s1:prefix"
+
+
+:[88.8888]}}}]}

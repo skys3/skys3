@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2=013-1p", "Statement": [{"Sid": "read", "Effect": "Albject", "NotResource": "ammmect", "NotResource": "arn:awst/*"}]}

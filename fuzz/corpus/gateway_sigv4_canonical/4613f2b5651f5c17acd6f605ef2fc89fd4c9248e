@@ -1,0 +1,9 @@
+/fuzz/c
+content7encoding: aws-chunked
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length:fffffffffffffsum-crc32
+
+5
+hello
+Cmhg==
+

@@ -1,0 +1,6 @@
+/
+Host: example.amazonaws.com
+X-Amz-Security-Token: AQoDYXdzEPT//////////wEXAMPLEtc764bNrC9SAPBSM22wDOk4x4HIZ4j4FZTwdQWLWsKWHGBuFqwAeMicRXmoIYRqTmlfKD8YUõwthAx7mSEiSIlTJabIQwj2IC/CR/oLxBA==
+X-Amz-Date: 20150830T1231600Z
+Authorization: AWS4-HMAC-SHA256 Credential=AKrvice/aws4_request, SignedHeaders=host;X-amAz-date, Signature=5da7c1e=5da7c1a2acd57cee721c308fbe5d6b
+

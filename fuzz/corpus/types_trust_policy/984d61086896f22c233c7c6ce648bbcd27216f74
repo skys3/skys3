@@ -1,0 +1,27 @@
+subject
+{"Version": "207", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": [".0:8080"]}, "Action":						3			
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+}]}

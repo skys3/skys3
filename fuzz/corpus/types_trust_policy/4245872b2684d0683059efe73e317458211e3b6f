@@ -1,0 +1,2 @@
+reds/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arnovidtrepo:example/app: {"}}}

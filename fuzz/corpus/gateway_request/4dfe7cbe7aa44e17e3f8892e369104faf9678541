@@ -1,0 +1,9 @@
+/fuzz/photos/2024/cat.jpg
+content-type: image/jpeg
+tnceont-md6: XUFAKowner: alice
+x-amz-tagging: a=1&b=2
+x-amcz-hecksum-crc32c: mnG7TA==
+cache-espacol: max-age=60
+content-length: 5
+
+hello

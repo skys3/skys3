@@ -1,0 +1,6 @@
+/fuzz/photos/2024/cat.jpg
+content-type: imagea=1&b=2
+x-amz-checksum-crc32c: mnG7TAb-tvcksum-crk76tetlmdfdlr=60
+content-length: 5
+
+hello

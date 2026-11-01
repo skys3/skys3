@@ -1,0 +1,2 @@
+repo:ref:refheads/main
+{"Version": "20-17", "Statement": {"Effect": "All6:oidc-provitent.com"}, "A": {"StringEquals": {"": "repo:exape/ap {"}}}

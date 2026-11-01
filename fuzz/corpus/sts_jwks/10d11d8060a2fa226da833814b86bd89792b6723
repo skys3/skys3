@@ -1,0 +1,1 @@
+{"keys": [{"kty": "OKP","kid": "rsa-1", "us": ["MIB"], "x5t": "&abc", "key_ops": ["verify"]}]}

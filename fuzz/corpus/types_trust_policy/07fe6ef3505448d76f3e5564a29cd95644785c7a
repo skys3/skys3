@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["ht://1s:/0"]}, "Action": ["le", "htt"], "Condition": {"StringLike": {"id:azp": "c"}}}, {"Effect": "DeCCC'CCCCCCCCCCCnsts:*"}]}

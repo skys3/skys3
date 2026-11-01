@@ -1,0 +1,2 @@
+bucket/key
+{ "Id": "p", "Statement": [{"Sid":"r", "NotAction": "?bject", "NotResource"    0	ktecret/*"}]}

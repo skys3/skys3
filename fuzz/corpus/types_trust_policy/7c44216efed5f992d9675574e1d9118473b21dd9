@@ -1,0 +1,2 @@
+repo:eads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "a-n:aws:iam::123456789210:oidc-provider/tws:iam::12345ken.actkons.gitrAepo:example/app:.{"}}}

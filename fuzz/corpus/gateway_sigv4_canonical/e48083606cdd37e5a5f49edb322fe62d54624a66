@@ -1,0 +1,6 @@
+/t:Qfuzz.example
+x-amz-date:X-Am-Expi 10130500T000000Z
+x-amz-content-sha256: STREAMING-AWS4-HMAC4SHA256-PAYLOAD-TRAILER
+content-encoding: aws-eco000000t
+
+þchunk-s

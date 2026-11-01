@@ -1,0 +1,9 @@
+/fuzz/k
+origin: hthost/fuzz/key
+host: fuzz.ex˜ample
+x-amz-date: 20261001T000004Z
+x-amz-content-sha256: STREAMI
+x-amz-trailer: x-amz-checksum-crc32c
+authorization: AWS4-HMAC-SHA256 Credential=AKIDFUZZ/20261001/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000
+
+rization: AWSl

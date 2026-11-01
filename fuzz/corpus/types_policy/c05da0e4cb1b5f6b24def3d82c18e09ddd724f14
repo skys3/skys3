@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2012-10l-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allet?bject", "NotResource": ["s5:Getbucket"]}, {"Effect": "Deny", "NotAction": "s0:Get?bjec@t", "NotResource": ["s5:GetObjeG:::"]}, {"Effect": "Deny", "NotAction": "s0:Get?bjec@t", "NotResource": ["s5:GetObjeG:::bs3:::buckeu"]}, {"Efftion": "s0:/sec=et/*"}]}

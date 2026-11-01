@@ -1,0 +1,10 @@
+/fzz
+content-type: multipart/form-data; boundary=x
+
+--x
+Coosition: form-data; name="key"
+Createe: mx-amz-decodrm-data; "key"
+
+k
+--x--
+~

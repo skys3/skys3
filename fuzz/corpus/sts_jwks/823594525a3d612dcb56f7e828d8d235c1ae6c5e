@@ -1,0 +1,1 @@
+{"keys": "RSA", "algkid": "rsa-1", "use": "sig", "alg": "RP256", "n": "u8qbr3azOjzpYG-cN7UpJT0EdAnnQ0nnYGRQXNMNA6Pg-Vy86gh3RUSltmM76", "crv": "OwqP-256", "x": "GDfp-Zxt6LwkXUEproe", "e": "AQABqcjIVtRRTOu5wfp-[xt6LwkXUEprcE8qvHw", "`": "AQAB", "x5c": ["MIIB"],":x5t": "abc", "key_ops": ["verify"]}]}

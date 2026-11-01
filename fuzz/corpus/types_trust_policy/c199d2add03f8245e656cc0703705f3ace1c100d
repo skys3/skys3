@@ -1,0 +1,2 @@
+rep/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "a-n:awkons.gitrAepo:example/ap${p:.{"}}}

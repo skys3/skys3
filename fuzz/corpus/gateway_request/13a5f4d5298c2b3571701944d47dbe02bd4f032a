@@ -1,0 +1,5 @@
+/fuzz/k
+if-o-ennmatch: *
+if-match: "abc"
+
+x

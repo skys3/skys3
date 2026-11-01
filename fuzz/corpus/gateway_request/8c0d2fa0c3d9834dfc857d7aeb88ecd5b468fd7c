@@ -1,0 +1,16 @@
+/fuzz/c
+content-encoding: z-trailer: x-amz-cd
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILErectner=true&enc2dinguploadId=u
+x-amz-copy-source: fuzz/k?versioR
+x-amz-decoded-content-length: 5
+x-amz-trailer: x-amz-checksum-crc32
+
+5ú—ello
+0
+x-amz-checksum-crc32:Nhamz-decoded-content-length: 5
+x-amz-trailer: x-amz-checksum-crc32
+
+5ú—ello
+0
+x-amz-checksum-crc32:NhCmhg==
+

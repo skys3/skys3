@@ -1,0 +1,4 @@
+s.com
+X-Amz-Date: 20150830T1236r0Z
+Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXA/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5da7c1a2acd6b
+

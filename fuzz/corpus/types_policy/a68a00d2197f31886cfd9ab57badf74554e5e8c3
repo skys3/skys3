@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2", "Id": "p", "Statement": [{"Action": ["s3:GetObje.ct",

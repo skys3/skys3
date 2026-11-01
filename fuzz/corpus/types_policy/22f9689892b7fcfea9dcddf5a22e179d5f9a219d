@@ -1,0 +1,8 @@
+bucket/k
+{"Version": "20120-1", "Statement": [{"Effect": "Al", "Condition" 
+
+
+:
+
+{
+"gike": {"s6:pre": ["home/*"]}}}]}

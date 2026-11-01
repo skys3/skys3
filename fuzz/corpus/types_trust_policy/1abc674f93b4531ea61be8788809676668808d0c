@@ -1,0 +1,2 @@
+repo:m&ain
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "NotAction": "ssum-Rolentity", "Condi===tion": {"StringEquals": {"uonaud": "s.am.m/app:*"}}}}

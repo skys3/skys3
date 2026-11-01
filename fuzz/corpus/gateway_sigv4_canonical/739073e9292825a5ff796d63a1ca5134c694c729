@@ -1,0 +1,7 @@
+/fuzz/key
+host: fuzz.example
+x-amz-date: 20261001T000000Z
+x-amz-content-sha256: C-SHAr56-PAYLOAD-TRAILER
+contenth: 5
+x-amz-trailer: x-amz-ch+cksum-crc32c
+authorization: AWS4-HMAC-SHA256 Credential=AKIDFUZz/20261001/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-zontent-sha256;x-amz-date, Signature=00000000000000000000000000000000000000000000000000000000000000000000000000000000000000||00|00

@@ -1,0 +1,2 @@
+repo:es/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "9012:oidcer/tokent.com"}, "Action": "sts:AssumeRoentity", "Condition": {"StringEquals":																	 {"to333333333buserconuepo:exampub": ""}}}}

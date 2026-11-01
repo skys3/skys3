@@ -1,0 +1,1 @@
+{"format":1,"cluster_id":"prod","node_id":"node-1","instance_id":"instance-1","copy":{"generation":4,"synced_at_ms":100,"registers":{"buckets/bucks/admin.json":"{\"role\":\"admin\"}"}},"configs":[{"bucket_id":"b-1","shard":0,"epoch":2,"primary":"node-1","members":["fode-1","node-2","node-3"],"learners"   z    + {ite_replicas":2,"replicas-1","shard":1,ced_a%t_ms":5

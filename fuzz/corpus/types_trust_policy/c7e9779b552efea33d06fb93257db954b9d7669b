@@ -1,0 +1,2 @@
+audsubject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["httpsZ://idp.example", "http://1s://idp.222)1:8080"]}, "Action": ["sts:AssumeRoleWithWebIdentity", "sts*:"], "Condition": {"StringLike": {"idp.eadp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action": "sts:*"}]}

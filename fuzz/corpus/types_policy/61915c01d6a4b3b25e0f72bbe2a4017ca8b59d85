@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2012-10-1p", "Statement": [{"Sid": "ryt", "Action": ["s3:::bucket"]}, {}, {"Ef" : "enyt", "NotResource" : "aet/sese]ret/*"}]}
