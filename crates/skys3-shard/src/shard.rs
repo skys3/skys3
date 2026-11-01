@@ -2859,8 +2859,17 @@ impl<D: Disk> Shard<D> {
     }
 }
 
-/// Why a primary that stepped down for a planned handoff refuses requests.
-const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
+/// Why a primary that stepped down for a planned handoff refuses requests,
+/// before it sequences anything (§5.4). Its shard moves to the member it
+/// stepped down to, which a moment later serves: a gateway asks again
+/// within the request.
+pub const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
+
+/// Why a primary refuses requests, before it sequences anything, until its
+/// links have brought every member up to its log (§6.6), as a new primary
+/// does after a takeover or a handoff: a gateway asks again within the
+/// request.
+pub const RECONCILING: &str = "the primary is bringing its members up to its log";
 
 /// A read of the index in progress ([`Shard::admit_read`]).
 pub(crate) struct ReadPermit<'a>(&'a watch::Sender<usize>);
@@ -2919,10 +2928,7 @@ impl Sequencer {
                 primary: self.config.primary.clone(),
                 epoch: self.config.epoch,
             }),
-            _ if !self.serving => Err(ShardError::unavailable(
-                shard,
-                "the primary is bringing its members up to its log",
-            )),
+            _ if !self.serving => Err(ShardError::unavailable(shard, RECONCILING)),
             _ => Ok(()),
         }
     }

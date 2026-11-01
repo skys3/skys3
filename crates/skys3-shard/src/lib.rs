@@ -106,4 +106,6 @@ pub use seeded::SeededBug;
 #[doc(hidden)]
 pub use seeded::seed_bug;
 pub use set::ShardSet;
-pub use shard::{Change, Committed, Role, Shard, ShardSummary, StreamedBody};
+pub use shard::{
+    Change, Committed, RECONCILING, Role, STEPPED_DOWN, Shard, ShardSummary, StreamedBody,
+};

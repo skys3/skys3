@@ -35,6 +35,12 @@
 //! A request whose answer is lost after it was sent is not sent again
 //! unless it only reads: a write may have been applied, so the client
 //! sees it fail (`503`), which means not acknowledged (§5.2).
+//!
+//! A request waits while its shard moves to a new primary (§5.4, §6.7):
+//! the old primary refuses once it stepped down, until it learns its
+//! successor, and the new one until its members hold its log. Both
+//! refuse before they sequence anything, so the gateway asks again, read
+//! or write, for at most the request timeout.
 
 mod client;
 mod map;
