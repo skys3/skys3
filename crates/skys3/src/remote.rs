@@ -73,6 +73,7 @@ impl<S: ObjectStore, D: Disk> RemoteReads for NodeRemote<S, D> {
             Ok(found.map(|found| RemoteObject {
                 object: found.object,
                 version_id: found.version_id,
+                last_modified_ms: found.last_modified_ms,
             }))
         })
     }
@@ -106,6 +107,7 @@ impl<S: ObjectStore, D: Disk> RemoteReads for NodeRemote<S, D> {
                 Ok(Some(found)) => Ok(OriginHead::Found(Box::new(RemoteObject {
                     object: found.object,
                     version_id: found.version_id,
+                    last_modified_ms: found.last_modified_ms,
                 }))),
                 Ok(None) => Ok(OriginHead::Missing),
                 Err(error) if error.status() == Some(FORBIDDEN) => Ok(OriginHead::Denied),
