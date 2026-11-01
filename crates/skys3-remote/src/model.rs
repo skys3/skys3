@@ -408,14 +408,28 @@ pub enum MetadataDirective {
     /// `COPY`: keep the source's user metadata and content type.
     #[default]
     Copy,
-    /// `REPLACE`: use these instead. SkyS3 always replaces, so the copy
+    /// `REPLACE`: use these instead. A flush always replaces, so the copy
     /// carries its own write identity (design §7.2).
     Replace {
         /// The copy's user metadata.
         metadata: UserMetadata,
         /// The copy's content type.
         content_type: Option<String>,
+        /// The copy's other standard headers, as [`PutObject::headers`].
+        headers: BTreeMap<String, String>,
     },
+}
+
+/// What a `CopyObject` does with the source's tags
+/// (`x-amz-tagging-directive`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TaggingDirective {
+    /// `COPY`: keep the source's tags.
+    #[default]
+    Copy,
+    /// `REPLACE`: give the copy these tags (`x-amz-tagging`), by tag key;
+    /// none if the map is empty.
+    Replace(BTreeMap<String, String>),
 }
 
 /// `CopyObject` within one bucket.
@@ -431,13 +445,15 @@ pub struct CopyObject {
     pub key: String,
     /// What to do with the source's metadata.
     pub metadata_directive: MetadataDirective,
+    /// What to do with the source's tags.
+    pub tagging_directive: TaggingDirective,
     /// The destination's precondition.
     pub precondition: WritePrecondition,
 }
 
 impl CopyObject {
     /// An unconditional copy of the current `source_key` to `key`, keeping
-    /// its metadata.
+    /// its metadata and tags.
     pub fn new(source_key: impl Into<String>, key: impl Into<String>) -> Self {
         CopyObject {
             source_key: source_key.into(),
@@ -445,8 +461,15 @@ impl CopyObject {
             source_if_match: None,
             key: key.into(),
             metadata_directive: MetadataDirective::Copy,
+            tagging_directive: TaggingDirective::Copy,
             precondition: WritePrecondition::None,
         }
+    }
+
+    /// Sets the tagging directive.
+    pub fn with_tagging_directive(mut self, directive: TaggingDirective) -> Self {
+        self.tagging_directive = directive;
+        self
     }
 
     /// Copies a specific source version.
@@ -641,6 +664,10 @@ pub struct ObjectInfo {
     /// `Last-Modified`, in milliseconds since the Unix epoch, if the store
     /// returned it.
     pub last_modified_ms: Option<u64>,
+    /// How many tags the object has (`x-amz-tagging-count`). S3 sends the
+    /// count only to callers allowed `s3:GetObjectTagging`, and only for
+    /// an object with tags, so it is 0 otherwise.
+    pub tag_count: u32,
 }
 
 /// The result of a write that creates an object: `PutObject`, `CopyObject`,
@@ -810,11 +837,14 @@ mod tests {
             .with_metadata_directive(MetadataDirective::Replace {
                 metadata: metadata.clone(),
                 content_type: None,
+                headers: BTreeMap::new(),
             })
+            .with_tagging_directive(TaggingDirective::Replace(BTreeMap::new()))
             .with_precondition(WritePrecondition::IfMatch(etag.clone()));
         assert_eq!(copy.source_version_id.as_ref(), Some(&version));
         assert_eq!(copy.source_if_match.as_ref(), Some(&etag));
         assert_ne!(copy.metadata_directive, MetadataDirective::Copy);
+        assert_ne!(copy.tagging_directive, TaggingDirective::Copy);
         assert_eq!(copy.precondition, WritePrecondition::IfMatch(etag));
 
         let headers = BTreeMap::from([("cache-control".to_owned(), "no-cache".to_owned())]);

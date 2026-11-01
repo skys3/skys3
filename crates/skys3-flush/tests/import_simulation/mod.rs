@@ -166,7 +166,7 @@ async fn check(
 ) -> Outcome {
     let status = service.status(&bucket().bucket_id).ok_or("no flusher")?;
     // The probe ran under the faults too, and found every precondition.
-    if !matches!(&status.probe, ProbeStatus::Done { unprotected } if unprotected.is_empty()) {
+    if !matches!(&status.probe, ProbeStatus::Done { unprotected, .. } if unprotected.is_empty()) {
         return Err(format!("the probe found {:?}", status.probe).into());
     }
     let conflicts: Vec<_> = status

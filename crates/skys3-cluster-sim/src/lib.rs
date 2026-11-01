@@ -92,6 +92,7 @@ mod cluster;
 pub mod coding;
 mod conflicts;
 mod coordination;
+mod copies;
 mod creation;
 pub mod drill;
 mod faults;
@@ -118,6 +119,7 @@ pub use coordination::{
     Change, ChangeStage, CoordinatedServices, CoordinationConfig, CoordinatorLoss, Forgotten,
     LostCoordinator, PUSH_PORT, PushDelays, RegistryView,
 };
+pub use copies::{Copies, CopyAudit};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use holders::{HolderCounts, HolderFaults};
 pub use learners::{DurabilityWindows, LearnerCounts};
@@ -132,6 +134,8 @@ pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
 /// The seeded bugs of conflict handling ([`Conflicts::bug`]).
 pub use skys3_flush::test_hooks::ConflictBug;
+/// The seeded bugs of server-side copies ([`Copies::bug`]).
+pub use skys3_flush::test_hooks::CopyBug;
 /// The seeded bugs of index snapshots ([`Snapshots::bug`]).
 pub use skys3_flush::test_hooks::SnapshotBug;
 pub use snapshots::{SnapshotAudit, Snapshots};

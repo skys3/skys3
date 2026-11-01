@@ -293,7 +293,7 @@ pub(crate) async fn writer(
 }
 
 /// The `write_back` buckets of `routes`.
-fn write_back_buckets(routes: &Routes) -> Vec<BucketDocument> {
+pub(crate) fn write_back_buckets(routes: &Routes) -> Vec<BucketDocument> {
     routes
         .buckets
         .iter()
@@ -437,7 +437,7 @@ fn live(flushers: &Flushers) -> Vec<Arc<FlushService<SimS3, SimMount>>> {
 /// Waits until the live flushers cover every shard of `buckets` and have
 /// nothing left to send but keys held in conflict, and returns the keys
 /// held, as the history names them.
-async fn drain(
+pub(crate) async fn drain(
     flushers: &Flushers,
     buckets: &[BucketDocument],
 ) -> Result<BTreeSet<String>, String> {

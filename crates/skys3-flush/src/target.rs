@@ -2,7 +2,7 @@
 //! preconditions it honors, the settings, and the window and byte bound of
 //! its requests in flight (§7.7).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,8 +12,8 @@ use skys3_config::{ConflictPolicy, FlushConfig, PeeringConfig};
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::UploadId;
-use skys3_remote::probe::ConditionalWrites;
-use skys3_types::{ClusterId, EpochSeq, WriteIdentity};
+use skys3_remote::probe::{ConditionalWrites, CopySupport};
+use skys3_types::{BucketId, ClusterId, EpochSeq, WriteIdentity};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::concurrency::{ConcurrencyBug, ConcurrencyStatus, Membership, Paced, Window, hooks};
@@ -144,6 +144,51 @@ impl Default for FlushSettings {
     }
 }
 
+/// Where a target's copies find their sources for a server-side copy
+/// (§7.2, §11): the buckets whose objects the target's remote bucket
+/// holds, each with the key prefix it flushes under.
+///
+/// A bucket is listed only if it flushes to the same remote bucket, on the
+/// same endpoint, with the same credentials, as the target: then a
+/// `CopyObject` within that remote bucket reaches the source's object.
+/// The [`FlushService`](crate::FlushService) keeps one list per remote
+/// bucket, updated as buckets come and go; clones share it. A version
+/// copied from a bucket that is not listed is sent as a regular upload.
+#[derive(Debug, Clone, Default)]
+pub struct CopySources(Arc<Mutex<BTreeMap<BucketId, String>>>);
+
+impl CopySources {
+    /// A list without buckets: every copy is sent as a regular upload.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lists `bucket`, whose objects are under `prefix` in the remote
+    /// bucket.
+    #[must_use]
+    pub fn with(self, bucket: BucketId, prefix: impl Into<String>) -> Self {
+        self.lock().insert(bucket, prefix.into());
+        self
+    }
+
+    /// Replaces the list.
+    pub fn set(&self, buckets: BTreeMap<BucketId, String>) {
+        *self.lock() = buckets;
+    }
+
+    /// The prefix `bucket`'s objects are under, if it is listed.
+    #[must_use]
+    pub fn prefix(&self, bucket: &BucketId) -> Option<String> {
+        self.lock().get(bucket).cloned()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<BucketId, String>> {
+        // Every update is a single step.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// One remote target as its shard flushers see it.
 pub struct Target<S> {
     /// The store, each request through the window.
@@ -159,6 +204,11 @@ pub struct Target<S> {
     pub(crate) counters: Counters,
     /// What a flush that finds an out-of-band write does (§7.2).
     pub(crate) conflict_policy: ConflictPolicy,
+    /// Where copies find their sources for a server-side copy.
+    pub(crate) copy_sources: CopySources,
+    /// The server-side copy support the probe found: `writes.copy_object`
+    /// until a later probe of copies alone replaces it.
+    copies: Mutex<CopySupport>,
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
@@ -194,6 +244,7 @@ impl<S> Target<S> {
         let inflight_kib = u32::try_from(settings.max_inflight_bytes.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX));
+        let copies = Mutex::new(writes.copy_object);
         let window = Arc::new(Window::new((
             settings.min_concurrency,
             settings.max_concurrency,
@@ -211,6 +262,8 @@ impl<S> Target<S> {
             wall: Arc::new(SystemWallClock),
             counters,
             conflict_policy: ConflictPolicy::Hold,
+            copy_sources: CopySources::new(),
+            copies,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
             inflight_bytes: AtomicU64::new(0),
@@ -252,14 +305,38 @@ impl<S> Target<S> {
         self
     }
 
+    /// Sets where copies find their sources: a copy of a clean version of
+    /// a bucket in `sources` is sent as a server-side `CopyObject`, if the
+    /// probe found the target supports it (§7.2, §11). Without it, every
+    /// copy is sent as a regular upload.
+    #[must_use]
+    pub fn with_copy_sources(mut self, sources: CopySources) -> Self {
+        self.copy_sources = sources;
+        self
+    }
+
     /// What a flush that finds an out-of-band write does.
     pub fn conflict_policy(&self) -> ConflictPolicy {
         self.conflict_policy
     }
 
-    /// The preconditions the target honors.
+    /// The preconditions the target honors. Its `copy_object` is the
+    /// copy support the target was built with; [`Target::copy_support`]
+    /// is the current one.
     pub fn writes(&self) -> &ConditionalWrites {
         &self.writes
+    }
+
+    /// What the target supports of a server-side copy (§11): what it was
+    /// built with, until the flush service's probe of copies alone
+    /// replaces it.
+    pub fn copy_support(&self) -> CopySupport {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces what the target supports of a server-side copy.
+    pub(crate) fn set_copy_support(&self, support: CopySupport) {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner) = support;
     }
 
     /// The counters its flushers count events in.
@@ -356,7 +433,7 @@ impl Drop for Reservation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use skys3_remote::probe::{OperationSupport, PreconditionSupport};
+    use skys3_remote::probe::{CopySupport, OperationSupport, PreconditionSupport};
 
     use super::*;
 
@@ -369,6 +446,7 @@ mod tests {
             put_object: honored,
             complete_multipart_upload: honored,
             delete_object: honored,
+            copy_object: CopySupport::FULL,
         };
         let cluster = ClusterId::new("c-test").unwrap();
         Target::new(
@@ -395,5 +473,17 @@ mod tests {
         );
         assert_eq!(target.orphaned_uploads(), MAX_ORPHANS - 1);
         assert!(format!("{target:?}").contains("p/"));
+    }
+
+    #[test]
+    fn copy_sources_are_shared_and_replaced() {
+        let (a, b) = (BucketId::new("b-a").unwrap(), BucketId::new("b-b").unwrap());
+        let sources = CopySources::new().with(a.clone(), "a/");
+        let target = target().with_copy_sources(sources.clone());
+        assert_eq!(target.copy_sources.prefix(&a).as_deref(), Some("a/"));
+        assert_eq!(target.copy_sources.prefix(&b), None);
+        sources.set(BTreeMap::from([(b.clone(), String::new())]));
+        assert_eq!(target.copy_sources.prefix(&a), None);
+        assert_eq!(target.copy_sources.prefix(&b).as_deref(), Some(""));
     }
 }

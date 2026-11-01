@@ -19,12 +19,12 @@ use skys3_remote::aws::{
     AwsS3, Credentials, ProvideCredentials, SharedCredentialsProvider, default_credentials,
     web_identity_credentials,
 };
-use skys3_remote::probe::ConditionalProbe;
+use skys3_remote::probe::{ConditionalProbe, CopySupport};
 use skys3_remote::{
     AbortMultipartUpload, ByteRange, CompleteMultipartUpload, CompletedPart, CopyObject,
     CreateMultipartUpload, DeleteObject, GetObject, HeadObject, ListObjectsV2, ListParts,
-    MetadataDirective, ObjectStore, PutObject, S3ErrorKind, UploadId, UploadPart, UserMetadata,
-    VersionId, WritePrecondition,
+    MetadataDirective, ObjectStore, PutObject, S3ErrorKind, TaggingDirective, UploadId, UploadPart,
+    UserMetadata, VersionId, WritePrecondition,
 };
 use skys3_types::{ETag, RemoteTarget};
 use tokio::net::TcpListener;
@@ -342,7 +342,15 @@ async fn copies_replace_metadata_and_check_the_source() {
         .with_metadata_directive(MetadataDirective::Replace {
             metadata,
             content_type: Some("application/octet-stream".to_owned()),
+            headers: BTreeMap::from([
+                ("cache-control".to_owned(), "no-cache".to_owned()),
+                ("content-language".to_owned(), "en".to_owned()),
+            ]),
         })
+        .with_tagging_directive(TaggingDirective::Replace(BTreeMap::from([
+            ("a b".to_owned(), "c&d".to_owned()),
+            ("team".to_owned(), "x".to_owned()),
+        ])))
         .with_precondition(WritePrecondition::IfAbsent);
     let output = store.copy_object(request).await.unwrap();
     assert_eq!(output.etag, etag("c1"));
@@ -362,6 +370,10 @@ async fn copies_replace_metadata_and_check_the_source() {
         copy.header("content-type"),
         Some("application/octet-stream")
     );
+    assert_eq!(copy.header("cache-control"), Some("no-cache"));
+    assert_eq!(copy.header("content-language"), Some("en"));
+    assert_eq!(copy.header("x-amz-tagging-directive"), Some("REPLACE"));
+    assert_eq!(copy.header("x-amz-tagging"), Some("a%20b=c%26d&team=x"));
     assert_eq!(copy.header("if-none-match"), Some("*"));
 
     mock.reply(ok(
@@ -374,6 +386,8 @@ async fn copies_replace_metadata_and_check_the_source() {
     let copy = mock.only_request();
     assert_eq!(copy.header("x-amz-copy-source"), Some("bucket/a"));
     assert_eq!(copy.header("x-amz-metadata-directive"), Some("COPY"));
+    assert_eq!(copy.header("x-amz-tagging-directive"), Some("COPY"));
+    assert_eq!(copy.header("x-amz-tagging"), None);
     assert_eq!(copy.header("if-match"), Some("\"d1\""));
     assert_eq!(copy.header("x-amz-copy-source-if-match"), None);
 
@@ -416,6 +430,7 @@ async fn reads_send_ranges_and_conditions() {
     assert_eq!(output.info.etag, etag("g1"));
     assert_eq!(output.info.metadata.get("owner"), Some("team"));
     assert_eq!(output.info.content_type.as_deref(), Some("text/plain"));
+    assert_eq!(output.info.tag_count, 0);
     let get = mock.only_request();
     assert_eq!(get.method, Method::GET);
     assert_eq!(get.path(), "/bucket/k");
@@ -436,6 +451,7 @@ async fn reads_send_ranges_and_conditions() {
             ("etag", "\"h1\""),
             ("content-length", "42"),
             ("x-amz-meta-skys3-wid", "c/b/1/2.3"),
+            ("x-amz-tagging-count", "2"),
         ],
         "",
     ));
@@ -444,6 +460,7 @@ async fn reads_send_ranges_and_conditions() {
         .await
         .unwrap();
     assert_eq!(info.size, 42);
+    assert_eq!(info.tag_count, 2);
     assert_eq!(info.metadata.write_identity(), Some("c/b/1/2.3"));
     let head = mock.only_request();
     assert_eq!(head.method, Method::HEAD);
@@ -774,8 +791,17 @@ async fn the_probe_classifies_a_provider_that_answers_501() {
     // DeleteObject: the key is created, and If-Match is rejected.
     mock.reply(ok(&[("etag", "\"e4\"")], ""));
     mock.reply(not_implemented());
+    // CopyObject: the source is written, and every copy that replaces a
+    // directive or carries a precondition is rejected, so the destination
+    // is created with a plain PUT to probe If-Match.
+    mock.reply(ok(&[("etag", "\"e5\"")], ""));
+    for _ in 0..4 {
+        mock.reply(not_implemented());
+    }
+    mock.reply(ok(&[("etag", "\"e6\"")], ""));
+    mock.reply(not_implemented());
     // Cleanup: one delete per key.
-    for _ in 0..3 {
+    for _ in 0..5 {
         mock.reply(status(204, &[], ""));
     }
 
@@ -783,15 +809,27 @@ async fn the_probe_classifies_a_provider_that_answers_501() {
     let writes = probe.run(&store).await.unwrap();
     assert!(writes.put_object.is_protected());
     assert_eq!(writes.unprotected().len(), 2);
+    assert_eq!(writes.copy_object, CopySupport::NONE);
     let received = mock.received();
-    assert_eq!(received.len(), 18);
-    let deletes: Vec<&str> = received[15..].iter().map(Received::path).collect();
+    assert_eq!(received.len(), 27);
+    let copy = &received[16];
+    assert_eq!(copy.header("x-amz-metadata-directive"), Some("REPLACE"));
+    assert_eq!(copy.header("x-amz-meta-skys3-probe"), Some("replaced"));
+    let copy = &received[17];
+    assert_eq!(copy.header("x-amz-tagging-directive"), Some("REPLACE"));
+    assert_eq!(
+        copy.header("x-amz-tagging"),
+        Some("skys3-probe-0=probe&skys3-probe-1=probe")
+    );
+    let deletes: Vec<&str> = received[22..].iter().map(Received::path).collect();
     assert_eq!(
         deletes,
         [
             "/bucket/.skys3-probe/0000000000000001/put-object",
             "/bucket/.skys3-probe/0000000000000001/complete-multipart-upload",
             "/bucket/.skys3-probe/0000000000000001/delete-object",
+            "/bucket/.skys3-probe/0000000000000001/copy-source",
+            "/bucket/.skys3-probe/0000000000000001/copy-destination",
         ]
     );
 }
