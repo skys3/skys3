@@ -28,7 +28,7 @@ pub mod control;
 pub mod datadir;
 mod node;
 pub mod rebuild;
-mod remote;
+pub mod remote;
 pub mod sessions;
 pub mod storage;
 pub mod tls;

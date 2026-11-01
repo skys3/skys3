@@ -1,6 +1,8 @@
 //! Reads that depend on the namespace import of a `write_back` bucket
 //! (§9.1): keys the import has not reached, which fall through to the
 //! remote, and imported stubs, whose metadata is loaded on first read.
+//! Reads of a `read_only` bucket are checked against its origin instead
+//! (§9.5, `origin`).
 
 use std::sync::Arc;
 
@@ -55,7 +57,8 @@ impl<H: Shards> Objects<H> {
     /// A key with no entry falls through to a remote HEAD while the
     /// bucket's import has not passed it; once it has, or for a delete
     /// tombstone, the key has no object. An imported stub has its
-    /// metadata loaded first ([`Objects::load`]).
+    /// metadata loaded first ([`Objects::load`]). A key of a `read_only`
+    /// bucket is checked against its origin ([`Objects::origin_lookup`]).
     ///
     /// # Errors
     ///
@@ -68,6 +71,9 @@ impl<H: Shards> Objects<H> {
         key: &str,
         planned: bool,
     ) -> S3Result<Lookup> {
+        if bucket.mode == BucketMode::ReadOnly {
+            return self.origin_lookup(bucket, shard, key, planned).await;
+        }
         let plan = self.read_plan(shard, key, planned).await?;
         let Some(remote) = self.remote_of(bucket) else {
             return local(plan);
@@ -105,7 +111,12 @@ impl<H: Shards> Objects<H> {
     }
 
     /// The read plan of `key`, or, unless `planned`, its entry alone.
-    async fn read_plan(&self, shard: &ShardRef, key: &str, planned: bool) -> S3Result<ReadPlan> {
+    pub(super) async fn read_plan(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        planned: bool,
+    ) -> S3Result<ReadPlan> {
         if planned {
             self.shards.plan(shard, key).await.map_err(shard_error)
         } else {
@@ -205,7 +216,7 @@ impl<H: Shards> Objects<H> {
 /// clean or evicted, with neither a checksum nor a `Content-Type`. Every
 /// local write stores a checksum, and loaded metadata always has a
 /// `Content-Type` (§9.1).
-fn unloaded(entry: &Entry) -> bool {
+pub(super) fn unloaded(entry: &Entry) -> bool {
     matches!(entry.state, EntryState::Clean | EntryState::Evicted)
         && entry.object.as_ref().is_some_and(|object| {
             object.checksums.is_empty() && !object.metadata.contains_key("content-type")
@@ -222,7 +233,7 @@ fn unplanned(entry: Option<Entry>) -> ReadPlan {
 }
 
 /// What a read of a local entry serves.
-fn local(plan: ReadPlan) -> S3Result<Lookup> {
+pub(super) fn local(plan: ReadPlan) -> S3Result<Lookup> {
     let (version, state, object) = plan
         .entry
         .and_then(|entry| Some((entry.version, entry.state, entry.object?)))

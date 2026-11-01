@@ -22,10 +22,13 @@
 //!
 //! While a `write_back` bucket's namespace import runs, the page also
 //! merges the remote's listing of the keys the import has not reached
-//! (§9.1, [`merge`]).
+//! (§9.1, [`merge`]). A `read_only` bucket's listings are forwarded to its
+//! origin, which alone knows its keys (§9.5, [`forward`]); the pages and
+//! tokens are the gateway's own, as for any bucket.
 //! The owner of every object is the bucket owner, as in a bucket with
 //! `BucketOwnerEnforced` ownership; SkyS3 names it by the cluster ID.
 
+mod forward;
 mod merge;
 mod token;
 
@@ -43,9 +46,9 @@ use skys3_types::{BucketDocument, BucketMode};
 
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::conditions::{last_modified, s3_etag};
-use crate::remote::RemoteReads;
+use crate::remote::{RemoteError, RemoteReads};
 use crate::shard::Shards;
-use merge::{MergeError, RemoteSide};
+use merge::{MergeError, MergedPage, RemoteSide};
 pub(crate) use token::TokenScope;
 pub use token::{ListTokenKeys, ShortTokenKey};
 
@@ -217,22 +220,18 @@ impl<H: Shards> Listings<H> {
     ) -> S3Result<Page> {
         let query = request.query(start_after);
         let bucket = request.bucket;
-        // While a `write_back` bucket's import runs, the remote lists the
-        // keys the import has not reached (§9.1).
-        let remote = self
-            .remote
-            .as_deref()
-            .filter(|_| bucket.mode == BucketMode::WriteBack)
-            .and_then(|remote| match remote.import(&bucket.bucket_id)? {
-                ImportCheckpoint::Running { after } => Some(RemoteSide {
-                    remote,
-                    passed: after,
-                }),
-                ImportCheckpoint::Done => None,
-            });
-        let merged = merge::list(&self.shards, bucket, &query, remote)
-            .await
-            .map_err(merge_error)?;
+        let merged = if bucket.mode == BucketMode::ReadOnly {
+            let origin = self.remote.as_deref().ok_or_else(|| {
+                merge_error(MergeError::Remote(RemoteError(
+                    "this node does not read origins".to_owned(),
+                )))
+            })?;
+            forward::list(origin, bucket, &query)
+                .await
+                .map_err(|error| merge_error(MergeError::Remote(error)))?
+        } else {
+            self.merge(bucket, &query).await?
+        };
         let last = merged.items.last().map(|item| item.name().to_owned());
         let mut page = Page {
             contents: Vec::new(),
@@ -254,6 +253,27 @@ impl<H: Shards> Listings<H> {
         }
         Ok(page)
     }
+
+    /// One page of `bucket`'s shards, merged (§9.4), with the remote's
+    /// keys while a `write_back` bucket's import runs (§9.1).
+    async fn merge(&self, bucket: &BucketDocument, query: &ListQuery) -> S3Result<MergedPage> {
+        // While a `write_back` bucket's import runs, the remote lists the
+        // keys the import has not reached (§9.1).
+        let remote = self
+            .remote
+            .as_deref()
+            .filter(|_| bucket.mode == BucketMode::WriteBack)
+            .and_then(|remote| match remote.import(&bucket.bucket_id)? {
+                ImportCheckpoint::Running { after } => Some(RemoteSide {
+                    remote,
+                    passed: after,
+                }),
+                ImportCheckpoint::Done => None,
+            });
+        merge::list(&self.shards, bucket, query, remote)
+            .await
+            .map_err(merge_error)
+    }
 }
 
 fn merge_error(error: MergeError) -> S3Error {
@@ -261,7 +281,7 @@ fn merge_error(error: MergeError) -> S3Error {
         MergeError::Shard(error) => shard_error(error),
         MergeError::Remote(error) => s3_error!(
             ServiceUnavailable,
-            "The bucket's remote target cannot be listed: {error}"
+            "The bucket's remote target or origin cannot be listed: {error}"
         ),
     }
 }

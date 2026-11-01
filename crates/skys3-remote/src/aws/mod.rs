@@ -11,7 +11,9 @@
 //!   S3-compatible providers support; [`Addressing`] overrides the choice.
 //! - **Credentials** come from `aws-config` providers:
 //!   [`default_credentials`] is the SDK's default chain (environment,
-//!   profiles, web identity, container and instance metadata), and
+//!   profiles, web identity, container and instance metadata),
+//!   [`profile_credentials`] one profile of the shared configuration, as a
+//!   `read_only` bucket's `origin_profile` names it (§9.5), and
 //!   [`web_identity_credentials`] assumes a role with a web-identity token
 //!   file, as a workload does (§11).
 //! - **No retries.** The SDK's retries are off: every method is one
@@ -54,6 +56,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::web_identity_token::{StaticConfiguration, WebIdentityTokenCredentialsProvider};
 use aws_sdk_s3::config::retry::RetryConfig;
@@ -274,6 +277,22 @@ pub async fn default_credentials(region: &str) -> SharedCredentialsProvider {
     SharedCredentialsProvider::new(chain)
 }
 
+/// The credentials of the profile `profile` of the shared configuration
+/// and credentials files, with its `role_arn`, `source_profile`,
+/// `web_identity_token_file`, and `credential_process` settings. `region`
+/// is the STS region for profiles that assume roles.
+///
+/// Building the provider reads nothing; the files are read, and the
+/// credentials loaded and cached, on first use.
+#[must_use]
+pub fn profile_credentials(profile: &str, region: &str) -> SharedCredentialsProvider {
+    let provider = ProfileFileCredentialsProvider::builder()
+        .configure(&provider_config(region))
+        .profile_name(profile)
+        .build();
+    SharedCredentialsProvider::new(provider)
+}
+
 /// Credentials from STS `AssumeRoleWithWebIdentity`, with the token read
 /// from `token_file` on every refresh, as a workload identity provider
 /// rotates it (§11). `region` is the STS region.
@@ -345,6 +364,19 @@ mod tests {
             .build();
         assert!(path.is_path_style());
         assert_eq!(path.bucket(), "bucket");
+    }
+
+    /// What the error says depends on the machine: with no shared AWS
+    /// files at all, as on CI, the provider reports that it loaded
+    /// nothing; with files that lack the profile, it names the profile.
+    #[tokio::test]
+    async fn a_profile_that_is_not_configured_provides_no_credentials() {
+        let provider = profile_credentials("skys3-no-such-profile", "us-east-1");
+        let error = format!("{:?}", provider.provide_credentials().await.unwrap_err());
+        assert!(
+            error.starts_with("CredentialsNotLoaded") || error.contains("skys3-no-such-profile"),
+            "{error}"
+        );
     }
 
     /// `credential_process` profiles, which the default chain reads, need

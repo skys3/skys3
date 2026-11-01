@@ -78,7 +78,10 @@ mod target;
 mod transport;
 
 pub use admin::{AdminConfig, LogFormat, LoggingConfig};
-pub use buckets::{BucketSettings, BucketsConfig, MAX_IMPORT_PARALLEL_STREAMS, TargetTransport};
+pub use buckets::{
+    BucketSettings, BucketsConfig, Freshness, MAX_FRESHNESS_TTL_SECONDS,
+    MAX_IMPORT_PARALLEL_STREAMS, MAX_ORIGIN_PROFILE_BYTES, TargetTransport,
+};
 pub use cluster::{ClusterConfig, ControlStoreBackend, ControlStoreConfig, FailureDomain};
 pub use ec::{EcConfig, MAX_FRAGMENT_BYTES};
 pub use error::{ConfigError, Violation, Violations};
