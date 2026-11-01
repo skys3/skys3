@@ -14,12 +14,14 @@
 //! key ([`Shards::flushed`]). The ask is bounded by [`FLUSH_WAIT_ROUND`]
 //! and repeated until `write_through_timeout_seconds` have passed, and an
 //! ask that fails, such as while a new primary's flusher starts after a
-//! primary change, is repeated after [`RETRY_DELAY`]. The gateway gives up
-//! on an ask that is not answered within the round and [`ASK_GRACE`], or
-//! by the deadline, and asks again: an unreachable primary must not hold
-//! the write past its timeout, or keep it from asking a new one. A write
-//! is never undone: the client's error says that it is committed in the
-//! cluster, and the flusher keeps sending it.
+//! primary change, is repeated after [`RETRY_DELAY`]. A routed ask passes
+//! over a member that does not answer within the round and a grace, and
+//! asks the shard's other members and its register, so a silent primary
+//! does not keep the write from reaching a new one; the gateway gives up
+//! on an ask still unanswered at the deadline, so that nothing holds the
+//! write past its timeout. A write is never undone: the client's error
+//! says that it is committed in the cluster, and the flusher keeps sending
+//! it.
 //!
 //! - **Not flushed in time** (a remote outage, slow transfers, a primary
 //!   change that outlasts the timeout): `503 SlowDown`.
@@ -42,10 +44,6 @@ pub(crate) const FLUSH_WAIT_ROUND: Duration = Duration::from_secs(5);
 
 /// How long the gateway waits before it asks again after an ask failed.
 pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(100);
-
-/// How much longer than [`FLUSH_WAIT_ROUND`] the gateway waits for an
-/// ask's answer, so that a primary's `Pending` arrives before it gives up.
-pub(crate) const ASK_GRACE: Duration = Duration::from_secs(1);
 
 /// Which buckets acknowledge writes only once they are flushed, and how
 /// long such a write waits.
@@ -109,10 +107,10 @@ pub(crate) async fn reach_remote<H: Shards>(
         if left.is_zero() {
             return Err(not_flushed(shard, key, timeout));
         }
-        // The routed ask can outlast its wait, by a forward's timeout and
-        // more members: bound all of it.
+        // A routed ask bounds each member's answer by the wait, but can
+        // outlast it by asking more members: stop it at the deadline.
         let ask = shards.flushed(shard, key, version, left.min(FLUSH_WAIT_ROUND));
-        match tokio::time::timeout(left.min(FLUSH_WAIT_ROUND + ASK_GRACE), ask).await {
+        match tokio::time::timeout(left, ask).await {
             Ok(Ok(FlushState::Flushed)) => return Ok(()),
             Ok(Ok(FlushState::Conflict)) => return Err(conflict()),
             // Not yet: ask again.
@@ -123,7 +121,7 @@ pub(crate) async fn reach_remote<H: Shards>(
             }
             Err(_) => {
                 tracing::debug!(%shard, key,
-                    "a write-through flush ask went unanswered; asking again");
+                    "a write-through flush ask went unanswered until the deadline");
             }
         }
     }
