@@ -247,7 +247,7 @@ pub(super) async fn fill<N: Network, D: Disk>(
         .peers
         .get(learner)
         .ok_or_else(|| protocol(format_args!("no address for {learner}")))?;
-    let connection = inner.transport.connect(learner, address).await?;
+    let connection = inner.transport.connect(learner, &address).await?;
     let (mut receiver, mut sender) = connection.into_split();
     let open = Backfill {
         config: shard.config().to_json().map_err(protocol)?,

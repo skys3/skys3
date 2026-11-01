@@ -78,6 +78,39 @@ fn a_real_file_keeps_what_a_checkpoint_made_durable() {
 }
 
 #[test]
+fn a_peek_reads_a_closed_index_without_writing_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    // No file: nothing to read, and none is created.
+    assert!(Index::peek(&path, &IndexConfig::default()).is_none());
+    assert!(!path.exists());
+
+    let index = Index::open(&path, &IndexConfig::default()).unwrap();
+    index
+        .apply(&TestApplier, &[delete(0, 1, "a"), delete(0, 2, "b")])
+        .unwrap();
+    index.checkpoint(&BTreeMap::new()).unwrap();
+    drop(index);
+    let closed = std::fs::read(&path).unwrap();
+    let read = Index::peek(&path, &IndexConfig::default()).unwrap();
+    assert_eq!(read.applied(&shard(0)).unwrap(), Some(position(2)));
+    assert_eq!(
+        read.applied_positions().unwrap(),
+        BTreeMap::from([(shard(0), position(2))])
+    );
+    drop(read);
+    assert!(
+        std::fs::read(&path).unwrap() == closed,
+        "a peek changed the file"
+    );
+
+    // A file that is not an index is not read, and stays as it was.
+    std::fs::write(&path, b"not an index at all").unwrap();
+    assert!(Index::peek(&path, &IndexConfig::default()).is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), b"not an index at all");
+}
+
+#[test]
 fn removing_a_shard_keeps_every_other_shard() {
     let disk = SimDisk::new(5);
     let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();

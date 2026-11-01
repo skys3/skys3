@@ -16,6 +16,7 @@ use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_types::EpochSeq;
@@ -42,6 +43,19 @@ pub enum FillError {
     Unavailable(String),
 }
 
+/// How far a whole fill ([`Fills::fill`]) got within its wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FillProgress {
+    /// The version is filled: clean cache of this node's replica.
+    Filled,
+    /// The fill goes on.
+    Filling {
+        /// The bytes it committed so far.
+        filled: u64,
+    },
+}
+
 /// Read-through fill of evicted versions (§9.2).
 ///
 /// The method returns a boxed future so that the gateway can hold any
@@ -63,4 +77,32 @@ pub trait Fills: fmt::Debug + Send + Sync + 'static {
         version: EpochSeq,
         range: Range<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>>;
+
+    /// Fills the whole of the evicted version `version` of `key`, in
+    /// `shard`, and resolves once the fill has ended, the version clean
+    /// cache of this node's replica, or after `wait` with the bytes the
+    /// fill committed so far: the fill a gateway on another node asks of
+    /// the shard's primary (`Request::Fill` in [`routing`](crate::routing)),
+    /// asking again while the fill makes progress. Fills of the same
+    /// version share one fill, as reads do.
+    ///
+    /// By default it fills nothing: [`FillError::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Fills::read`].
+    fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<FillProgress, FillError>> + Send + '_>> {
+        let _ = (shard, key, version, wait);
+        Box::pin(async {
+            Err(FillError::Unavailable(
+                "this node does not fill whole versions".to_owned(),
+            ))
+        })
+    }
 }

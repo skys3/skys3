@@ -35,6 +35,7 @@ use skys3_types::{
 
 use super::{Reply, Request, Response};
 use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
+use crate::fill::{FillError, FillProgress};
 use crate::shard::{ShardError, ShardRef, ShardSummary};
 
 /// The longest refusal reason a reply carries, in bytes.
@@ -43,6 +44,11 @@ const MAX_REASON_LEN: usize = 1024;
 /// The longest a forwarded flush wait may ask its replica to wait. A
 /// gateway asks for less than its request timeout, and asks again.
 pub const MAX_FLUSH_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest a forwarded fill may ask its replica to wait for the fill
+/// to end. A gateway asks for less than its request timeout, and asks
+/// again while the fill makes progress.
+pub const MAX_FILL_WAIT: Duration = Duration::from_secs(60);
 
 /// Gateway to replica: one call of the gateway's shard interface.
 #[derive(Clone, PartialEq, Message)]
@@ -59,7 +65,7 @@ pub struct Forward {
     /// The call.
     #[prost(
         oneof = "Op",
-        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub op: Option<Op>,
 }
@@ -122,6 +128,25 @@ pub enum Op {
     /// The namespace import progress the shard applied last.
     #[prost(bool, tag = "21")]
     ImportProgress(bool),
+    /// Fill an evicted version from the bucket's remote target.
+    #[prost(message, tag = "22")]
+    Fill(FillQuery),
+}
+
+/// A read-through fill of an evicted version, on the shard's primary
+/// (design §9.2).
+#[derive(Clone, PartialEq, Message)]
+pub struct FillQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The evicted version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
+    /// How long the replica may wait for the fill to end, in
+    /// milliseconds: at most [`MAX_FILL_WAIT`].
+    #[prost(uint64, tag = "3")]
+    pub wait_ms: u64,
 }
 
 /// A write-through write's wait for its version's flush (design §7.5).
@@ -346,7 +371,7 @@ pub struct Answer {
     /// The answer, by the call it answers.
     #[prost(
         oneof = "Result",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
     )]
     pub result: Option<Result>,
 }
@@ -406,7 +431,35 @@ pub enum Result {
     /// then its ranges); empty for none.
     #[prost(bytes = "vec", tag = "17")]
     ImportProgress(Vec<u8>),
+    /// Whether the version was filled, and if not, why.
+    #[prost(message, tag = "18")]
+    Filled(FillAnswer),
 }
+
+/// The outcome of a fill: one of the `FILL_*` constants, with the reason
+/// of [`FILL_UNAVAILABLE`] and the progress of [`FILL_FILLING`].
+#[derive(Clone, PartialEq, Message)]
+pub struct FillAnswer {
+    /// What happened.
+    #[prost(uint32, tag = "1")]
+    pub outcome: u32,
+    /// Why the fill failed, for [`FILL_UNAVAILABLE`]; empty otherwise.
+    #[prost(string, tag = "2")]
+    pub reason: String,
+    /// The bytes the fill committed so far, for [`FILL_FILLING`]; 0
+    /// otherwise.
+    #[prost(uint64, tag = "3")]
+    pub filled: u64,
+}
+
+/// The version is filled: the primary holds its bytes.
+pub const FILL_FILLED: u32 = 0;
+/// The key no longer holds that evicted version.
+pub const FILL_CHANGED: u32 = 1;
+/// The fill failed.
+pub const FILL_UNAVAILABLE: u32 = 2;
+/// The fill goes on after the wait.
+pub const FILL_FILLING: u32 = 3;
 
 /// The remote holds the version waited for, or a later one.
 pub const FLUSH_FLUSHED: u32 = 0;
@@ -642,6 +695,11 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         Request::Seal => Op::Seal(true),
         Request::Unseal => Op::Unseal(true),
         Request::ImportProgress => Op::ImportProgress(true),
+        Request::Fill { key, version, wait } => Op::Fill(FillQuery {
+            key: key.clone(),
+            version: Some(position(*version)),
+            wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        }),
     };
     let forward = Forward {
         bucket_id: shard.bucket.as_str().to_owned(),
@@ -834,6 +892,20 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 return Err(format!("a flush wait of {} ms", query.wait_ms));
             }
             Request::Flushed {
+                key: query.key,
+                version: epoch_seq(query.version)?,
+                wait,
+            }
+        }
+        Op::Fill(query) => {
+            if query.key.is_empty() || query.key.len() > MAX_KEY_LEN {
+                return Err(format!("a key of {} bytes", query.key.len()));
+            }
+            let wait = Duration::from_millis(query.wait_ms);
+            if wait > MAX_FILL_WAIT {
+                return Err(format!("a fill wait of {} ms", query.wait_ms));
+            }
+            Request::Fill {
                 key: query.key,
                 version: epoch_seq(query.version)?,
                 wait,
@@ -1058,6 +1130,26 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
                 .map(|(update, ranges)| encoded(codec::encode_import_progress(*update, ranges)))
                 .unwrap_or_default(),
         ),
+        Response::Filled(filled) => Result::Filled(match filled {
+            Ok(FillProgress::Filled) => FillAnswer {
+                outcome: FILL_FILLED,
+                ..FillAnswer::default()
+            },
+            Ok(FillProgress::Filling { filled }) => FillAnswer {
+                outcome: FILL_FILLING,
+                filled: *filled,
+                ..FillAnswer::default()
+            },
+            Err(FillError::Changed) => FillAnswer {
+                outcome: FILL_CHANGED,
+                ..FillAnswer::default()
+            },
+            Err(FillError::Unavailable(reason)) => FillAnswer {
+                outcome: FILL_UNAVAILABLE,
+                reason: truncate(reason),
+                filled: 0,
+            },
+        }),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -1235,6 +1327,18 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
         Result::ImportProgress(bytes) => {
             Response::ImportProgress(Some(codec::decode_import_progress(&bytes).map_err(codec)?))
         }
+        Result::Filled(answer) => Response::Filled(match answer.outcome {
+            _ if answer.outcome != FILL_FILLING && answer.filled != 0 => {
+                return Err(format!("fill outcome {} with progress", answer.outcome));
+            }
+            FILL_FILLED if answer.reason.is_empty() => Ok(FillProgress::Filled),
+            FILL_FILLING if answer.reason.is_empty() => Ok(FillProgress::Filling {
+                filled: answer.filled,
+            }),
+            FILL_CHANGED if answer.reason.is_empty() => Err(FillError::Changed),
+            FILL_UNAVAILABLE => Err(FillError::Unavailable(answer.reason)),
+            other => return Err(format!("fill outcome {other}")),
+        }),
     })
 }
 

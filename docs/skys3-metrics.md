@@ -154,13 +154,14 @@ Design section 6.4. These report data with fewer than `replicas` copies,
 after a member was removed from a shard. A shard counts on the node that
 leads it, so summing the series of every node counts each shard once; the
 cluster's oldest age is the maximum over the nodes. The metrics are defined
-by M2-11 (`skys3_shard::replication::ReplicationMetrics`) and exported once
-replication runs in the node binary.
+by M2-11 (`skys3_shard::replication::ReplicationMetrics`) and exported by
+nodes with `[cluster] multi_node = true` (M8-05b), whose shards have other
+members; a single node does not export them.
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
-| `skys3_under_replicated_bytes` | gauge | none | §6.4 | defined (M2-11) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
-| `skys3_oldest_under_replicated_age_seconds` | gauge | none | §6.4 | defined (M2-11) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
+| `skys3_under_replicated_bytes` | gauge | none | §6.4 | exported (M2-11; with `multi_node` from M8-05b) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
+| `skys3_oldest_under_replicated_age_seconds` | gauge | none | §6.4 | exported (M2-11; with `multi_node` from M8-05b) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
 
 ### 3.4 Read-through fill
 

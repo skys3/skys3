@@ -227,6 +227,7 @@ fn conflicts_are_listed_and_resolved_under_each_policy() {
             health: Health::new(),
             flush: service.clone(),
             cluster: None,
+            replicated: None,
         };
 
         // Listing: each key, its shard, its local `seq`, and the remote's

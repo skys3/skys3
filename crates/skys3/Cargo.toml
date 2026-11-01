@@ -22,6 +22,7 @@ rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+skys3-cluster.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
 skys3-coord.workspace = true

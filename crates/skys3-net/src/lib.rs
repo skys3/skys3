@@ -25,6 +25,9 @@
 //! - **Network.** [`Transport`] runs over any [`Network`]: the operating
 //!   system's TCP ([`TokioNetwork`]) or, with the `turmoil` feature,
 //!   `turmoil`'s simulated network.
+//! - **Peers.** [`Peers`] holds the address of each node, which the
+//!   services that connect to other nodes look up as they connect, so
+//!   that a node that registers later is reached too.
 //!
 //! ```no_run
 //! use skys3_net::{Credentials, Frame, Header, MessageKind, TokioNetwork, Transport};
@@ -54,6 +57,7 @@ mod frame;
 mod identity;
 mod message;
 mod network;
+mod peers;
 mod pki;
 mod transport;
 
@@ -65,6 +69,7 @@ pub use message::{MessageClass, MessageKind};
 #[cfg(feature = "turmoil")]
 pub use network::TurmoilNetwork;
 pub use network::{Network, TokioNetwork};
+pub use peers::Peers;
 pub use pki::{Credentials, PkiError, pki_error};
 /// The DER types [`Credentials::new`] takes, re-exported from `rustls`.
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};

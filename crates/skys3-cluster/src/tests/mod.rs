@@ -27,7 +27,9 @@ use skys3_net::{
 };
 use skys3_shard::replication::{ControlRegisters, HandedOff, Replication, ReplicationConfig};
 use skys3_shard::{AckTimeout, Shard, ShardSet};
-use skys3_types::{BucketId, ClusterId, ETag, Epoch, NodeId, ProposalId, ShardConfig, ShardId};
+use skys3_types::{
+    BucketId, ClusterId, ETag, Epoch, NodeAddress, NodeId, ProposalId, ShardConfig, ShardId,
+};
 
 use crate::{ReplicaObserver, ReplicatedShards};
 
@@ -284,7 +286,7 @@ async fn cluster<S: ControlStore>(pki: &Pki, count: u8, store: &S) -> Vec<Node> 
             .iter()
             .filter(|(to, _)| **to != n)
             .map(|(to, address)| (node(*to), address.to_string().parse().unwrap()))
-            .collect();
+            .collect::<BTreeMap<_, NodeAddress>>();
         let (set, clock) = shard_set(40 + u64::from(n)).await;
         let replication = Replication::new(
             node(n),

@@ -2,7 +2,7 @@
 //! intra-cluster connections.
 
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use skys3_io::Disk;
@@ -13,9 +13,12 @@ use skys3_types::{Epoch, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{Reply, Request, Response, wire};
+use skys3_index::EntryState;
 use skys3_log::RecordBody;
+use skys3_types::EpochSeq;
 
 use crate::conditions::Precondition;
+use crate::fill::{FillError, FillProgress, Fills};
 use crate::shard::{ShardError, ShardRef, Shards, WriteOutcome};
 
 /// How long an accepted connection may take to send its first frame.
@@ -60,6 +63,7 @@ struct Inner<S, D: Disk> {
     set: ShardSet<D>,
     shards: S,
     observer: OnceLock<Observer>,
+    fills: OnceLock<Weak<dyn Fills>>,
 }
 
 impl<S, D: Disk> Clone for ForwardServer<S, D> {
@@ -90,6 +94,7 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 set,
                 shards,
                 observer: OnceLock::new(),
+                fills: OnceLock::new(),
             }),
         }
     }
@@ -102,6 +107,21 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
     pub fn observe(&self, observer: impl Fn(&Served) + Send + Sync + 'static) {
         if self.inner.observer.set(Arc::new(observer)).is_err() {
             tracing::warn!("a forward server already has an observer");
+        }
+    }
+
+    /// Serves [`Request::Fill`] through `fills`, the node's read-through
+    /// fills into its own replicas, which must not forward fills in turn.
+    /// Without them, a fill is refused as unavailable. A server has at most
+    /// one: the first one set stays.
+    ///
+    /// The server holds them weakly, and refuses fills once the caller
+    /// dropped them: fills commit through the node's shards, which may
+    /// route through this server, and a strong reference would make a
+    /// cycle that keeps the node's index open after it stops.
+    pub fn fill_with(&self, fills: &Arc<dyn Fills>) {
+        if self.inner.fills.set(Arc::downgrade(fills)).is_err() {
+            tracing::warn!("a forward server already has its fills");
         }
     }
 
@@ -232,7 +252,32 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
             Request::ImportProgress => {
                 Response::ImportProgress(shards.import_progress(shard).await?)
             }
+            Request::Fill { key, version, wait } => {
+                Response::Filled(self.fill(shard, &key, version, wait).await?)
+            }
         })
+    }
+
+    /// Fills the whole of `version` of `key`, if the replica, as its
+    /// shard's serving primary, still holds it evicted, and waits until
+    /// the version is clean cache, or for `wait` at most.
+    async fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<Result<FillProgress, FillError>, ShardError> {
+        // Read as a client read is, so that only the serving primary fills.
+        let entry = self.inner.shards.entry(shard, key).await?;
+        let Some(fills) = self.inner.fills.get().and_then(Weak::upgrade) else {
+            let reason = "the node does not fill".to_owned();
+            return Ok(Err(FillError::Unavailable(reason)));
+        };
+        if !entry.is_some_and(|e| e.version == version && e.state == EntryState::Evicted) {
+            return Ok(Err(FillError::Changed));
+        }
+        Ok(fills.fill(shard, key, version, wait).await)
     }
 
     /// Serves the forwarded requests of one connection from a gateway, one

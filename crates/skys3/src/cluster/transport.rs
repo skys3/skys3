@@ -9,17 +9,22 @@
 //! holds at most the cap of handshake tasks and TLS states, each for at
 //! most `skys3_net::HANDSHAKE_TIMEOUT`, whatever the rate of the flood.
 //!
-//! This build serves admin messages (pushed generations, heartbeats, and
-//! handoff requests, `skys3_coord::AdminEndpoint`). A connection of
-//! another class is closed: replication and forwarded requests join when
-//! the binary serves shards across nodes (plan M8-05b).
+//! It serves admin messages (pushed generations, heartbeats, and handoff
+//! requests, `skys3_coord::AdminEndpoint`); replication links, backfills,
+//! and lease messages from other nodes' primaries, through the node's
+//! replication; and the requests other gateways forward to this node's
+//! replicas (plan M8-05b). A connection whose first frame is of erasure
+//! coding (fragment writes, reads, and releases, plan M8-07a) is closed.
 
 use std::time::Duration;
 
 use skys3_coord::AdminEndpoint;
-use skys3_net::{Connection, Frame, Listener, MessageClass, Network, TransportError};
+use skys3_net::{Connection, Frame, Listener, MessageClass, MessageKind, Network, TransportError};
 use skys3_obs::{HandshakeLimit, HandshakeOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinSet;
+
+use super::replication::{Forwarded, NodeReplication};
 
 /// How long an authenticated connection may take to send its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,6 +39,28 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 pub(crate) struct Services {
     /// Admin messages from other nodes and operator tools.
     pub(crate) admin: AdminEndpoint,
+    /// Replication links, backfills, and lease messages from the primaries
+    /// of the shards this node holds a replica of.
+    pub(crate) replication: NodeReplication,
+    /// Requests other gateways forward to this node's replicas.
+    pub(crate) forwarded: Forwarded,
+}
+
+/// Whether `kind` opens a connection of erasure coding, which this build
+/// does not serve yet (plan M8-07a).
+fn is_coding(kind: MessageKind) -> bool {
+    matches!(
+        kind,
+        MessageKind::FragmentWrite
+            | MessageKind::FragmentWritten
+            | MessageKind::OrphanQuery
+            | MessageKind::OrphanVerdicts
+            | MessageKind::FragmentRead
+            | MessageKind::FragmentData
+            | MessageKind::FragmentRelease
+            | MessageKind::FragmentHold
+            | MessageKind::FragmentNoted
+    )
 }
 
 impl Services {
@@ -56,11 +83,18 @@ impl Services {
                 return;
             }
         };
-        match first.header.kind.class() {
+        let kind = first.header.kind;
+        match kind.class() {
             Some(MessageClass::Admin) => {
                 if let Err(error) = self.admin.serve_link((receiver, sender), first).await {
                     tracing::debug!(%peer, %error, "an admin connection ended");
                 }
+            }
+            Some(MessageClass::Replication | MessageClass::Lease) if !is_coding(kind) => {
+                self.replication.follow((receiver, sender), first).await;
+            }
+            Some(MessageClass::Request) if kind == MessageKind::Forward => {
+                self.forwarded.serve((receiver, sender), first).await;
             }
             class => tracing::info!(
                 %peer,
@@ -74,13 +108,19 @@ impl Services {
 
 /// Accepts connections on `listener` until the task is dropped, with at
 /// most `limit` handshakes at once, and serves each authenticated one with
-/// `services` on a task of its own.
+/// `services` on a task of its own. The connections' tasks end with this
+/// one: a node that stops serves no other node's link or forwarded request
+/// from then on, and those nodes see their connections end at once, rather
+/// than answers from replicas that are closing.
 pub(crate) async fn serve<N: Network>(
     listener: Listener<N>,
     limit: HandshakeLimit,
     services: Services,
 ) {
+    let mut connections = JoinSet::new();
     loop {
+        // Forget the connections that ended.
+        while connections.try_join_next().is_some() {}
         let incoming = match listener.accept().await {
             Ok(incoming) => incoming,
             Err(error) => {
@@ -93,7 +133,7 @@ pub(crate) async fn serve<N: Network>(
         // accept queue.
         let permit = limit.acquire().await;
         let services = services.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let remote = incoming.remote_addr();
             let connection = match incoming.handshake().await {
                 Ok(connection) => {

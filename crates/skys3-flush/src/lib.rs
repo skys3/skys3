@@ -153,7 +153,7 @@ pub use concurrency::{
     THROTTLE_DECREASE,
 };
 pub use conflict::Unresolved;
-pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
+pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler, WholeFill};
 pub use import::{
     Commit, DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject,
     RemoteReader, loaded_metadata,
