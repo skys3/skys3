@@ -5915,6 +5915,26 @@ of this file. A task with nothing unexpected keeps "None."
 - **No new fuzz target.** The simulation adds no parser. Frames travel
   through `skys3-peer`'s own wire code, which `peer_messages` already
   fuzzes.
+- **A panicking append held a COMMIT forever (review).** The note above
+  says appends always settle or discard; one whose task panics, as in a
+  sink bug, did neither. Its admitted range stayed in flight, so a
+  `COMMIT` on any stream of the identity waited in `Staging::settled`
+  with no end, pinned, and `expire` skips pinned staging: the stream
+  stayed occupied and the source's quota charged until the process
+  exited. Before the cross-stream wait, the panic dropped the stream's
+  append permit, the `COMMIT` was answered `incomplete`, and the TTL
+  reclaimed the staging. An append now keeps the ranges it has not
+  settled in a guard (`Unsettled`) that settles them as failed when
+  dropped, so a range leaves flight however its task ends, panic or
+  cancellation included, and the `COMMIT` stays prompt. No deadline was
+  added to the wait as well: with the guard it lasts only while an
+  append is still running, an `ExtentSink` bounds each append itself
+  (an unacknowledged one is `unavailable`), and a running append holds
+  its own stream's `COMMIT` and finish anyway, which a deadline on the
+  cross-stream wait would not change. A TTL-long deadline would not
+  make the `COMMIT` prompt either.
+  `a_panicking_append_neither_holds_a_commit_nor_keeps_its_staging`
+  (a test sink that panics for one key) times out without the guard.
 
 ## M4 Large objects
 
