@@ -188,8 +188,9 @@ struct State {
     discard_order: VecDeque<String>,
     /// The newest version among the drops `discards` no longer holds.
     forgotten: EpochSeq,
-    /// The position the shard had applied when the flusher subscribed:
-    /// the flusher tracked every version after it, from its change on.
+    /// The position the shard had applied as the flusher's task started,
+    /// after it subscribed: the flusher tracked every version after it,
+    /// from its change on.
     since: EpochSeq,
     /// Write-through waits for versions of untracked keys whose flush
     /// neither the flusher nor the index can establish
@@ -661,8 +662,13 @@ impl ShardFlusher {
         let bodies = Arc::new(Bodies::default());
         let (commands, resolutions) = mpsc::unbounded_channel();
         let not_before = Instant::now() + quarantine;
+        // Subscribed before the task first runs, which may be much later:
+        // the shard drops the announcements of streamed bodies, and refuses
+        // write-through waits, while nothing follows it.
+        let changes = shard.subscribe();
         let task = tokio::spawn(run(
             shard,
+            changes,
             (ready, not_before),
             wall,
             Arc::clone(&state),
@@ -763,16 +769,18 @@ type Done = (String, EpochSeq, Option<ConflictPolicy>, Outcome);
 type Recorded = (String, Seq, Result<(), ShardError>);
 
 /// The flusher's task. It tracks the shard's dirty keys from the start,
-/// and flushes them once the target is ready.
+/// and flushes them once the target is ready. `changes` is the shard's
+/// subscription, taken before the task was spawned.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
+    mut changes: mpsc::UnboundedReceiver<Change>,
     (ready, not_before): (Arc<Ready<S>>, Instant),
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     (streams, bodies): (Arc<Streams>, Arc<Bodies>),
     mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
-    let mut changes = shard.subscribe();
+    // Read after the subscription: every version after it is reported.
     lock(&state).since = shard.applied();
     // A native target is ready from the start: its bodies are staged at the
     // peer, and no remote multipart upload is ever opened (§7.8).
