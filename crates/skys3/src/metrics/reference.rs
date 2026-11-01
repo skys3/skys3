@@ -26,6 +26,7 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use super::NodeMetrics;
 use crate::admission::{DiskOf, DiskSpace, NodeAdmission};
+use crate::cluster::coding::CodingMetrics;
 
 pub(super) const REFERENCE: &str = include_str!("../../../../docs/skys3-metrics.md");
 pub(super) const DESIGN: &str = include_str!("../../../../docs/skys3-design.md");
@@ -70,6 +71,7 @@ async fn catalog() -> MetricsRegistry {
     drop(RepairMetrics::register(&registry));
     drop(ReleaseMetrics::register(&registry));
     drop(CoordinatorMetrics::register(&registry));
+    drop(CodingMetrics::register(&registry));
     registry
 }
 

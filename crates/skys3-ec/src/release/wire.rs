@@ -19,7 +19,6 @@
 //! connections the gateway reads fragments on, paired with its answer by
 //! the header's request ID ([`FragmentReadClient`](crate::FragmentReadClient)).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +27,8 @@ use prost::Message;
 use skys3_io::Disk;
 use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
-use skys3_net::{Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
-use skys3_types::{BucketId, Epoch, EpochSeq, FragmentId, NodeAddress, NodeId, Seq, ShardId};
+use skys3_net::{Frame, Header, MessageKind, Network, Peers, Receiver, Sender, Transport};
+use skys3_types::{BucketId, Epoch, EpochSeq, FragmentId, NodeId, Seq, ShardId};
 
 use super::{ReleaseSink, ReleasedFragment};
 use crate::FragmentServer;
@@ -254,7 +253,7 @@ pub struct ReleaseClient<N: Network, D: Disk> {
 struct ClientInner<N: Network, D: Disk> {
     node: NodeId,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     local: Option<FragmentServer<D>>,
 }
 
@@ -274,14 +273,14 @@ impl<N: Network, D: Disk> ReleaseClient<N, D> {
     pub fn new(
         node: NodeId,
         transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
+        peers: impl Into<Peers>,
         local: Option<FragmentServer<D>>,
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 node,
                 transport,
-                peers,
+                peers: peers.into(),
                 local,
             }),
         }
@@ -308,7 +307,7 @@ impl<N: Network, D: Disk> ReleaseSink for ReleaseClient<N, D> {
         let exchange = async {
             let mut connection = inner
                 .transport
-                .connect(node, address)
+                .connect(node, &address)
                 .await
                 .map_err(|e| e.to_string())?;
             for batch in fragments.chunks(MAX_RELEASES) {

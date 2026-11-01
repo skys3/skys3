@@ -22,8 +22,8 @@ use prost::Message;
 use skys3_io::Disk;
 use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
-use skys3_net::{Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
-use skys3_types::{AttemptId, BucketId, Epoch, FragmentId, NodeAddress, NodeId, ShardId};
+use skys3_net::{Frame, Header, MessageKind, Network, Peers, Receiver, Sender, Transport};
+use skys3_types::{AttemptId, BucketId, Epoch, FragmentId, NodeId, ShardId};
 use tokio::task::JoinSet;
 
 use super::{OrphanConfirmer, OrphanJudge, Suspect, Unanswered, Verdict};
@@ -180,7 +180,7 @@ pub struct OrphanClient<N: Network, D: Disk> {
 struct ClientInner<N: Network, D: Disk> {
     node: NodeId,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     primaries: PrimariesOf,
     local: OrphanServer<D>,
 }
@@ -193,7 +193,7 @@ impl<N: Network, D: Disk> OrphanClient<N, D> {
     pub fn new(
         node: NodeId,
         transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
+        peers: impl Into<Peers>,
         primaries: PrimariesOf,
         local: OrphanServer<D>,
     ) -> Self {
@@ -201,7 +201,7 @@ impl<N: Network, D: Disk> OrphanClient<N, D> {
             inner: Arc::new(ClientInner {
                 node,
                 transport,
-                peers,
+                peers: peers.into(),
                 primaries,
                 local,
             }),
@@ -227,7 +227,7 @@ impl<N: Network, D: Disk> ClientInner<N, D> {
         let exchange = async {
             let mut connection = self
                 .transport
-                .connect(node, address)
+                .connect(node, &address)
                 .await
                 .map_err(|e| e.to_string())?;
             let query = OrphanQuery::new(shard, suspects).encode_to_vec();

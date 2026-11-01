@@ -265,6 +265,7 @@ reconcile_requests_per_second = 25
 target_region = "auto"
 
 [ec]
+enabled = true
 parity_fragments = 3
 max_data_fragments = 6
 min_eligible_nodes = 7
@@ -401,6 +402,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
     assert_eq!(config.ec().fragment_repair_after().as_secs(), 900);
+    assert!(config.ec().enabled);
     let node = config.node();
     assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
     assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));

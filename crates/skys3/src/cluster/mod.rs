@@ -19,12 +19,16 @@
 //!   (design §6.7).
 //! - [`operations`]: the cluster routes of the admin API: the cluster's
 //!   state, handoffs, and drains (plan M8-06).
+//! - [`coding`]: with `[ec] enabled = true`, erasure coding: the fragment
+//!   stores and their server, the encoders, coded reads, fragment release,
+//!   and orphan reclamation (design §8, plan M8-07a).
 //!
 //! All but the first two run only with `[cluster] multi_node = true`
 //! ([`ClusterServices`], [`replication::ClusterShards`]); without it, the
 //! node behaves as a single node, serves every shard alone, and never
 //! binds the transport.
 
+pub(crate) mod coding;
 pub(crate) mod control;
 pub(crate) mod coordinator;
 pub(crate) mod hints;
@@ -50,6 +54,7 @@ use crate::admin::ClusterView;
 use crate::control::backend::Backend;
 use crate::datadir::DataDir;
 use crate::node::StartError;
+use coding::CodingServices;
 use coordinator::NodeCoordinator;
 use operations::ClusterOperations;
 use registration::NodeHeartbeater;
@@ -111,7 +116,8 @@ impl ClusterServices {
     /// `shards`, and the listener's handshakes are exported in
     /// `handshakes`. With `[cluster] coordinator = true`, the elector and
     /// the coordinator are ready to run too, with their metrics in
-    /// `metrics`.
+    /// `metrics`. With `[ec] enabled = true`, the transport serves
+    /// `coding` too.
     ///
     /// # Errors
     ///
@@ -125,7 +131,7 @@ impl ClusterServices {
         hints: ControlHints,
         (handshakes, metrics): (&HandshakeMetrics, &MetricsRegistry),
         pool: &BlockingPool,
-        shards: &ClusterShards,
+        (shards, coding): (&ClusterShards, Option<CodingServices>),
     ) -> Result<Self, StartError> {
         let settings = config.transport();
         let advertise = settings.advertised().ok_or_else(|| {
@@ -160,6 +166,7 @@ impl ClusterServices {
             ),
             replication: shards.replication().clone(),
             forwarded: shards.server().clone(),
+            coding,
         };
         let operations = Arc::new(ClusterOperations::new(
             (node, config.cluster().cluster_id.clone()),

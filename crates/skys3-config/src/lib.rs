@@ -222,6 +222,16 @@ impl Config {
         if raw.cluster.multi_node {
             check_multi_node(&control_store, &raw.transport, &mut checker);
         }
+        // Fragments travel on the transport, and a stripe spans nodes.
+        checker.require(
+            raw.cluster.multi_node || !raw.ec.enabled,
+            "ec.enabled",
+            || {
+                "is true; erasure coding places fragments on several nodes and moves them on \
+                 the intra-cluster transport, so it needs [cluster] multi_node = true"
+                    .to_owned()
+            },
+        );
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
         check_peer_sources(&raw.peering, &named_buckets, &mut checker);
         check_stripes(

@@ -17,6 +17,12 @@ pub const MAX_FRAGMENT_BYTES: u64 = 256 * MIB;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EcConfig {
+    /// `enabled`: whether the node runs erasure coding (plan M8-07a): its
+    /// fragment stores, the fragment server on the transport, an encoder
+    /// for each shard of a `local` bucket it leads, coded reads in its
+    /// gateway, and orphan reclamation. Needs `[cluster] multi_node`. A
+    /// gate that plan M8-09 removes.
+    pub enabled: bool,
     /// `parity_fragments`: `m`, the parity fragments per stripe (§8.3).
     pub parity_fragments: u32,
     /// `max_data_fragments`: the widest `k` the coordinator picks (§8.3).
@@ -41,6 +47,7 @@ pub struct EcConfig {
 impl Default for EcConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             parity_fragments: 2,
             max_data_fragments: 8,
             min_eligible_nodes: 5,
