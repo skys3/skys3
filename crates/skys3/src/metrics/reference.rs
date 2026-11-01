@@ -17,6 +17,7 @@ use skys3_coord::CoordinatorMetrics;
 use skys3_ec::{ReleaseMetrics, RepairMetrics};
 use skys3_flush::{DirtyBudget, FlushMetrics};
 use skys3_gateway::{HotCacheMetrics, PeerRefusals};
+use skys3_log::LogStats;
 use skys3_obs::{AdminConfig, AdminListener, Health, MetricsRegistry};
 use skys3_shard::lifecycle::LifecycleMetrics;
 use skys3_shard::replication::ReplicationMetrics;
@@ -24,7 +25,7 @@ use skys3_shard::{CacheMetrics, CompactionMetrics};
 use skys3_types::Label;
 use yaml_rust2::{Yaml, YamlLoader};
 
-use super::NodeMetrics;
+use super::{LogMetrics, NodeMetrics};
 use crate::admission::{DiskOf, DiskSpace, NodeAdmission};
 use crate::cluster::coding::CodingMetrics;
 
@@ -45,6 +46,7 @@ const EXTERNAL: &[&str] = &["up", "node_timex_sync_status"];
 /// metrics in one registry, as a node does.
 async fn catalog() -> MetricsRegistry {
     let registry = NodeMetrics::new(Duration::from_secs(3600)).registry;
+    LogMetrics::register(&registry, LogStats::default);
     let admin = AdminConfig {
         listen: ([127, 0, 0, 1], 0).into(),
         token: None,

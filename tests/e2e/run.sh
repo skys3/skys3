@@ -42,6 +42,9 @@
 #                     1 when the suite's CA is installed in the system
 #                     trust store (CI does it); otherwise the nodes get it
 #                     through SSL_CERT_FILE
+#   SKYS3_E2E_SCENARIO_TIMEOUT
+#                     how long a scenario may run, in seconds (600); the
+#                     perf scenario's full profile needs hours
 #   SKYS3_E2E_FAULT   a seeded fault, to show that the suite catches it:
 #                     `flusher-off` gives the node a wrong secret for
 #                     MinIO, so nothing flushes (or imports); `udp-blocked`
@@ -500,7 +503,7 @@ run_scenario() {
     name=$(basename "$script" .sh)
     name=${name#[0-9][0-9]-}
     started=$SECONDS
-    if timeout 600 bash "$script" >"$E2E_DIR/logs/scenario-$name.log" 2>&1; then
+    if timeout "${SKYS3_E2E_SCENARIO_TIMEOUT:-600}" bash "$script" >"$E2E_DIR/logs/scenario-$name.log" 2>&1; then
         status=passed
     fi
     echo "$status $name ($((SECONDS - started))s)" >"$E2E_DIR/results/$name"

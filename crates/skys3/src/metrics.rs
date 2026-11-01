@@ -7,11 +7,16 @@
 //! the code registers, and the alerting rules and the dashboard under
 //! `deploy/` against the reference.
 
+use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use prometheus_client::encoding::{EncodeMetric, MetricEncoder, NoLabelSet};
+use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Unit;
+use skys3_log::LogStats;
 use skys3_obs::{HandshakeMetrics, MetricsRegistry};
 use skys3_remote::aws::BucketVersioning;
 
@@ -137,6 +142,110 @@ impl ControlMetrics {
     }
 }
 
+/// What [`LogMetrics`] reads at each scrape: the summed [`LogStats`] of
+/// the node's logs.
+type StatsSource = Arc<dyn Fn() -> LogStats + Send + Sync>;
+
+/// The group commits of the node's logs (§5.3, §10.4), summed over its
+/// disks: `skys3_log_group_commits_total`, `skys3_log_records_total`,
+/// `skys3_log_syncs_total`, `skys3_log_written_bytes_total`, and
+/// `skys3_log_commit_seconds_total`. Each is read from the logs' own
+/// counters when the registry is encoded, so the commit path does no
+/// extra work for them. The performance suite divides them by the PUTs
+/// it had acknowledged, to compare with §5.3's table.
+pub(crate) struct LogMetrics;
+
+impl LogMetrics {
+    /// Registers the log metrics in `registry`, reading `stats` at each
+    /// scrape.
+    pub(crate) fn register(
+        registry: &MetricsRegistry,
+        stats: impl Fn() -> LogStats + Send + Sync + 'static,
+    ) {
+        let stats: StatsSource = Arc::new(stats);
+        let counter = |read: fn(&LogStats) -> LogCounterValue| LogCounter {
+            stats: Arc::clone(&stats),
+            read,
+        };
+        registry.register(
+            "log_group_commits",
+            "Group commits of the node's logs that succeeded, each one serial durable round.",
+            counter(|s| LogCounterValue::Count(s.group_commits)),
+        );
+        registry.register(
+            "log_records",
+            "Records those group commits made durable.",
+            counter(|s| LogCounterValue::Count(s.records)),
+        );
+        registry.register(
+            "log_syncs",
+            "File syncs those group commits made: one per segment written, and one of the \
+             directory after a segment was created.",
+            counter(|s| LogCounterValue::Count(s.syncs)),
+        );
+        registry.register_with_unit(
+            "log_written",
+            "Bytes those group commits wrote.",
+            Unit::Bytes,
+            counter(|s| LogCounterValue::Count(s.bytes)),
+        );
+        registry.register_with_unit(
+            "log_commit",
+            "Time those group commits took to write and sync.",
+            Unit::Seconds,
+            counter(|s| LogCounterValue::Seconds(s.commit_time.as_secs_f64())),
+        );
+    }
+
+    /// The sum of the logs' counts.
+    pub(crate) fn sum<'a>(stats: impl IntoIterator<Item = &'a LogStats>) -> LogStats {
+        stats
+            .into_iter()
+            .fold(LogStats::default(), |total, s| LogStats {
+                group_commits: total.group_commits + s.group_commits,
+                records: total.records + s.records,
+                bytes: total.bytes + s.bytes,
+                syncs: total.syncs + s.syncs,
+                commit_time: total.commit_time + s.commit_time,
+            })
+    }
+}
+
+/// A counter's value as one of the log counters reads it.
+enum LogCounterValue {
+    Count(u64),
+    Seconds(f64),
+}
+
+/// One of the [`LogMetrics`] counters.
+struct LogCounter {
+    stats: StatsSource,
+    read: fn(&LogStats) -> LogCounterValue,
+}
+
+impl fmt::Debug for LogCounter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LogCounter").finish_non_exhaustive()
+    }
+}
+
+impl EncodeMetric for LogCounter {
+    fn encode(&self, mut encoder: MetricEncoder) -> fmt::Result {
+        match (self.read)(&(self.stats)()) {
+            LogCounterValue::Count(value) => {
+                encoder.encode_counter::<NoLabelSet, _, u64>(&value, None)
+            }
+            LogCounterValue::Seconds(value) => {
+                encoder.encode_counter::<NoLabelSet, _, f64>(&value, None)
+            }
+        }
+    }
+
+    fn metric_type(&self) -> MetricType {
+        MetricType::Counter
+    }
+}
+
 #[cfg(test)]
 mod reference;
 
@@ -146,6 +255,65 @@ mod runbooks;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_counters_sum_the_logs_at_each_scrape() {
+        let one = LogStats {
+            group_commits: 2,
+            records: 5,
+            bytes: 700,
+            syncs: 3,
+            commit_time: Duration::from_millis(250),
+        };
+        let two = LogStats {
+            group_commits: 1,
+            records: 1,
+            bytes: 100,
+            syncs: 2,
+            commit_time: Duration::from_millis(500),
+        };
+        let total = LogMetrics::sum([&one, &two]);
+        assert_eq!(total.group_commits, 3);
+        assert_eq!(total.records, 6);
+        assert_eq!(total.bytes, 800);
+        assert_eq!(total.syncs, 5);
+        assert_eq!(total.commit_time, Duration::from_millis(750));
+
+        let registry = MetricsRegistry::new();
+        let commits = Arc::new(AtomicU64::new(3));
+        let source = Arc::clone(&commits);
+        LogMetrics::register(&registry, move || LogStats {
+            group_commits: source.load(std::sync::atomic::Ordering::Relaxed),
+            ..total
+        });
+        let text = registry.encode().unwrap();
+        for line in [
+            "skys3_log_group_commits_total 3\n",
+            "skys3_log_records_total 6\n",
+            "skys3_log_syncs_total 5\n",
+            "skys3_log_written_bytes_total 800\n",
+            "skys3_log_commit_seconds_total 0.75\n",
+            "# TYPE skys3_log_syncs counter\n",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        commits.store(10, std::sync::atomic::Ordering::Relaxed);
+        let text = registry.encode().unwrap();
+        assert!(
+            text.contains("skys3_log_group_commits_total 10\n"),
+            "{text}"
+        );
+        assert!(
+            format!(
+                "{:?}",
+                LogCounter {
+                    stats: Arc::new(LogStats::default),
+                    read: |s| LogCounterValue::Count(s.records),
+                }
+            )
+            .contains("LogCounter")
+        );
+    }
 
     #[test]
     fn the_control_gauges_follow_the_store_and_the_identity_copy() {

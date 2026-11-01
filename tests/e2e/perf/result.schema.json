@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkyS3 performance result, version 1",
+  "description": "One run of the performance harness (tests/e2e/perf/perf.py). docs/skys3-performance.md describes each field. Any change to this schema raises `version`, and the harness's `check` and `compare` refuse results of another version.",
+  "type": "object",
+  "required": ["schema", "version", "run_id", "started_at", "finished_at", "git", "profile",
+               "parameters", "host", "cluster", "scenarios"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "skys3-perf-result"},
+    "version": {"const": 1},
+    "run_id": {"type": "string"},
+    "started_at": {"type": "string"},
+    "finished_at": {"type": "string"},
+    "git": {
+      "type": "object",
+      "required": ["sha", "dirty"],
+      "additionalProperties": false,
+      "properties": {
+        "sha": {"type": ["string", "null"]},
+        "dirty": {"type": ["boolean", "null"]}
+      }
+    },
+    "profile": {"enum": ["smoke", "full"]},
+    "parameters": {"type": "object"},
+    "host": {
+      "type": "object",
+      "required": ["cpus", "kernel", "machine", "python", "memory_bytes", "disk"],
+      "additionalProperties": false,
+      "properties": {
+        "cpus": {"type": "integer", "minimum": 1},
+        "kernel": {"type": "string"},
+        "machine": {"type": "string"},
+        "python": {"type": "string"},
+        "memory_bytes": {"type": ["integer", "null"]},
+        "disk": {
+          "type": ["object", "null"],
+          "required": ["device", "rotational", "model"],
+          "additionalProperties": false,
+          "properties": {
+            "device": {"type": "string"},
+            "rotational": {"type": ["boolean", "null"]},
+            "model": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "required": ["name", "nodes", "binary_version", "facts"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "nodes": {"type": "array", "items": {"type": "string"}},
+        "binary_version": {"type": ["string", "null"]},
+        "facts": {"type": "object"}
+      }
+    },
+    "scenarios": {"type": "array", "items": {"$ref": "#/$defs/scenario"}}
+  },
+  "$defs": {
+    "scenario": {
+      "type": "object",
+      "required": ["name", "rows", "status", "reason", "duration_seconds", "cases"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "rows": {"type": "array", "items": {"type": "string"}},
+        "status": {"enum": ["ok", "failed", "skipped", "not_implemented"]},
+        "reason": {"type": ["string", "null"]},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "cases": {"type": "array", "items": {"$ref": "#/$defs/case"}}
+      }
+    },
+    "case": {
+      "type": "object",
+      "required": ["labels", "distributions", "values", "series"],
+      "additionalProperties": false,
+      "properties": {
+        "labels": {"type": "object"},
+        "distributions": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/distribution"}
+        },
+        "values": {"type": "object"},
+        "series": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "number"}}
+          }
+        }
+      }
+    },
+    "distribution": {
+      "type": "object",
+      "required": ["unit", "count", "min", "max", "mean", "percentiles", "histogram", "samples"],
+      "additionalProperties": false,
+      "properties": {
+        "unit": {"type": "string"},
+        "count": {"type": "integer", "minimum": 0},
+        "min": {"type": ["number", "null"]},
+        "max": {"type": ["number", "null"]},
+        "mean": {"type": ["number", "null"]},
+        "percentiles": {
+          "type": "object",
+          "required": ["p50", "p90", "p99", "p99.9"],
+          "additionalProperties": {"type": ["number", "null"]}
+        },
+        "histogram": {
+          "type": "object",
+          "required": ["bounds", "counts"],
+          "additionalProperties": false,
+          "properties": {
+            "bounds": {"type": "array", "items": {"type": "number"}},
+            "counts": {"type": "array", "items": {"type": "integer", "minimum": 0}}
+          }
+        },
+        "samples": {"type": ["array", "null"], "items": {"type": "number"}}
+      }
+    }
+  }
+}

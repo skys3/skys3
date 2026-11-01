@@ -11,7 +11,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::LogConfig;
-use crate::log::{LAZY_MAX_DELAY, Shared};
+use crate::log::{CommitCounts, LAZY_MAX_DELAY, Shared};
 use crate::record::ShardRef;
 use crate::segment::{RecordLocation, SegmentClass, SegmentId, file_name};
 
@@ -158,10 +158,15 @@ impl<D: Disk> Committer<D> {
     /// Commits `group` and answers its appenders. Returns `false` once an
     /// I/O error ended the write path, after failing every queued record.
     async fn commit_group(&mut self, group: &mut Vec<Request>) -> bool {
+        let started = self.clock.now();
         match self.commit(group).await {
-            Ok(locations) => {
-                let bytes = group.iter().map(|r| r.bytes.len() as u64).sum();
-                self.shared.stats.record_commit(group.len() as u64, bytes);
+            Ok((locations, syncs)) => {
+                self.shared.stats.record_commit(CommitCounts {
+                    records: group.len() as u64,
+                    bytes: group.iter().map(|r| r.bytes.len() as u64).sum(),
+                    syncs,
+                    time: self.clock.now().saturating_duration_since(started),
+                });
                 self.shared.summarize(
                     group
                         .iter()
@@ -228,8 +233,9 @@ impl<D: Disk> Committer<D> {
         }
     }
 
-    /// Writes and syncs `group`, and returns each record's location.
-    async fn commit(&mut self, group: &[Request]) -> io::Result<Vec<RecordLocation>> {
+    /// Writes and syncs `group`, and returns each record's location and
+    /// the number of file syncs it made.
+    async fn commit(&mut self, group: &[Request]) -> io::Result<(Vec<RecordLocation>, u64)> {
         let mut class_bytes = [0u64; 2];
         for request in group {
             class_bytes[request.class.index()] += request.bytes.len() as u64;
@@ -263,6 +269,9 @@ impl<D: Disk> Committer<D> {
             buffers[index].push(request.bytes.clone());
         }
 
+        // One sync per segment written, and the directory's.
+        let syncs = buffers.iter().filter(|records| !records.is_empty()).count() as u64
+            + u64::from(self.dir_dirty);
         let [hot, bulk] = buffers;
         let [hot_segment, bulk_segment] = self.active.each_ref();
         let dir_dirty = self.dir_dirty;
@@ -288,7 +297,7 @@ impl<D: Disk> Committer<D> {
                 active.len = end;
             }
         }
-        Ok(locations)
+        Ok((locations, syncs))
     }
 
     /// Makes sure `class` has a segment to append `len` bytes to, starting

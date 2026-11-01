@@ -1905,6 +1905,10 @@ Measure on fixed hardware and against remote targets with shaped links:
 - Read scaling: GET throughput for one hot object as `clean_copies` and the number of gateways grow.
 - Local buckets: stored bytes per logical byte at the measured object-size distribution, encoding backlog, and repair time after a node loss.
 
+**How section 5.3's counts are measured (plan M7-06a).** Each node exports its logs' group commits, the records they made durable, the file syncs they made, and their time (`skys3_log_*`, metrics reference section 3.13). Over a run of PUTs, the fsyncs per acknowledged PUT are the syncs of every node divided by the PUTs acknowledged, and the records per group commit are the records over the group commits. A group commit runs its syncs in parallel, so it is one serial durable round; a PUT's median latency over the mean group-commit time bounds its serial rounds from above, which is close to the claimed 1 only where syncs dominate the latency. Control-store calls on the write path are not measured.
+
+**The harness (plan M7-06a).** `tests/e2e/perf/perf.py` runs these measurements against a cluster its target file describes, samples every node's metrics meanwhile, and writes a versioned JSON result (`tests/e2e/perf/result.schema.json`) with the commit, the parameters, the host, and each distribution's percentiles, histogram, and samples. Its `smoke` profile runs on every pull request, end to end without thresholds; its `full` profile is the matrix above, for fixed hardware. It covers PUT latency with the counts above, read scaling, failover and the durability window, flush by target round trip, import, and fill latency; the cache hit rate and compaction write amplification, local-bucket space and repair, and the peer transport are named scenarios that report `not_implemented` until they are measured. [`docs/skys3-performance.md`](skys3-performance.md) is its runbook.
+
 ## 17. Delivery plan
 
 | Milestone | Scope | Exit criterion |

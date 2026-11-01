@@ -445,7 +445,8 @@ jobs:
   # heartbeats, refused strangers, a handshake flood, and a single node's
   # bucket moved into the cluster), about two minutes, and the
   # replication, coordinator, and erasure-coding scenarios (plans M8-05b,
-  # M8-06, and M8-07a), beside them. When the suite
+  # M8-06, and M8-07a), and the performance harness's smoke run (plan
+  # M7-06a), beside them. When the suite
   # fails, its directories (logs, configurations, and data directories)
   # are uploaded. The job also checks the alerting rules and runs their unit
   # tests with promtool from a pinned Prometheus release, which takes
@@ -474,6 +475,12 @@ jobs:
 
       - name: Check the alerting rules
         run: sh scripts/ci/promtool.sh
+
+      # The performance harness's own logic (plan M7-06a); the suite's
+      # scenario `perf` then runs it end to end.
+      - name: Test the performance harness
+        working-directory: tests/e2e/perf
+        run: python3 -m unittest discover -s tests
 
       - name: Find the MinIO version
         id: minio
