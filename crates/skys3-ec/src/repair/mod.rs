@@ -325,6 +325,10 @@ pub struct Repairer<D: Disk, W: FragmentWriter> {
     metrics: RepairMetrics,
     observer: Option<RepairObserver>,
     state: Mutex<State>,
+    /// A position at or after every `EC_RELOCATE` of this repairer whose
+    /// commit was not confirmed and that may still commit. Shared with
+    /// the commit tasks, which set it even if their pass is dropped.
+    unconfirmed: Arc<Mutex<Option<EpochSeq>>>,
     passes: AtomicU64,
     #[cfg(feature = "test-util")]
     bug: Option<RepairBug>,
@@ -338,9 +342,6 @@ struct State {
     nodes: BTreeMap<NodeId, Health>,
     /// When each fragment known lost was first found lost.
     lost: BTreeMap<(NodeId, FragmentId), Instant>,
-    /// A position at or after every `EC_RELOCATE` of this repairer whose
-    /// commit was not confirmed and that may still commit.
-    unconfirmed: Option<EpochSeq>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -400,6 +401,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             metrics: RepairMetrics::default(),
             observer: None,
             state: Mutex::default(),
+            unconfirmed: Arc::default(),
             passes: AtomicU64::new(0),
             #[cfg(feature = "test-util")]
             bug: None,
@@ -551,11 +553,11 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     /// confirmed is settled: applied or rejected, or cut by a later epoch.
     fn settled(&self) -> bool {
         let applied = self.shard.applied();
-        let mut state = self.state();
-        if state.unconfirmed.is_some_and(|at| at <= applied) {
-            state.unconfirmed = None;
+        let mut unconfirmed = lock(&self.unconfirmed);
+        if unconfirmed.is_some_and(|at| at <= applied) {
+            *unconfirmed = None;
         }
-        state.unconfirmed.is_none()
+        unconfirmed.is_none()
     }
 
     /// The shard's fragments and their keys' entries, from one index
@@ -856,9 +858,10 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             moves,
         });
         let appended = || emit(RepairStep::Appended);
-        // The outcome is reported on the commit's task, even if this future
-        // is dropped.
+        // The outcome is reported, and an unconfirmed commit bounded, on
+        // the commit's task, even if this future is dropped.
         let (observer, owned) = (self.observer.clone(), key.to_owned());
+        let (shard, unconfirmed) = (self.shard.clone(), Arc::clone(&self.unconfirmed));
         let settled = move |publication: &Publication| {
             let step = match publication {
                 Publication::Committed(committed) => RepairStep::Committed {
@@ -866,7 +869,17 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                     relocated: committed.outcome == Outcome::Applied(Effect::Relocated),
                 },
                 Publication::Abandoned | Publication::NotAppended(_) => RepairStep::Abandoned,
-                Publication::Unconfirmed(_) => return,
+                Publication::Unconfirmed(_) => {
+                    // The record, if appended, is in the attempt's epoch
+                    // and was sequenced before its commit ended, so at or
+                    // before this position: seqs run on across epochs. Once
+                    // the shard applies this one, or one of a later epoch,
+                    // the record is applied or cut.
+                    let bound = EpochSeq::new(attempt.epoch, shard.last_sequenced());
+                    let mut unconfirmed = lock(&unconfirmed);
+                    *unconfirmed = (*unconfirmed).max(Some(bound));
+                    return;
+                }
             };
             emit_to(observer.as_ref(), &owned, stripe, attempt, step);
         };
@@ -882,15 +895,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         {
             Publication::Committed(committed) => committed,
             Publication::Abandoned => return Err(RepairError::Abandoned(attempt)),
-            Publication::NotAppended(error) => return Err(RepairError::Publish(error)),
-            Publication::Unconfirmed(error) => {
-                // The record, if appended, is in the attempt's epoch and
-                // sequenced by now, so at or before this position. Positions
-                // order as the log does: once the shard applies this one,
-                // or one of a later epoch, the record is applied or cut.
-                let bound = EpochSeq::new(attempt.epoch, self.shard.last_sequenced());
-                let mut state = self.state();
-                state.unconfirmed = state.unconfirmed.max(Some(bound));
+            Publication::NotAppended(error) | Publication::Unconfirmed(error) => {
                 return Err(RepairError::Publish(error));
             }
         };
@@ -1135,7 +1140,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.state)
     }
 
     #[cfg(feature = "test-util")]
@@ -1147,6 +1152,11 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     fn has_bug(&self, _bug: RepairBug) -> bool {
         false
     }
+}
+
+/// Locks `mutex`, poisoned or not.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Reports `step` of the repair of `key`'s `stripe` by `attempt` to

@@ -1350,6 +1350,18 @@ fn moves_are_fenced_like_repairs() {
 
 #[test]
 fn moves_wait_for_a_relocation_that_may_still_commit() {
+    moves_wait_for_an_unconfirmed_relocation(false);
+}
+
+#[test]
+fn moves_wait_for_a_relocation_whose_pass_was_dropped() {
+    moves_wait_for_an_unconfirmed_relocation(true);
+}
+
+/// A second pass moves nothing while the first pass's relocation, which
+/// its members did not acknowledge, may still commit; with `dropped`, the
+/// first pass is cancelled while the relocation commits.
+fn moves_wait_for_an_unconfirmed_relocation(dropped: bool) {
     runtime().block_on(async {
         let acking = Arc::new(AtomicBool::new(true));
         let disk = SimDisk::new(11);
@@ -1393,14 +1405,51 @@ fn moves_wait_for_a_relocation_that_may_still_commit() {
             moves_per_pass: 1,
             ..MOVING
         };
-        let repairer = f.repairer(racks, one);
+        let repairer = Arc::new(f.repairer(racks, one));
 
         // The first pass drains fragment 3 of the first stripe from `x` to
         // node 4, bringing rack b to 2, and its members do not acknowledge
         // the move's record, which keeps its position.
         acking.store(false, Ordering::SeqCst);
-        let report = repairer.pass().await;
-        assert_eq!((report.moved, report.unmoved), (0, 1), "{report:?}");
+        if dropped {
+            // The pass is cancelled once the record is sequenced: what
+            // becomes of it is still heard on the commit's task.
+            let pass = tokio::spawn({
+                let repairer = Arc::clone(&repairer);
+                async move { repairer.pass().await }
+            });
+            let publishing = |attempt| {
+                matches!(
+                    f.attempts.state(attempt),
+                    Some(AttemptState::Publishing { position: None })
+                )
+            };
+            let attempt = loop {
+                let found = f
+                    .attempts
+                    .in_progress()
+                    .into_iter()
+                    .find(|&a| publishing(a));
+                if let Some(attempt) = found
+                    && f.steps().contains(&RepairStep::Appended)
+                {
+                    break attempt;
+                }
+                assert!(!pass.is_finished(), "the pass ended before it published");
+                tokio::task::yield_now().await;
+            };
+            pass.abort();
+            // The commit fails as not acknowledged after 100 ms.
+            while publishing(attempt) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // The commit's task reports the outcome right after it records
+            // the position.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        } else {
+            let report = repairer.pass().await;
+            assert_eq!((report.moved, report.unmoved), (0, 1), "{report:?}");
+        }
         assert!(matches!(
             &f.steps()[0],
             RepairStep::MoveStarted { pass: 1, index: 3, from, to, .. }

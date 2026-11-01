@@ -7522,6 +7522,21 @@ of this file. A task with nothing unexpected keeps "None."
   Moves are planned per shard from the pass's index read, one fragment
   per `EC_RELOCATE`; moves of one stripe could share a record. The space
   moved-from fragments keep is above.
+- **A dropped pass left no bound on its unconfirmed relocation (found
+  restacking onto M5-08's settling fix).** M5-08 moved the reporting of
+  a record's outcome onto the commit's task, so a dropped pass still
+  reports it, but the bound above was still set by the pass from
+  `publish`'s return value: a pass cancelled while its relocation waited
+  through set none, and the next pass moved as if nothing were in
+  flight. The `settled` callback now sets the bound on the commit's task,
+  in a cell the repairer shares with it. The bound stays the shard's last
+  sequenced seq in the attempt's epoch, read once the commit has ended,
+  rather than `attempts::sequenced_through`'s seq in the current epoch:
+  `commit_in` sequences only in the attempt's epoch, and seqs run on
+  across epochs (a `CONFIG` takes the next seq), so the record is at or
+  before it either way, and the tighter bound frees moves as soon as the
+  shard applies a record of a later epoch
+  (`moves_wait_for_a_relocation_whose_pass_was_dropped`).
 
 ### M5-10 Lifecycle expiration and multipart cleanup
 
