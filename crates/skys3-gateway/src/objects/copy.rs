@@ -1,6 +1,7 @@
 //! CopyObject (design §7.2, §10.1, §11).
 //!
-//! A copy reads the source object's bytes from its shard and writes them
+//! A copy reads the source object's bytes from its shard, or from its
+//! fragments if it is coded (§8.5), and writes them
 //! into the destination's shard as a new body, inline or as `EXTENT`
 //! records, exactly as a PUT of the same bytes would be stored. It then
 //! commits a `PUT` that records its source: the source bucket's ID, its
@@ -54,7 +55,9 @@ use skys3_types::{BucketDocument, ETag, EpochSeq, VersionIdentity, WriteIdentity
 
 use super::tagging::parse_tagging_header;
 use super::upload::Upload;
-use super::{MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, download, metadata_of, now_ms};
+use super::{
+    MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, coded, download, metadata_of, now_ms,
+};
 use crate::authz::{CopiedTags, access_denied};
 use crate::buckets::shard_error;
 use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm};
@@ -254,7 +257,13 @@ impl<H: Shards> Objects<H> {
             hashed.push(ChecksumAlgorithm::Md5);
         }
         let (data, digests) = self
-            .copy_bytes(&source_shard, &object, &shard, &input.key, &hashed)
+            .copy_bytes(
+                (&source_shard, &source_key),
+                &object,
+                &shard,
+                &input.key,
+                &hashed,
+            )
             .await?;
         let checksums = if wanted.is_empty() {
             object.checksums.clone()
@@ -322,27 +331,35 @@ impl<H: Shards> Objects<H> {
         })
     }
 
-    /// Writes the bytes of `object`, in `source`, into `shard` as the body
-    /// of a `PUT` of `key`, and returns where they are and their digests in
-    /// the `hashed` algorithms.
+    /// Writes the bytes of `object`, the current version of
+    /// `source_key` in `source`, into `shard` as the body of a `PUT` of
+    /// `key`, and returns where they are and their digests in the `hashed`
+    /// algorithms. A coded source is read from its fragments, since its
+    /// replicas drop their copies once it is coded (§8.5).
     async fn copy_bytes(
         &self,
-        source: &ShardRef,
+        (source, source_key): (&ShardRef, &str),
         object: &ObjectVersion,
         shard: &ShardRef,
         key: &str,
         hashed: &[ChecksumAlgorithm],
     ) -> S3Result<(PutData, Digests)> {
-        let positions: Vec<_> = match &object.payload {
-            Payload::Inline(position) => vec![(*position, object.size)],
-            Payload::Extents(extents) => extent_positions(extents),
-            Payload::Parts { upload, parts } => {
-                let whole = 0..object.size;
-                let (extents, _) =
-                    download::part_extents(&self.shards, source, *upload, parts, whole).await?;
-                extent_positions(&extents)
-            }
-            Payload::None => return Err(download::not_cached()),
+        let (mut coded, positions) = if object.coded.is_some() {
+            let body = self.coded_source(source, source_key, object).await?;
+            (Some(body), Vec::new())
+        } else {
+            let positions = match &object.payload {
+                Payload::Inline(position) => vec![(*position, object.size)],
+                Payload::Extents(extents) => extent_positions(extents),
+                Payload::Parts { upload, parts } => {
+                    let whole = 0..object.size;
+                    let (extents, _) =
+                        download::part_extents(&self.shards, source, *upload, parts, whole).await?;
+                    extent_positions(&extents)
+                }
+                Payload::None => return Err(download::not_cached()),
+            };
+            (None, positions)
         };
         let mut upload = Upload::new(
             self.shards.clone(),
@@ -355,16 +372,28 @@ impl<H: Shards> Objects<H> {
         let mut hasher = (!hashed.is_empty())
             .then(|| PooledHasher::new(hashed.iter().copied(), self.pool.clone()));
         let mut copied = 0u64;
-        for (position, len) in positions {
-            let data: Bytes = self
-                .shards
-                .payload(source, position)
-                .await
-                .map_err(shard_error)?;
-            if data.len() as u64 != len {
-                return Err(size_mismatch());
-            }
-            copied += len;
+        let mut positions = positions.into_iter();
+        loop {
+            let data: Bytes = if let Some(body) = &mut coded {
+                match body.recv().await {
+                    Some(piece) => piece.map_err(coded::unreadable_source)?,
+                    None => break,
+                }
+            } else {
+                let Some((position, len)) = positions.next() else {
+                    break;
+                };
+                let data = self
+                    .shards
+                    .payload(source, position)
+                    .await
+                    .map_err(shard_error)?;
+                if data.len() as u64 != len {
+                    return Err(size_mismatch());
+                }
+                data
+            };
+            copied += data.len() as u64;
             upload.push(&data).await?;
             if let Some(hasher) = &mut hasher {
                 hasher.update(data).await.map_err(|_| unavailable())?;

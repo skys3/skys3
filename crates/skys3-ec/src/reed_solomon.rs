@@ -1,6 +1,7 @@
 //! Codec 1: systematic Reed-Solomon over GF(2^16), from `reed-solomon-simd`.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use reed_solomon_simd::engine::{DefaultEngine, Engine};
 use reed_solomon_simd::rate::{HighRateDecoder, HighRateEncoder, RateDecoder, RateEncoder};
@@ -30,6 +31,12 @@ const FRAGMENT_ALIGN: u64 = 64;
 /// - Parity fragments `k..k+m` are the crate's recovery shards `0..m` for
 ///   the `k` data fragments as original shards.
 ///
+/// The code works on each 64-byte column of the fragments alone: bytes
+/// `64·j..64·(j+1)` of the parity fragments depend only on the same bytes
+/// of the data fragments. A range read decodes just the 64-byte columns
+/// that cover its bytes ([`EcCodec::columns`]), which the unit tests and
+/// the golden vectors check against whole-stripe decoding.
+///
 /// The crate picks a SIMD engine (AVX2, SSSE3, Neon, or none) at run time.
 /// All of them compute the same bytes; the unit tests check the SIMD path
 /// against the portable one.
@@ -43,6 +50,35 @@ impl EcCodec for ReedSolomonV1 {
 
     fn fragment_len(&self, geometry: Geometry, data_len: u64) -> Result<u64, EcError> {
         fragment_len(geometry, data_len)
+    }
+
+    fn columns(
+        &self,
+        geometry: Geometry,
+        data_len: u64,
+        within: Range<u64>,
+    ) -> Result<Range<u64>, EcError> {
+        let fragment_len = fragment_len(geometry, data_len)?;
+        if within.is_empty() || within.end > fragment_len {
+            return Err(EcError::OutsideFragment {
+                range: within,
+                fragment_len,
+            });
+        }
+        // The fragment length is a multiple of the alignment, so rounding
+        // the end up stays within it.
+        let start = within.start / FRAGMENT_ALIGN * FRAGMENT_ALIGN;
+        Ok(start..within.end.next_multiple_of(FRAGMENT_ALIGN))
+    }
+
+    fn decode_columns(
+        &self,
+        geometry: Geometry,
+        data_len: u64,
+        columns: Range<u64>,
+        fragments: &[Option<&[u8]>],
+    ) -> Result<Vec<Vec<u8>>, EcError> {
+        decode_columns::<DefaultEngine>(geometry, data_len, columns, fragments)
     }
 
     fn encode(&self, geometry: Geometry, data: &[u8]) -> Result<Vec<Vec<u8>>, EcError> {
@@ -93,13 +129,25 @@ fn check_fragments(
     data_len: u64,
     fragments: &[Option<&[u8]>],
 ) -> Result<usize, EcError> {
+    let expected = fragment_len(geometry, data_len)?;
+    check_slots(geometry, expected, fragments)?;
+    // `fragment_len` checked that the whole stripe fits in a usize.
+    Ok(expected as usize)
+}
+
+/// Checks that `fragments` has a slot per fragment of `geometry`, that
+/// every fragment present has `expected` bytes, and that at least `k` are.
+fn check_slots(
+    geometry: Geometry,
+    expected: u64,
+    fragments: &[Option<&[u8]>],
+) -> Result<(), EcError> {
     if fragments.len() != geometry.total_fragments() {
         return Err(EcError::FragmentCount {
             expected: geometry.total_fragments(),
             actual: fragments.len(),
         });
     }
-    let expected = fragment_len(geometry, data_len)?;
     let mut available = 0;
     for (index, fragment) in fragments.iter().enumerate() {
         if let Some(fragment) = fragment {
@@ -119,8 +167,7 @@ fn check_fragments(
             available,
         });
     }
-    // `fragment_len` checked that the whole stripe fits in a usize.
-    Ok(expected as usize)
+    Ok(())
 }
 
 fn backend(error: reed_solomon_simd::Error) -> EcError {
@@ -160,6 +207,31 @@ fn decode<E: Engine + Default>(
         remaining -= take;
     }
     Ok(data)
+}
+
+fn decode_columns<E: Engine + Default>(
+    geometry: Geometry,
+    data_len: u64,
+    columns: Range<u64>,
+    fragments: &[Option<&[u8]>],
+) -> Result<Vec<Vec<u8>>, EcError> {
+    let fragment_len = fragment_len(geometry, data_len)?;
+    let aligned = |at: u64| at.is_multiple_of(FRAGMENT_ALIGN);
+    if columns.is_empty()
+        || columns.end > fragment_len
+        || !aligned(columns.start)
+        || !aligned(columns.end)
+    {
+        return Err(EcError::OutsideFragment {
+            range: columns,
+            fragment_len,
+        });
+    }
+    let width = columns.end - columns.start;
+    check_slots(geometry, width, fragments)?;
+    // Within a fragment, which fits in a usize.
+    let restored = restore_data::<E>(geometry, width as usize, fragments)?;
+    Ok(restored.into_iter().map(Cow::into_owned).collect())
 }
 
 fn reconstruct<E: Engine + Default>(
@@ -306,6 +378,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Decoding a range of columns of `k` fragments gives the same bytes
+    /// as decoding the whole stripe, for every engine.
+    #[test]
+    fn columns_decode_alone() {
+        let codec = ReedSolomonV1;
+        for (seed, geometry) in Geometry::DESIGN_TABLE.into_iter().enumerate() {
+            let data = sample(4096 * 5 + 77, seed as u32);
+            let len = data.len() as u64;
+            let fragments = encode::<DefaultEngine>(geometry, &data).unwrap();
+            let fragment_len = fragments[0].len() as u64;
+            for within in [0..1, 63..65, 100..fragment_len, 0..fragment_len] {
+                let columns = codec.columns(geometry, len, within.clone()).unwrap();
+                assert!(columns.start <= within.start && within.end <= columns.end);
+                let cut = |f: &Vec<u8>| f[columns.start as usize..columns.end as usize].to_vec();
+                // Lose the first `m` fragments.
+                let cuts: Vec<Vec<u8>> = fragments.iter().map(cut).collect();
+                let slots: Vec<Option<&[u8]>> = cuts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (i >= geometry.parity_fragments()).then_some(f.as_slice()))
+                    .collect();
+                let expected: Vec<Vec<u8>> = fragments[..geometry.data_fragments()]
+                    .iter()
+                    .map(cut)
+                    .collect();
+                for decoded in [
+                    decode_columns::<NoSimd>(geometry, len, columns.clone(), &slots).unwrap(),
+                    codec
+                        .decode_columns(geometry, len, columns.clone(), &slots)
+                        .unwrap(),
+                ] {
+                    assert_eq!(decoded, expected, "{geometry}, columns {columns:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_ranges_are_checked() {
+        let (codec, g) = (ReedSolomonV1, Geometry::RS_4_2);
+        // Fragments of 128 bytes.
+        assert_eq!(codec.columns(g, 512, 70..71), Ok(64..128));
+        assert_eq!(codec.columns(g, 512, 0..128), Ok(0..128));
+        for within in [5..5, 0..129] {
+            assert_eq!(
+                codec.columns(g, 512, within.clone()),
+                Err(EcError::OutsideFragment {
+                    range: within,
+                    fragment_len: 128
+                })
+            );
+        }
+        let slots = vec![Some(&[0u8; 64][..]); 6];
+        for columns in [0..0, 1..65, 0..100, 64..192] {
+            assert_eq!(
+                codec.decode_columns(g, 512, columns.clone(), &slots),
+                Err(EcError::OutsideFragment {
+                    range: columns,
+                    fragment_len: 128
+                })
+            );
+        }
+        // Each fragment holds the columns' bytes, no more.
+        assert_eq!(
+            codec.decode_columns(g, 512, 0..128, &slots),
+            Err(EcError::FragmentLength {
+                index: 0,
+                expected: 128,
+                actual: 64
+            })
+        );
+        assert!(codec.decode_columns(g, 512, 64..128, &slots).is_ok());
     }
 
     #[test]

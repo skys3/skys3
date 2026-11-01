@@ -54,6 +54,7 @@ use skys3_control::{
     propose_document, read, read_with_retries,
 };
 use skys3_coord::{Creation, CreationError, Pending, create_bucket, settle};
+use skys3_ec::FragmentSource;
 use skys3_io::BlockingPool;
 use skys3_types::lifecycle::LifecycleConfiguration;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
@@ -147,6 +148,10 @@ pub struct GatewayConfig {
     /// target before it is answered `503 SlowDown` (§7.5). Which buckets
     /// wait is their `ack_policy` in [`GatewayConfig::buckets`].
     pub write_through_timeout: Duration,
+    /// Where GETs of coded objects read fragments from (§8.5): the node's
+    /// fragment read client. [`GatewayConfig::new`] has none, so a GET of
+    /// a coded object answers `503`.
+    pub fragments: Option<Arc<dyn FragmentSource>>,
     /// The node's hot cache of recently read objects (§9.2):
     /// [`GatewayConfig::new`] makes one of `hot_cache_bytes_per_node`
     /// without metrics. Clones of a configuration share it, so gateways
@@ -196,6 +201,7 @@ impl GatewayConfig {
             read_registration_renew_interval: config.storage().read_registration_renew_interval(),
             write_through_timeout: config.flush().write_through_timeout(),
             hot_cache: HotCache::new(config.cache().hot_cache_bytes_per_node),
+            fragments: None,
         }
     }
 }

@@ -15,7 +15,9 @@
 //! version is not clean, since each holds it durably, and the first
 //! `clean_copies` of the primary and the other members, in configuration
 //! order, once it is (§9.3). An evicted version has no holder; its bytes
-//! are at the remote. Holder lists are hints.
+//! are at the remote. A coded version has neither layout nor holders: its
+//! entry's coded layout names the fragment nodes the gateway reads it
+//! from (§8.5), since the replicas drop its bytes. Holder lists are hints.
 //!
 //! **Registrations.** Before it fetches, a gateway registers the plan's
 //! version with the holder it reads from ([`Shard::register_read`](crate::Shard::register_read)).
@@ -84,7 +86,8 @@ pub struct ReadPlan {
     /// The key's entry: its latest version, a delete tombstone, or `None`.
     pub entry: Option<Entry>,
     /// The version's bytes as log positions, in body order; empty if the
-    /// version has no local bytes, or none at all.
+    /// version has no local bytes, none at all, or is coded: its entry's
+    /// coded layout then names its fragments (§8.5).
     pub layout: Vec<ExtentRef>,
     /// The nodes whose replicas should hold the bytes, the primary first;
     /// empty if no replica does, as for an evicted version.
