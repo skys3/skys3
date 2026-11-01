@@ -140,8 +140,8 @@ pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TR
 pub use origin::{FULL, GUEST, Origin, OriginAudit, OriginBug, OriginFreshness};
 pub use peer::{AimScope, AimedBlocks, DescriptorKind, Peer, PeerAudit, ProtocolFaults};
 pub use replication::{
-    HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
-    ReplicatedServices, ReplicatedShards,
+    AuditedShards, HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
+    ReplicatedServices,
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;

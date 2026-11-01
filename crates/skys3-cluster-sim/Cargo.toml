@@ -25,6 +25,7 @@ rand.workspace = true
 rcgen.workspace = true
 s3s.workspace = true
 skys3.workspace = true
+skys3-cluster.workspace = true
 skys3-config.workspace = true
 # `test-util` for the fault-injecting control store.
 skys3-control = { workspace = true, features = ["test-util"] }

@@ -3,16 +3,17 @@
 //! compare-and-swap of the shard's register, or the coordinator's
 //! replacement adds learners to the shards that lost members
 //! ([`CoordinatedServices`](crate::CoordinatedServices)); every node
-//! follows the registers that name it, and the audits check rule R3, time
-//! the promotions, and measure how long shards that lost a member had
-//! fewer than `replicas` copies (§16.3).
+//! follows the registers that name it, with `skys3-cluster`'s
+//! `RegisterFollower`, and the audits check rule R3, time the
+//! promotions, and measure how long shards that lost a member had fewer
+//! than `replicas` copies (§16.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use skys3_control::ProposalIds;
-use skys3_control::{ControlError, RegisterKey, RegisterKind, S3ControlStore};
+use skys3_control::{ControlError, S3ControlStore};
 use skys3_gateway::ShardRef;
 use skys3_shard::replication::{BoxFuture, ControlRegisters, Replaced, ShardRegisters};
 use skys3_sim::SimS3;
@@ -20,7 +21,7 @@ use skys3_types::{NodeId, Seq, ShardConfig};
 
 use crate::node::ControlHandle;
 use crate::replication::{
-    Audit, REGISTER_RETRY, ReplicatedServices, ReplicatedShards, lock, register,
+    Audit, AuditedShards, REGISTER_RETRY, ReplicatedServices, SimRegisters, lock, register,
 };
 
 /// When the driver adds learners ([`ReplicatedServices::with_learners`]).
@@ -374,53 +375,11 @@ impl ReplicatedServices {
     }
 }
 
-/// Opens, or brings up to date, the replica `shards` hold of each shard
-/// whose register in `registers` names their node.
-async fn follow(shards: &ReplicatedShards, registers: &S3ControlStore<SimS3>) {
-    let node = &shards.node;
-    for shard in &followed(shards, registers) {
-        let Some(config) = register(registers, shard) else {
-            continue;
-        };
-        if !config.is_member(node) && !config.is_learner(node) {
-            continue;
-        }
-        let open = shards.replication.set().get(&shard.into()).await;
-        if let Some(replica) = &open {
-            // A learner opens its replica again once it installs a
-            // snapshot (§6.7).
-            shards.track(replica);
-        }
-        if open.is_some_and(|replica| replica.config().epoch >= config.epoch) {
-            continue;
-        }
-        if let Err(error) = shards.open_config(shard, &config).await {
-            tracing::debug!(%shard, %error, "following the shard's register failed");
-        }
-    }
-}
-
-/// The shards whose registers a node follows: those of the static
-/// placement, and those whose registers exist, which includes the shards
-/// of buckets the gateways created (plan M3-04), unknown to the static
-/// placement.
-fn followed(shards: &ReplicatedShards, registers: &S3ControlStore<SimS3>) -> BTreeSet<ShardRef> {
-    let prefix = registers.config().prefix.as_str();
-    let created = registers.objects().keys().into_iter().filter_map(|key| {
-        let key = RegisterKey::new(key.strip_prefix(prefix)?).ok()?;
-        match key.kind() {
-            RegisterKind::Shard(bucket, shard) => Some(ShardRef { bucket, shard }),
-            _ => None,
-        }
-    });
-    shards.placement.keys().cloned().chain(created).collect()
-}
-
 /// One life of a node following the shard registers that name it, and
 /// adding learners to the shards it serves as primary
 /// ([`ReplicatedServices::with_learners`]).
 pub(crate) struct LearnerDriver {
-    pub(crate) shards: ReplicatedShards,
+    pub(crate) shards: AuditedShards,
     /// The node's control store, with its faults, for the driver's
     /// compare-and-swaps.
     pub(crate) store: ControlHandle,
@@ -437,13 +396,15 @@ impl LearnerDriver {
     /// each in its own loop: a slow compare-and-swap holds up only the
     /// other additions.
     pub(crate) async fn run(mut self) {
-        let (shards, registers) = (self.shards.clone(), self.registers.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(FOLLOW_INTERVAL).await;
-                follow(&shards, &registers).await;
-            }
-        });
+        // The registers, read without faults; a shard without one is
+        // followed only once it has one.
+        let registers = SimRegisters {
+            store: Some(self.registers.clone()),
+            placement: Arc::clone(self.shards.placement()),
+            placed: false,
+        };
+        let follower = self.shards.replicas.follower(Arc::new(registers));
+        tokio::spawn(follower.run(FOLLOW_INTERVAL));
         if !self.plan.adds {
             return;
         }
@@ -459,13 +420,13 @@ impl LearnerDriver {
     /// Adds a learner to each shard this node serves as primary that has
     /// none yet, once per shard and life.
     async fn add(&mut self, added: &mut BTreeSet<ShardRef>) {
-        let node = self.shards.node.clone();
-        let placement = Arc::clone(&self.shards.placement);
+        let node = self.shards.node_id().clone();
+        let placement = Arc::clone(self.shards.placement());
         for (shard, placed) in placement.iter() {
             if added.contains(shard) {
                 continue;
             }
-            let Some(replica) = self.shards.replication.set().get(&shard.into()).await else {
+            let Some(replica) = self.shards.replication().set().get(&shard.into()).await else {
                 continue;
             };
             let current = replica.config();

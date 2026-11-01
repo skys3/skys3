@@ -110,6 +110,7 @@ crates/
   skys3-log/            record format, segments, group commit, recovery (§10.1, §10.4)
   skys3-index/          redb index, checkpoints, local control-state copies (§10.2)
   skys3-shard/          shard state machine, replication, leases, reconciliation (§5, §6.3–6.6)
+  skys3-cluster/        replicated shards for the gateway, register following, asked handoffs (§6.3–6.7)
   skys3-control/        ControlStore trait, backends, startup probe (§6.1, §6.2)
   skys3-coord/          coordinator and placement (§6.7)
   skys3-net/            intra-cluster transport: mutual TLS over TCP, prost headers
@@ -1088,7 +1089,7 @@ This section is unnumbered so that sections 14 and 15, which other documents cit
 
 **Design:** §5, §6.3–§6.6 · **After:** M2-17 · **Size:** M
 
-- `ReplicatedShards`, the handoff driver, and register following move from `skys3-cluster-sim` into a `cluster` module of `skys3-shard`, generic over disk and network, and the simulation uses them from there.
+- `ReplicatedShards`, the handoff driver, and register following move from `skys3-cluster-sim` into a new crate, `skys3-cluster`, generic over disk and network, and the simulation uses them from there. They cannot be a module of `skys3-shard`: they implement the gateway's `Shards` and `skys3-coord`'s `HandoffSink`, and `skys3-gateway` depends on `skys3-shard`.
 - **Done when:** the fixed-seed simulation set passes unchanged.
 
 #### M8-05b Replication and routing in the binary
