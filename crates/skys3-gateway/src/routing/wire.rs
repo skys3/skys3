@@ -19,6 +19,8 @@
 //! authenticated but untrusted peers, so every field is checked before it
 //! is used.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use prost::{Message, Oneof};
 use skys3_index::codec;
@@ -26,7 +28,7 @@ use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery, Upload};
 use skys3_log::record::{ExtentRef, MAX_EXTENTS, MAX_KEY_LEN};
 use skys3_log::{LogRecord, RecordBody};
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_shard::{ReadPlan, Registered, StreamedBody};
+use skys3_shard::{FlushState, ReadPlan, Registered, StreamedBody};
 use skys3_types::{
     BucketId, ClusterId, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
 };
@@ -37,6 +39,10 @@ use crate::shard::{ShardError, ShardRef, ShardSummary};
 
 /// The longest refusal reason a reply carries, in bytes.
 const MAX_REASON_LEN: usize = 1024;
+
+/// The longest a forwarded flush wait may ask its replica to wait. A
+/// gateway asks for less than its request timeout, and asks again.
+pub const MAX_FLUSH_WAIT: Duration = Duration::from_secs(60);
 
 /// Gateway to replica: one call of the gateway's shard interface.
 #[derive(Clone, PartialEq, Message)]
@@ -53,7 +59,7 @@ pub struct Forward {
     /// The call.
     #[prost(
         oneof = "Op",
-        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub op: Option<Op>,
 }
@@ -110,6 +116,24 @@ pub enum Op {
     /// Announce more of a streamed single PUT's body.
     #[prost(message, tag = "19")]
     Announce(Announcement),
+    /// Wait for a version of a key to reach the remote target.
+    #[prost(message, tag = "20")]
+    Flushed(FlushQuery),
+}
+
+/// A write-through write's wait for its version's flush (design §7.5).
+#[derive(Clone, PartialEq, Message)]
+pub struct FlushQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
+    /// How long the replica may wait, in milliseconds: at most
+    /// [`MAX_FLUSH_WAIT`].
+    #[prost(uint64, tag = "3")]
+    pub wait_ms: u64,
 }
 
 /// More of a streamed single PUT's body (design §7.3).
@@ -315,7 +339,7 @@ pub struct Answer {
     /// The answer, by the call it answers.
     #[prost(
         oneof = "Result",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
     )]
     pub result: Option<Result>,
 }
@@ -368,7 +392,17 @@ pub enum Result {
     /// The announcement was passed on.
     #[prost(bool, tag = "15")]
     Announced(bool),
+    /// Where the version waited for is: see the `FLUSH_*` constants.
+    #[prost(uint32, tag = "16")]
+    Flushed(u32),
 }
+
+/// The remote holds the version waited for, or a later one.
+pub const FLUSH_FLUSHED: u32 = 0;
+/// The key is held in conflict.
+pub const FLUSH_CONFLICT: u32 = 1;
+/// Neither, within the wait.
+pub const FLUSH_PENDING: u32 = 2;
 
 /// A read plan.
 #[derive(Clone, PartialEq, Message)]
@@ -585,6 +619,11 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
             Op::AppendExtent(true)
         }
         Request::Announce(body) => Op::Announce(announcement(body)?),
+        Request::Flushed { key, version, wait } => Op::Flushed(FlushQuery {
+            key: key.clone(),
+            version: Some(position(*version)),
+            wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        }),
         Request::Write { body, condition } => {
             payload = record(body.clone())?;
             Op::Write(match condition {
@@ -753,6 +792,20 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
             position: epoch_seq(query.position)?,
         },
         Op::Announce(announced) => Request::Announce(decode_announcement(announced)?),
+        Op::Flushed(query) => {
+            if query.key.is_empty() || query.key.len() > MAX_KEY_LEN {
+                return Err(format!("a key of {} bytes", query.key.len()));
+            }
+            let wait = Duration::from_millis(query.wait_ms);
+            if wait > MAX_FLUSH_WAIT {
+                return Err(format!("a flush wait of {} ms", query.wait_ms));
+            }
+            Request::Flushed {
+                key: query.key,
+                version: epoch_seq(query.version)?,
+                wait,
+            }
+        }
     };
     if !matches!(
         request,
@@ -959,6 +1012,12 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
         Response::Renewed(renewed) => Result::Renewed(*renewed),
         Response::Released => Result::Released(true),
         Response::Announced => Result::Announced(true),
+        Response::Flushed(state) => Result::Flushed(match state {
+            FlushState::Flushed => FLUSH_FLUSHED,
+            FlushState::Conflict => FLUSH_CONFLICT,
+            // A state added later is reported as not flushed yet.
+            _ => FLUSH_PENDING,
+        }),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -1125,6 +1184,12 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
         Result::Renewed(renewed) => Response::Renewed(renewed),
         Result::Released(_) => Response::Released,
         Result::Announced(_) => Response::Announced,
+        Result::Flushed(state) => Response::Flushed(match state {
+            FLUSH_FLUSHED => FlushState::Flushed,
+            FLUSH_CONFLICT => FlushState::Conflict,
+            FLUSH_PENDING => FlushState::Pending,
+            other => return Err(format!("flush state {other}")),
+        }),
     })
 }
 

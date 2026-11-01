@@ -11,8 +11,8 @@ use skys3_log::record::ExtentRef;
 use skys3_log::record::RemoteStep;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
-    Change, Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary,
-    StateMachine, StreamedBody,
+    Change, Committed, Effect, FlushState, FlushWait, Outcome, Role, Shard, ShardError, ShardSet,
+    ShardSummary, StateMachine, StreamedBody,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
@@ -834,6 +834,54 @@ fn announcements_of_a_streamed_body_reach_the_subscriber_before_its_put() {
         shard.close().await.unwrap();
         assert!(matches!(
             shard.announce(announced),
+            Err(ShardError::Unavailable { .. })
+        ));
+    });
+}
+
+#[test]
+fn a_flush_wait_reaches_the_flusher_after_its_version() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap().position;
+        let unavailable = |result: Result<FlushWait, ShardError>, why: &str| match result {
+            Err(ShardError::Unavailable { reason, .. }) => {
+                assert!(reason.contains(why), "{reason}")
+            }
+            other => panic!("expected the shard to be unavailable, got {other:?}"),
+        };
+        // Nothing flushes the shard yet.
+        unavailable(shard.await_flush("a", first), "no flusher");
+        let mut changes = shard.subscribe();
+        // A version the shard has not applied cannot be waited for.
+        let later = EpochSeq::new(first.epoch, Seq::new(first.seq.get() + 10));
+        unavailable(shard.await_flush("a", later), "not applied");
+
+        let second = shard.commit(put("a", 4, 2)).await.unwrap().position;
+        let mut wait = shard.await_flush("a", second).unwrap();
+        // The wait follows the change that stored its version.
+        let Some(Change::Stored { position, .. }) = changes.recv().await else {
+            panic!("the PUT's change comes first");
+        };
+        assert_eq!(position, second);
+        let Some(Change::Awaited(waiter)) = changes.recv().await else {
+            panic!("then the wait");
+        };
+        assert_eq!((waiter.key(), waiter.version()), ("a", second));
+        waiter.answer(FlushState::Flushed);
+        assert_eq!(wait.answered().await, Some(FlushState::Flushed));
+
+        // A wait whose subscription ended has no answer.
+        let mut unanswered = shard.await_flush("a", first).unwrap();
+        drop(changes);
+        assert_eq!(unanswered.answered().await, None);
+        unavailable(shard.await_flush("a", first), "flusher stopped");
+
+        let _changes = shard.subscribe();
+        shard.close().await.unwrap();
+        assert!(matches!(
+            shard.await_flush("a", first),
             Err(ShardError::Unavailable { .. })
         ));
     });

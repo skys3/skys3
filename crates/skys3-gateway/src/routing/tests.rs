@@ -25,8 +25,8 @@ use skys3_net::{
     CertificateDer, Credentials, Frame, Header, MessageKind, PeerIdentity, PrivateKeyDer,
     TokioNetwork, Transport,
 };
-use skys3_shard::Change;
 use skys3_shard::replication::{Replication, ReplicationConfig};
+use skys3_shard::{Change, FlushState};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, ClusterId, ETag, Epoch, EpochSeq, NodeAddress, NodeId,
     ProposalId, Seq, ShardConfig, ShardCount, ShardId,
@@ -35,6 +35,7 @@ use skys3_types::{
 use super::*;
 use crate::LocalShards;
 use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
+use crate::objects::write_through::reach_remote;
 use crate::shard::{ShardError, ShardRef, Shards};
 use crate::stub::{EntryState, MemoryShards};
 
@@ -371,6 +372,25 @@ async fn every_call_is_forwarded_to_the_primary() {
         .unwrap();
     assert_eq!(changes.recv().await, Some(Change::Streamed(announced)));
 
+    // A write-through write's wait reaches the primary's flusher, which
+    // answers it; a wait it does not answer in time is pending.
+    let waited = tokio::spawn({
+        let (gateway, shard) = (gateway.clone(), shard.clone());
+        async move {
+            gateway
+                .flushed(&shard, "gone", at, Duration::from_secs(5))
+                .await
+        }
+    });
+    let Some(Change::Awaited(waiter)) = changes.recv().await else {
+        panic!("the wait reaches the flusher");
+    };
+    assert_eq!((waiter.key(), waiter.version()), ("gone", at));
+    waiter.answer(FlushState::Flushed);
+    assert_eq!(timed(waited).await.unwrap(), Ok(FlushState::Flushed));
+    let pending = gateway.flushed(&shard, "gone", at, Duration::from_millis(50));
+    assert_eq!(timed(pending).await, Ok(FlushState::Pending));
+
     // A multipart upload and its parts.
     let create = RecordBody::MpuCreate(MpuCreate {
         key: "multi".into(),
@@ -668,6 +688,56 @@ async fn a_lost_answer_fails_a_write_and_moves_a_read_on() {
     let error = lost.unwrap_err();
     assert!(error.to_string().contains("may have applied it"), "{error}");
     assert_eq!(gateway.stats().register_reads, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_through_wait_moves_on_from_a_silent_primary() {
+    // The default request timeout, which outlasts the write's own.
+    let timing = RoutingConfig {
+        request_timeout: Duration::from_secs(30),
+        ..timing()
+    };
+    let cluster = Cluster::start(timing).await;
+    let shard = shard(0);
+    let delete = RecordBody::Delete(Delete { key: "k".into() });
+    let written = timed(cluster.gateway(1).write(&shard, delete, Precondition::None)).await;
+    let at = written.unwrap().unwrap();
+    let primary = &cluster.nodes[0].0;
+    let replica = primary.local().set().get(&(&shard).into()).await.unwrap();
+    let mut changes = replica.subscribe();
+
+    // The gateway's map still names node 3 as the primary, which takes
+    // the ask and never answers; the register names node 1.
+    let gateway = cluster.gateway(2);
+    gateway.map().learn(config(0, 1, &[3])).await;
+    let timeout = Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let mut waited = tokio::spawn({
+        let (gateway, shard) = (gateway.clone(), shard.clone());
+        async move { reach_remote(&gateway, &shard, "k", at, timeout).await }
+    });
+    let awaited = async {
+        loop {
+            match changes.recv().await {
+                Some(Change::Awaited(waiter)) => break waiter,
+                Some(_) => {}
+                None => panic!("the replica's changes ended"),
+            }
+        }
+    };
+    let waiter = timed(async {
+        tokio::select! {
+            waiter = awaited => waiter,
+            ended = &mut waited => panic!("the wait never reached node 1: {ended:?}"),
+        }
+    })
+    .await;
+    waiter.answer(FlushState::Flushed);
+    timed(waited).await.unwrap().unwrap();
+    // One flush wait and its grace on node 3, then node 1.
+    assert!(started.elapsed() < timeout, "{:?}", started.elapsed());
+    assert_eq!(gateway.map().get(&shard).unwrap().epoch, Epoch::new(2));
+    assert_eq!(gateway.stats().register_reads, 1);
 }
 
 #[tokio::test]
@@ -976,6 +1046,74 @@ fn announcements_round_trip_and_malformed_ones_are_refused() {
 }
 
 #[test]
+fn flush_waits_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    for state in [
+        FlushState::Flushed,
+        FlushState::Conflict,
+        FlushState::Pending,
+    ] {
+        let reply = Reply::Served {
+            response: Response::Flushed(state),
+            epoch: Epoch::new(1),
+            hint: None,
+        };
+        let frame = wire::reply_frame(&reply, 3);
+        assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+    }
+    let answer = wire::Answer {
+        result: Some(wire::Result::Flushed(7)),
+    };
+    let reply = wire::ForwardReply {
+        outcome: wire::OUTCOME_SERVED,
+        epoch: 1,
+        ..wire::ForwardReply::default()
+    };
+    let frame = Frame::new(
+        Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+        Bytes::from(answer.encode_to_vec()),
+    );
+    assert!(wire::decode_reply(&frame, &shard).is_err());
+
+    let valid = wire::FlushQuery {
+        key: "k".into(),
+        version: Some(wire::Position { epoch: 1, seq: 2 }),
+        wait_ms: 5_000,
+    };
+    let decoded = |query: wire::FlushQuery| {
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Flushed(query)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
+            Bytes::new(),
+        );
+        wire::decode_request(&frame).map(|(_, _, request)| request)
+    };
+    assert_eq!(
+        decoded(valid.clone()),
+        Ok(Request::Flushed {
+            key: "k".into(),
+            version: EpochSeq::new(Epoch::new(1), Seq::new(2)),
+            wait: Duration::from_secs(5),
+        })
+    );
+    let refused = |change: &dyn Fn(&mut wire::FlushQuery)| {
+        let mut query = valid.clone();
+        change(&mut query);
+        decoded(query).is_err()
+    };
+    assert!(refused(&|q| q.key.clear()));
+    assert!(refused(&|q| q.key = "k".repeat(1025)));
+    assert!(refused(&|q| q.version = None));
+    assert!(refused(&|q| q.wait_ms = 60_001));
+    assert!(!refused(&|q| q.wait_ms = 60_000));
+}
+
+#[test]
 fn malformed_requests_are_refused() {
     let shard = shard(0);
     let request = Request::Entry { key: "k".into() };
@@ -1218,6 +1356,11 @@ proptest! {
                     cluster: ClusterId::new("prod-eu").unwrap(),
                     shard: shard(3),
                 }),
+            },
+            Request::Flushed {
+                key: format!("k{key}"),
+                version: EpochSeq::new(Epoch::new(epoch), Seq::new(4)),
+                wait: Duration::from_millis(limit as u64),
             },
             Request::Announce(StreamedBody {
                 key: format!("k{key}"),

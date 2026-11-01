@@ -67,6 +67,10 @@
 //!   hot cache, only for the version the read plan names, while
 //!   overwrites, evictions, compaction, crashes, and message loss race
 //!   them.
+//! - [`write_through`]: writes to a `write_through` bucket acknowledged
+//!   only once the remote store holds them, so that losing every node
+//!   after an acknowledgement loses none, under takeovers and remote
+//!   faults.
 
 mod acks;
 mod backfill;
@@ -92,6 +96,7 @@ mod restart;
 mod routing;
 mod takeover;
 mod workload;
+mod write_through;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical
 /// scenario: CI's fixed seed set runs `SKYS3_SIM_SEEDS / COST` seeds of

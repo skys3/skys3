@@ -217,6 +217,7 @@ reserve_fraction = 0.2
 
 [flush]
 ack_policy = "write_through"
+write_through_timeout_seconds = 12
 flush_min_concurrency_per_shard = 2
 flush_max_concurrency_per_shard = 32
 flush_max_inflight_bytes_per_target = 536870912
@@ -341,6 +342,7 @@ fn every_key_parses_and_is_resolved() {
     let defaults = &config.buckets().defaults;
     assert_eq!(defaults.mode, BucketMode::Local);
     assert_eq!(defaults.ack_policy, AckPolicy::WriteThrough, "from [flush]");
+    assert_eq!(config.flush().write_through_timeout().as_secs(), 12);
     assert_eq!(defaults.ec_after().as_secs(), 300);
     assert_eq!(defaults.index_snapshot_interval().as_secs(), 600);
     assert_eq!(defaults.max_dirty_bytes, 100 << 30);

@@ -218,6 +218,9 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 shards.announce(shard, body).await?;
                 Response::Announced
             }
+            Request::Flushed { key, version, wait } => {
+                Response::Flushed(shards.flushed(shard, &key, version, wait).await?)
+            }
             Request::Write { body, condition } => {
                 Response::Written(shards.write(shard, body, condition).await?)
             }

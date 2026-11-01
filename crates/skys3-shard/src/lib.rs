@@ -68,6 +68,7 @@ mod ack;
 pub mod cache;
 pub mod compaction;
 mod error;
+mod flush_wait;
 mod leader;
 mod lease;
 pub mod lineage;
@@ -85,6 +86,7 @@ pub use compaction::{
     CompactionError, CompactionMetrics, CompactionReport, CompactionSettings, Compactor,
 };
 pub use error::ShardError;
+pub use flush_wait::{FlushState, FlushWait, FlushWaiter};
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};

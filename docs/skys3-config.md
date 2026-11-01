@@ -147,6 +147,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `"local"` | §7.5. |
+| `write_through_timeout_seconds` | integer | `30` | Positive. How long a write to a `write_through` bucket waits for the remote flush before it is answered `503 SlowDown`; the write stays committed locally and is flushed later (§7.5). |
 | `flush_min_concurrency_per_shard` | integer | `4` | Positive. |
 | `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. |
 | `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. |

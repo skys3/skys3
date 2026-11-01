@@ -412,6 +412,15 @@ fn flush_rules() {
         "[flush]\nflush_conflict_policy = \"discard_local\"",
         &["flush.flush_conflict_policy"],
     );
+    assert_violations(
+        "[flush]\nwrite_through_timeout_seconds = 0",
+        &["flush.write_through_timeout_seconds"],
+    );
+    let config = load("[flush]\nwrite_through_timeout_seconds = 5").unwrap();
+    assert_eq!(
+        config.flush().write_through_timeout(),
+        std::time::Duration::from_secs(5)
+    );
 }
 
 #[test]

@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
@@ -11,7 +12,8 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_shard::{
-    Committed, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet, StreamedBody,
+    Committed, FlushState, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet,
+    StreamedBody,
 };
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
@@ -326,6 +328,28 @@ impl<D: Disk> Shards for LocalShards<D> {
     async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
         let local = self.find(shard).await?;
         local.announce(body).map_err(|error| convert(shard, error))
+    }
+
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<FlushState, ShardError> {
+        let mut flush = self
+            .serving(shard)
+            .await?
+            .await_flush(key, version)
+            .map_err(|error| convert(shard, error))?;
+        match tokio::time::timeout(wait, flush.answered()).await {
+            Ok(Some(state)) => Ok(state),
+            Ok(None) => Err(ShardError::Unavailable {
+                shard: shard.clone(),
+                reason: "the shard's flusher stopped".to_owned(),
+            }),
+            Err(_) => Ok(FlushState::Pending),
+        }
     }
 
     async fn write(

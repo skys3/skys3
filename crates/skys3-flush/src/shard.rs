@@ -10,7 +10,7 @@ use skys3_io::{Disk, WallClock};
 use skys3_log::record::Flushed;
 use skys3_log::{RecordBody, ShardRef};
 use skys3_remote::ObjectStore;
-use skys3_shard::{Change, Shard, ShardError};
+use skys3_shard::{Change, FlushState, FlushWaiter, Shard, ShardError};
 use skys3_types::{ETag, EpochSeq, Seq};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -60,6 +60,13 @@ struct Tracked {
     failures: u32,
     /// When a change arrived while the key was flushing.
     newer_since: Option<Duration>,
+    /// The newest version the remote is known to hold while the key is
+    /// still tracked: a tombstone the import has not passed, or a version
+    /// flushed while a newer one committed.
+    remote: Option<EpochSeq>,
+    /// Write-through writes waiting for versions not yet at the remote
+    /// (§7.5).
+    waiters: Vec<FlushWaiter>,
 }
 
 /// One held conflict, as the admin API lists it.
@@ -146,6 +153,8 @@ impl State {
                 phase: Phase::Dirty,
                 failures: 0,
                 newer_since: None,
+                remote: None,
+                waiters: Vec::new(),
             };
             self.keys.insert(key.to_owned(), tracked);
             return;
@@ -175,6 +184,11 @@ impl State {
     /// the budget, since a new flusher of the shard counts them again.
     fn stop(&mut self) {
         self.stopped = true;
+        // Unanswered, a wait ends, and its writer asks the flusher started
+        // next, here or on a new primary.
+        for tracked in self.keys.values_mut() {
+            tracked.waiters.clear();
+        }
         if let Some(charge) = self.charge.take() {
             charge.adjust(self.dirty_bytes, 0);
         }
@@ -259,6 +273,42 @@ impl State {
         if let Some(tracked) = self.keys.get_mut(key) {
             self.pending.remove(&(tracked.since, key.to_owned()));
             tracked.phase = Phase::Conflict(conflict);
+            for waiter in tracked.waiters.drain(..) {
+                waiter.answer(FlushState::Conflict);
+            }
+        }
+    }
+
+    /// Records that the remote holds `version` of `key`, or a later one,
+    /// and answers the waits it covers.
+    fn reached(&mut self, key: &str, version: EpochSeq) {
+        if let Some(tracked) = self.keys.get_mut(key) {
+            tracked.remote = tracked.remote.max(Some(version));
+            tracked.waiters.retain(|waiter| {
+                let covered = waiter.version() <= version;
+                if covered {
+                    waiter.answer(FlushState::Flushed);
+                }
+                !covered && waiter.is_waited()
+            });
+        }
+    }
+
+    /// Takes a write-through write's wait for its version (§7.5). The
+    /// shard passes it after the change that stored the version, so an
+    /// untracked key has had its latest version, at or after the one
+    /// waited for, flushed.
+    fn awaited(&mut self, waiter: FlushWaiter) {
+        let Some(tracked) = self.keys.get_mut(waiter.key()) else {
+            return waiter.answer(FlushState::Flushed);
+        };
+        if matches!(tracked.phase, Phase::Conflict(_)) {
+            waiter.answer(FlushState::Conflict);
+        } else if tracked.remote >= Some(waiter.version()) {
+            waiter.answer(FlushState::Flushed);
+        } else {
+            tracked.waiters.retain(FlushWaiter::is_waited);
+            tracked.waiters.push(waiter);
         }
     }
 
@@ -552,6 +602,7 @@ fn follow(state: &Mutex<State>, streams: &Streams, wall: &dyn WallClock, change:
         } => streams.part(upload, number, position),
         Change::Aborted { upload, .. } => streams.aborted(upload),
         Change::Streamed(body) => streams.announced(body),
+        Change::Awaited(waiter) => lock(state).awaited(waiter),
     }
 }
 
@@ -646,6 +697,7 @@ fn finish<S, D: Disk>(
             record,
         } => {
             target.counters.flushes.inc();
+            state.reached(&key, version);
             if record {
                 let flushed = Flushed {
                     key: key.clone(),
@@ -667,7 +719,12 @@ fn finish<S, D: Disk>(
                 state.failed(&key, "waiting for the import".to_owned(), at);
             }
         }
-        Outcome::Settled => state.finished(&key, dispatched),
+        Outcome::Settled => {
+            // The remote holds the key's latest version, read after the
+            // flush was dispatched.
+            state.reached(&key, dispatched);
+            state.finished(&key, dispatched);
+        }
         Outcome::Conflict(conflict) => {
             target.counters.conflicts.inc();
             tracing::warn!(shard = %shard.shard(), key, seq = %conflict.seq,

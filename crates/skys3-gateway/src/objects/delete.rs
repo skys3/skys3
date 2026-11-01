@@ -3,6 +3,8 @@
 //! **DeleteObject** commits a tombstone, also for a key with no object,
 //! and answers `204` either way. In a `local` bucket, which is never
 //! flushed, a `FLUSHED` record follows that removes the tombstone (§4.2).
+//! In a `write_through` bucket the answer waits until the remote no longer
+//! holds the key (§7.5).
 //!
 //! **DeleteObjects** deletes up to [`MAX_DELETE_KEYS`] keys of one bucket,
 //! each as DeleteObject would, and answers with what happened to each key:
@@ -25,6 +27,8 @@
 //! so their records share group commits. A crash can leave some deleted
 //! and not others, as in S3, where the operation is not atomic either.
 
+use std::time::Duration;
+
 use s3s::dto::{
     DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, DeletedObject,
     Error as KeyError, ObjectIdentifier,
@@ -32,10 +36,11 @@ use s3s::dto::{
 use s3s::{S3Error, S3Request, S3Result, s3_error};
 use skys3_log::RecordBody;
 use skys3_log::record::{Delete, Flushed};
-use skys3_types::{BucketDocument, BucketMode};
+use skys3_types::{BucketDocument, BucketMode, EpochSeq};
 use tokio::task::JoinSet;
 
 use super::Objects;
+use super::write_through::reach_remote;
 use crate::authz::{KeyDecisions, access_denied};
 use crate::buckets::shard_error;
 use crate::checksum::ExpectedChecksums;
@@ -64,7 +69,13 @@ impl<H: Shards> Objects<H> {
         }
         let condition = Precondition::of_write(input.if_match.as_ref(), None)?;
         let shard = ShardRef::for_key(bucket, &input.key);
-        remove(&self.shards, shard, is_local(bucket), input.key, condition).await?;
+        let delete = Removal {
+            local: is_local(bucket),
+            wait: self.write_through.wait_of(bucket),
+        };
+        delete
+            .remove(&self.shards, shard, input.key, condition)
+            .await?;
         Ok(DeleteObjectOutput::default())
     }
 
@@ -103,6 +114,10 @@ impl<H: Shards> Objects<H> {
             .get::<KeyDecisions>()
             .cloned()
             .unwrap_or_default();
+        let removal = Removal {
+            local: is_local(bucket),
+            wait: self.write_through.wait_of(bucket),
+        };
         let mut outcomes: Vec<Option<S3Result<()>>> = objects.iter().map(|_| None).collect();
         let mut pending = JoinSet::new();
         let mut work = objects.iter().enumerate();
@@ -124,9 +139,9 @@ impl<H: Shards> Objects<H> {
                 };
                 let shards = self.shards.clone();
                 let shard = ShardRef::for_key(bucket, &object.key);
-                let (local, key) = (is_local(bucket), object.key.clone());
+                let key = object.key.clone();
                 pending.spawn(async move {
-                    (index, remove(&shards, shard, local, key, condition).await)
+                    (index, removal.remove(&shards, shard, key, condition).await)
                 });
             }
             let Some(joined) = pending.join_next().await else {
@@ -196,38 +211,60 @@ fn key_condition(object: &ObjectIdentifier) -> S3Result<Precondition> {
     }))
 }
 
-/// Commits a tombstone for `key` in `shard` if `condition` holds, and
-/// answers once it is durable and applied.
-///
-/// Nothing flushes a `local` bucket, so its tombstone would stay forever.
-/// There a `FLUSHED` follows that removes it if no later write of the key
-/// came first; it is not part of the answer, and if a crash loses it, the
-/// tombstone only takes space.
-async fn remove<H: Shards>(
-    shards: &H,
-    shard: ShardRef,
+/// How a bucket's deletes are answered.
+#[derive(Debug, Clone, Copy)]
+struct Removal {
+    /// Whether the bucket is a `local` one, never flushed.
     local: bool,
-    key: String,
-    condition: Precondition,
-) -> Result<(), S3Error> {
-    let delete = RecordBody::Delete(Delete { key: key.clone() });
-    let position = shards
-        .write(&shard, delete, condition)
-        .await
-        .map_err(shard_error)??;
-    if local {
-        let shards = shards.clone();
-        let flushed = RecordBody::Flushed(Flushed {
-            key,
-            seq: position.seq,
-            remote_etag: None,
-            remote_version_id: None,
-        });
-        tokio::spawn(async move {
-            if let Err(error) = shards.write(&shard, flushed, Precondition::None).await {
-                tracing::debug!(%error, "a local tombstone was not removed");
-            }
-        });
+    /// How long a delete waits for the remote flush, in a `write_through`
+    /// bucket (§7.5).
+    wait: Option<Duration>,
+}
+
+impl Removal {
+    /// Commits a tombstone for `key` in `shard` if `condition` holds, and
+    /// answers once it is durable and applied, and in a `write_through`
+    /// bucket once the remote no longer holds the key.
+    ///
+    /// Nothing flushes a `local` bucket, so its tombstone would stay
+    /// forever. There a `FLUSHED` follows that removes it if no later write
+    /// of the key came first; it is not part of the answer, and if a crash
+    /// loses it, the tombstone only takes space.
+    async fn remove<H: Shards>(
+        self,
+        shards: &H,
+        shard: ShardRef,
+        key: String,
+        condition: Precondition,
+    ) -> Result<(), S3Error> {
+        let delete = RecordBody::Delete(Delete { key: key.clone() });
+        let position = shards
+            .write(&shard, delete, condition)
+            .await
+            .map_err(shard_error)??;
+        if let Some(timeout) = self.wait {
+            return reach_remote(shards, &shard, &key, position, timeout).await;
+        }
+        if self.local {
+            remove_tombstone(shards, shard, key, position);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Commits, in the background, the `FLUSHED` that removes the tombstone
+/// of `key` at `position` from a `local` bucket's shard.
+fn remove_tombstone<H: Shards>(shards: &H, shard: ShardRef, key: String, position: EpochSeq) {
+    let shards = shards.clone();
+    let flushed = RecordBody::Flushed(Flushed {
+        key,
+        seq: position.seq,
+        remote_etag: None,
+        remote_version_id: None,
+    });
+    tokio::spawn(async move {
+        if let Err(error) = shards.write(&shard, flushed, Precondition::None).await {
+            tracing::debug!(%error, "a local tombstone was not removed");
+        }
+    });
 }
