@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use skys3_ec::fragment::{FragmentHeader, StripeInfo};
 use skys3_ec::{
-    AttemptId, CodecId, FoundFragment, FragmentId, FragmentLocation, FragmentStore, Geometry,
-    ObjectLayout, ObjectVersion, RebuildError, StripeLayout, codec, current_codec, rebuild_layouts,
+    AttemptId, CodecId, CodedStripe, FoundFragment, FragmentId, FragmentLocation, FragmentStore,
+    Geometry, ObjectLayout, ObjectVersion, RebuildError, StripeLayout, codec, current_codec,
+    rebuild_layouts,
 };
 use skys3_io::{SimDisk, SimMount};
 use skys3_types::{Epoch, NodeId};
@@ -262,6 +263,35 @@ fn complete(attempt: AttemptId) -> Vec<FoundFragment> {
     (0..STRIPES.len() as u32)
         .flat_map(|stripe| (0..6).map(move |index| found(stripe, index, attempt, index.into())))
         .collect()
+}
+
+/// A complete set of headers rebuilds exactly the stripes `EC_PUBLISH`
+/// records as [`CodedStripe`]s.
+#[test]
+fn complete_headers_rebuild_the_published_stripes() {
+    let fragments = complete(attempt(4, 1));
+    let layout = rebuild_one(fragments.clone()).unwrap();
+    for (number, &(offset, data_len)) in STRIPES.iter().enumerate() {
+        let number = number as u32;
+        let located = fragments
+            .iter()
+            .filter(|f| f.header.stripe.number == number)
+            .map(|f| f.location.clone())
+            .collect();
+        let published = CodedStripe::new(
+            number,
+            offset,
+            data_len,
+            GEOMETRY,
+            CodecId::CURRENT,
+            located,
+        )
+        .unwrap();
+        assert_eq!(
+            StripeLayout::from(published),
+            layout.stripes[number as usize]
+        );
+    }
 }
 
 #[test]

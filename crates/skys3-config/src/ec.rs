@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use skys3_types::Geometry;
 
 use crate::error::Checker;
 use crate::storage::MIB;
@@ -54,6 +55,20 @@ impl EcConfig {
     pub(crate) fn check(&self, checker: &mut Checker) {
         checker.nonzero("ec.parity_fragments", self.parity_fragments.into());
         checker.nonzero("ec.max_data_fragments", self.max_data_fragments.into());
+        let widest = u64::from(self.max_data_fragments) + u64::from(self.parity_fragments);
+        checker.require(
+            widest <= Geometry::MAX_FRAGMENTS as u64,
+            "ec.max_data_fragments",
+            || {
+                format!(
+                    "is {}; with parity_fragments ({}) the widest stripe would have {widest} \
+                     fragments, and a stripe has at most {} (§8.4)",
+                    self.max_data_fragments,
+                    self.parity_fragments,
+                    Geometry::MAX_FRAGMENTS,
+                )
+            },
+        );
         checker.require(
             self.min_eligible_nodes > self.parity_fragments,
             "ec.min_eligible_nodes",

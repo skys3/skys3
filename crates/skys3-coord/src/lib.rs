@@ -37,6 +37,11 @@
 //!   their labels and capacity, and a bucket's policy to shard members,
 //!   never two in one domain at the `failure_domain` level. A policy the
 //!   cluster cannot satisfy is [`Unsatisfiable`].
+//! - [`GeometryPolicy`] and [`FragmentPlanner`]: the geometry of new
+//!   erasure-coded stripes, the widest the counts of eligible nodes and
+//!   domains allow, and the node of each fragment, at most one per node
+//!   and `m` per domain (§8.3). A [`StripePlan`] becomes the stripe layout
+//!   an `EC_PUBLISH` record holds, which is never recomputed.
 //! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
 //!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
 //!   through [`PlacementHealth`] for cluster health.
@@ -90,6 +95,7 @@ mod admin;
 mod buckets;
 mod change;
 mod coordinator;
+mod fragments;
 mod handoff;
 mod heartbeat;
 mod join;
@@ -111,6 +117,9 @@ pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
+pub use fragments::{
+    FragmentPlanner, GeometryPolicy, NoGeometry, StripePlan, StripeRequest, StripeRoom,
+};
 pub use handoff::{
     Handoff, HandoffAck, HandoffClient, HandoffError, HandoffFuture, HandoffSink, RequestHandoff,
 };

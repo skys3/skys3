@@ -39,8 +39,9 @@
 //!   in [`ShardRequest::avoid`]. Once no shard names a departing node, the
 //!   node lifecycle's [`Rehoming`](crate::Rehoming) check lets the
 //!   coordinator forget it.
-//! - Fragment placement (plan M5-03) reuses the same domains, with its own
-//!   per-domain cap.
+//! - Fragment placement ([`FragmentPlanner`](crate::FragmentPlanner))
+//!   reuses the same domains and eligibility, with its own per-domain cap
+//!   of `m` fragments of a stripe.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -577,7 +578,7 @@ impl Topology {
 
     /// How many of `chosen` share `candidate`'s zone, then its rack, at the
     /// levels below the required one: fewer is better.
-    fn spread(&self, candidate: &Candidate, chosen: &[&Candidate]) -> (usize, usize) {
+    pub(crate) fn spread(&self, candidate: &Candidate, chosen: &[&Candidate]) -> (usize, usize) {
         let shared = |label: fn(&Candidate) -> Option<&Label>| {
             label(candidate).map_or(0, |mine| {
                 chosen
@@ -629,18 +630,25 @@ impl PartialOrd for Load {
 /// ranks equal nodes in its own order (rendezvous hashing), so new shards
 /// spread over them.
 #[derive(Debug, Clone, Copy)]
-struct Seed(u64);
+pub(crate) struct Seed(u64);
 
 impl Seed {
-    fn new(bucket: &BucketId, shard: ShardId) -> Self {
+    pub(crate) fn new(bucket: &BucketId, shard: ShardId) -> Self {
         let mut hash = fnv(FNV_OFFSET, bucket.as_str().as_bytes());
         hash = fnv(hash, &[0, shard.get(), 0]);
         Self(hash)
     }
 
+    /// The seed of something within the shard that `bytes` name, such as
+    /// one stripe of an object, so that each ranks equal nodes in its own
+    /// order.
+    pub(crate) fn within(self, bytes: &[u8]) -> Self {
+        Self(fnv(self.0, bytes))
+    }
+
     /// The rank of `node` for this shard. Stable across builds and
     /// platforms: FNV-1a with a SplitMix64 finish.
-    fn hash(self, node: &NodeId) -> u64 {
+    pub(crate) fn hash(self, node: &NodeId) -> u64 {
         let mut z = fnv(self.0, node.as_str().as_bytes());
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

@@ -60,11 +60,12 @@ mod store;
 pub use codec::{EcCodec, codec, current_codec};
 pub use error::EcError;
 pub use layout::{
-    FoundFragment, FragmentLocation, ObjectLayout, ObjectVersion, RebuildError, StripeLayout,
-    rebuild_layouts,
+    FoundFragment, ObjectLayout, ObjectVersion, RebuildError, StripeLayout, rebuild_layouts,
 };
 pub use reed_solomon::ReedSolomonV1;
-pub use skys3_types::{AttemptId, CodecId, FragmentId, Geometry, GeometryError};
+pub use skys3_types::{
+    AttemptId, CodecId, CodedStripe, FragmentId, FragmentLocation, Geometry, GeometryError,
+};
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub use store::SeededBug;
