@@ -15,11 +15,12 @@
 //! **The cache.** The key's entry in its shard caches the origin's version
 //! as the entries of a `write_back` bucket cache its remote's: a read
 //! serves the entry if it holds the version the origin answered, its ETag,
-//! `Last-Modified`, and version ID ([`OriginVersion`]), from its
-//! holders or the hot cache, or by a fill when it is evicted (§9.2). An
-//! entry that holds another version, or none, is brought up to date by the
-//! GET: an `IMPORT` creates the stub of a key that has no entry, and an
-//! `ADOPT` of the entry's version records the origin's (§9.1, §9.2). Both
+//! `Last-Modified` if the origin sent one, version ID, and metadata
+//! ([`OriginVersion`]), from its holders or the hot cache, or by a fill
+//! when it is evicted (§9.2). An entry that holds another version, or
+//! none, is brought up to date by the GET: an `IMPORT` creates the stub
+//! of a key that has no entry, and an `ADOPT` of the entry's version
+//! records the origin's (§9.1, §9.2). Both
 //! are conditional, so of concurrent reads of the same change one record
 //! applies; a read that then finds still another version asks the origin
 //! again, at most [`MAX_ORIGIN_ROUNDS`] times. A HEAD commits nothing, and
@@ -311,14 +312,20 @@ fn cached(entry: &Entry) -> bool {
         && !unloaded(entry)
 }
 
-/// Whether `entry` caches the origin's `version`, with its metadata.
+/// Whether `entry` caches the origin's `version`, with its metadata. An
+/// `ADOPT` stores the metadata the HEAD answered unchanged, so it compares
+/// exactly; a `Last-Modified` the origin did not send is not compared,
+/// since the entry holds when the origin was asked instead.
 fn serves(entry: Option<&Entry>, version: &OriginVersion) -> bool {
     entry.is_some_and(|entry| {
         cached(entry)
             && entry.remote_version_id == version.version_id
             && entry.object.as_ref().is_some_and(|object| {
                 object.local_etag == version.etag
-                    && object.last_modified_ms == version.last_modified_ms
+                    && version
+                        .last_modified_ms
+                        .is_none_or(|modified| object.last_modified_ms == modified)
+                    && object.metadata == version.metadata
             })
     })
 }
