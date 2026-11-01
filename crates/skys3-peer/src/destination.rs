@@ -33,9 +33,10 @@
 //! A `BATCH` skips staging: its items carry their bytes inline, and the
 //! [`CommitSink`] applies them together.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -453,14 +454,25 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
         } = begin.clone();
         let data = data.clone();
         async move {
-            let (piece, generation) = (data.piece, admitted.generation);
-            for range in admitted.ranges {
+            let piece = data.piece;
+            // A COMMIT waits for every range in flight to settle, so one
+            // this task leaves unsettled, as when the sink panics, is
+            // settled as failed when the task ends.
+            let mut unsettled = Unsettled {
+                staging: Arc::clone(&staging),
+                identity: identity.clone(),
+                generation: admitted.generation,
+                piece,
+                ranges: admitted.ranges.into(),
+            };
+            while let Some(range) = unsettled.ranges.front().cloned() {
                 let start = usize::try_from(range.start - data.offset).expect("within a frame");
                 let end = usize::try_from(range.end - data.offset).expect("within a frame");
                 let bytes = data.bytes.slice(start..end);
                 let result = sink.append(&bucket, &key, range.start, bytes).await;
                 let extent = result.as_ref().ok().copied();
-                let grew = staging.settle(&identity, generation, piece, range, extent);
+                unsettled.ranges.pop_front();
+                let grew = staging.settle(&identity, unsettled.generation, piece, range, extent);
                 // The reporter is gone only once the stream is.
                 match result {
                     Ok(_) if grew => {
@@ -481,6 +493,26 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The ranges an append admitted and has not settled yet, settled as
+/// failed when dropped, as when the append's task panics: no range stays
+/// in flight for a [`Staging::settled`] to wait on forever.
+struct Unsettled {
+    staging: Arc<Staging>,
+    identity: WriteIdentity,
+    generation: u64,
+    piece: u64,
+    ranges: VecDeque<Range<u64>>,
+}
+
+impl Drop for Unsettled {
+    fn drop(&mut self) {
+        for range in self.ranges.drain(..) {
+            self.staging
+                .settle(&self.identity, self.generation, self.piece, range, None);
         }
     }
 }
