@@ -776,7 +776,12 @@ fn relocate_coded(
             stripe: moved.stripe,
             index: moved.index,
         };
-        index.release_fragment(shard, &released, &moved.from)?;
+        let replaced = if is_seeded(SeededBug::ReleaseRelocatedTarget) {
+            &moved.to
+        } else {
+            &moved.from
+        };
+        index.release_fragment(shard, &released, replaced)?;
     }
     coded.stripes = stripes;
     index.put_entry(shard, &relocate.key, &entry)?;

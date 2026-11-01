@@ -113,6 +113,13 @@ impl RepairMetrics {
         self.unrepaired.get()
     }
 
+    /// How long the oldest of the fragments known lost has been, in
+    /// seconds, as of the last pass: 0 when none is.
+    #[must_use]
+    pub fn oldest_unrepaired_age(&self) -> f64 {
+        self.oldest.get()
+    }
+
     /// Counts a fragment moved.
     pub(crate) fn moved_fragment(&self) {
         self.moved.inc();

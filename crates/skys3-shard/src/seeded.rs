@@ -16,6 +16,9 @@ pub enum SeededBug {
     /// The state machine applies an `EC_PUBLISH` whose version is no longer
     /// the key's current one, to the current one.
     PublishSuperseded,
+    /// Applying an `EC_RELOCATE` releases the fragments it moves to rather
+    /// than those it moves from (§8.7).
+    ReleaseRelocatedTarget,
 }
 
 #[cfg(feature = "test-util")]

@@ -137,7 +137,7 @@ pub(super) struct Reads {
     cluster: ClusterId,
     store: MemoryControlStore,
     /// Each version's bytes, by ETag.
-    versions: Mutex<BTreeMap<String, Vec<u8>>>,
+    pub(super) versions: Mutex<BTreeMap<String, Vec<u8>>>,
     /// Whether each node's fragment bytes arrive corrupted.
     corrupt: Vec<AtomicBool>,
     clients_done: AtomicU64,
@@ -284,7 +284,13 @@ pub(super) async fn start_gateway(
     )
     .parse::<skys3_config::Config>()?;
     let mut gateway_config = GatewayConfig::new(&config);
-    gateway_config.hot_cache = HotCache::new(HOT_CACHE_BYTES);
+    // The loss combinations must read fragments, never the hot cache.
+    let hot_cache_bytes = if world.run.combinations {
+        0
+    } else {
+        HOT_CACHE_BYTES
+    };
+    gateway_config.hot_cache = HotCache::new(hot_cache_bytes);
     // The shard's log takes inline bodies only up to its own bound, so the
     // copies the gateway writes must keep to it.
     gateway_config.inline_max_bytes = super::log_config().inline_max_bytes;
@@ -332,6 +338,14 @@ impl FragmentSource for Observed {
                 >= request.identity.stripe.geometry.data_fragments()
             {
                 reads.parity_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(error) = self
+                .world
+                .combinations
+                .as_ref()
+                .and_then(|combinations| combinations.refuses(&request))
+            {
+                return Err(error);
             }
             let node = self.world.position(&request.node);
             let mut read = self.client.read(request).await;
@@ -601,7 +615,7 @@ impl Reads {
 }
 
 /// What a GET got.
-enum Got {
+pub(super) enum Got {
     Bytes { etag: String, body: Bytes },
     Unavailable,
     Broken,
@@ -646,7 +660,7 @@ async fn write(host: &str, request: Request<Full<Bytes>>) -> Result<bool, String
 }
 
 /// GETs `key`, or bytes `a` to `b` of it, through `host`'s gateway.
-async fn get(host: &str, key: &str, range: Option<(usize, usize)>) -> Got {
+pub(super) async fn get(host: &str, key: &str, range: Option<(usize, usize)>) -> Got {
     let mut request = Request::get(format!("/{BUCKET}/{key}"));
     if let Some((a, b)) = range {
         request = request.header("range", format!("bytes={a}-{b}"));
