@@ -1,0 +1,172 @@
+# Why each ceph/s3-tests test that subset.txt does not select is left out
+# (plan M7-01): `## <kind> | <group> | <why>`, then rules, as
+# skys3_s3tests.py describes. A test belongs to the first rule that
+# matches it, so the narrow rules come first. The kinds:
+#
+# - unsupported: a feature SkyS3 does not support (design section 11
+#   rejects most of them with an error, which the gateway's
+#   tests/compatibility.rs checks).
+# - divergence: SkyS3 answers a supported request differently from what
+#   the test expects, by design; each is described in the compatibility
+#   matrix. None has been checked against AWS S3 itself.
+# - assumption: the test relies on something of the RGW test setup that
+#   SkyS3 does not have, such as several accounts, bucket owners, or a
+#   lifecycle debug clock; or on client behaviour the pinned botocore
+#   lacks.
+# - open: a gap in a supported feature too large to fix in M7-01, kept
+#   visible as an open point of the matrix until it is fixed and the
+#   tests move to subset.txt.
+
+## open | Request IDs | No answer carries `x-amz-request-id`, and error documents have no `RequestId`
+s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error
+
+## open | Expiration header | PutObject and HeadObject do not return `x-amz-expiration` for an object a lifecycle rule will expire
+s3tests/functional/test_s3.py::test_lifecycle_expiration_header_*
+
+## divergence | Listing encoding | With `encoding-type=url`, a space is encoded as `+`, and ListObjects (V1) encodes `Prefix` too; the tests expect `%20` and a V1 `Prefix` as given
+s3tests/functional/test_s3.py::test_bucket_list_encoding_basic
+s3tests/functional/test_s3.py::test_bucket_listv2_encoding_basic
+s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable
+
+## divergence | Empty listing parameters | An empty continuation token is refused with `400 InvalidArgument`; the tests expect it to be ignored
+s3tests/functional/test_s3.py::test_bucket_listv2_continuationtoken_empty
+
+## divergence | Bucket already exists | CreateBucket of an existing bucket answers `409 BucketAlreadyOwnedByYou`, as S3 does outside `us-east-1`; the tests expect `200`, as in `us-east-1`
+s3tests/functional/test_s3.py::test_bucket_create_exists
+s3tests/functional/test_s3.py::test_bucket_recreate_not_overriding
+
+## divergence | Part numbers out of range | GetObject and HeadObject with a `partNumber` beyond the object's parts answer `416 InvalidPartNumber`; the tests expect `400 InvalidPart`
+s3tests/functional/test_s3.py::test_multipart_get_part
+s3tests/functional/test_s3.py::test_multipart_single_get_part
+s3tests/functional/test_s3.py::test_non_multipart_get_part
+
+## divergence | Malformed whole-object checksum | A CompleteMultipartUpload whose whole-object checksum has a part count its type cannot have answers `400 InvalidRequest`; the test expects `BadDigest`
+s3tests/functional/test_s3.py::test_multipart_checksum_sha256
+
+## divergence | Completion with a part replaced | A completion that names a part by the ETag of an upload of it since replaced answers `400 InvalidPart`, rather than complete with the part it names
+s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last
+
+## divergence | Non-ASCII metadata | User metadata that is not ASCII is returned RFC 2047-encoded, as S3 documents; the test expects it as sent (it fails on RGW too)
+s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
+
+## divergence | Keys with control characters | A key with a C1 control character is a valid key; the test expects `400 InvalidURI` (it fails on RGW too)
+s3tests/functional/test_s3.py::test_object_read_unreadable
+
+## unsupported | Conditional writes other than `If-Match` and `If-None-Match: *` | `If-None-Match` with an ETag, conditional deletes by size or modification time, and preconditions on versions answer `501 NotImplemented` or need versioning
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_good
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed
+marker:conditional_write
+
+## unsupported | Versioning and delete markers | Versioning belongs to the remote target (`501 NotImplemented`)
+s3tests/functional/test_s3.py::test_*versioning*
+s3tests/functional/test_s3.py::test_*versioned*
+s3tests/functional/test_s3.py::test_*noncur*
+s3tests/functional/test_s3.py::test_*deletemarker*
+marker:delete_marker
+s3tests/functional/test_s3.py::test_lifecycle_expiration_size_*
+
+## unsupported | Server-side encryption | SSE-S3, SSE-KMS, SSE-C, and bucket default encryption are rejected (`400 InvalidRequest` or `501 NotImplemented`); some of these tests accept any error and pass
+marker:encryption
+marker:sse_s3
+
+## unsupported | Object Lock | Rejected (`501 NotImplemented`, or `400 InvalidRequest` as for a bucket without it)
+s3tests/functional/test_s3.py::test_object_lock_*
+
+## unsupported | RGW extensions | Unordered listings, usage statistics, tenants, and the extended HeadBucket of RGW
+s3tests/functional/test_s3.py::test_bucket_list_unordered
+s3tests/functional/test_s3.py::test_bucket_listv2_unordered
+s3tests/functional/test_s3.py::test_account_usage
+s3tests/functional/test_s3.py::test_head_bucket_usage
+s3tests/functional/test_s3.py::test_bucket_head_extended
+s3tests/functional/test_s3.py::test_object_presigned_put_object_with_acl_tenant
+
+## unsupported | ACLs and object ownership | Only the canned ACLs `private` and `bucket-owner-full-control` and the ownership `BucketOwnerEnforced` are accepted; reading ACLs answers `501 NotImplemented`
+s3tests/functional/test_s3.py::test_*acl*
+s3tests/functional/test_headers.py::test_*acl*
+s3tests/functional/test_s3.py::test_access_bucket_*
+s3tests/functional/test_s3.py::test_object_raw_get*
+s3tests/functional/test_s3.py::test_object_raw_authenticated*
+s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
+s3tests/functional/test_s3.py::test_bucket_list_return_data
+s3tests/functional/test_s3.py::test_bucket_create_special_key_names
+s3tests/functional/test_s3.py::test_list_multipart_upload_owner
+s3tests/functional/test_s3.py::test_expected_bucket_owner
+marker:object_ownership
+
+## unsupported | POST object | Browser-form uploads answer `501 NotImplemented`; some of these tests accept any error and pass
+s3tests/functional/test_s3.py::test_post_object_*
+
+## unsupported | Bucket and user policies, public access blocks | SkyS3 is authorized by its own IAM policies; the S3 policy APIs answer `501 NotImplemented`
+marker:bucket_policy
+marker:user_policy
+marker:session_policy
+s3tests/functional/test_s3.py::test_*public_block*
+s3tests/functional/test_s3.py::test_block_public_*
+s3tests/functional/test_s3.py::test_*policy*
+
+## unsupported | Bucket logging | `501 NotImplemented`
+marker:bucket_logging
+
+## unsupported | Lifecycle transitions and archive restore | Storage classes other than STANDARD are refused, and there is no archive to restore from
+marker:lifecycle_transition
+marker:cloud_restore
+s3tests/functional/test_s3.py::test_lifecycle_transition_set_invalid_date
+
+## unsupported | Lifecycle rules SkyS3 does not apply | `ExpiredObjectDeleteMarker` needs versioning (`501 NotImplemented`), and a rule's `Filter` may not hold a `Prefix` and a `Tag` without an `And`
+s3tests/functional/test_s3.py::test_lifecycle_set_filter
+s3tests/functional/test_s3.py::test_lifecycle_set_empty_filter
+s3tests/functional/test_s3.py::test_lifecycle_expiration_tags1
+s3tests/functional/test_s3.py::test_lifecycle_expiration_tags2
+
+## unsupported | CORS, website, torrents, GetObjectAttributes, bucket tagging | `501 NotImplemented`, or `403 AccessDenied` for an operation without an IAM action
+s3tests/functional/test_s3.py::test_*cors*
+s3tests/functional/test_s3.py::test_*object_attributes
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_*
+s3tests/functional/test_s3.py::test_get_object_torrent
+s3tests/functional/test_s3.py::test_set_bucket_tagging
+
+## unsupported | Signature Version 2 | Refused with `400 InvalidRequest` (design section 11)
+marker:auth_aws2
+
+## unsupported | IAM, STS, and SNS APIs | SkyS3 has no IAM or SNS API, and of STS only AssumeRoleWithWebIdentity, whose tests create roles through IAM
+s3tests/functional/test_iam.py
+s3tests/functional/test_sts.py
+s3tests/functional/test_sns.py
+s3tests/functional/test_s3control.py
+
+## unsupported | S3 Select | `501 NotImplemented`; some of these tests accept any error and pass
+s3tests/functional/test_s3select.py
+
+## assumption | Accounts and bucket owners | SkyS3 has no bucket owners: buckets belong to the cluster and every caller is authorized by IAM policy, so another user's buckets and anonymous access are not told apart as the tests expect
+s3tests/functional/test_s3.py::test_bucket_create_exists_nonowner
+s3tests/functional/test_s3.py::test_list_buckets_paginated
+s3tests/functional/test_s3.py::test_list_buckets_anonymous
+s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous
+s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous
+s3tests/functional/test_s3.py::test_object_anon_put_write_access
+s3tests/functional/test_s3.py::test_object_copy_not_owned_bucket
+s3tests/functional/test_s3.py::test_object_copy_not_owned_object_bucket
+
+## assumption | Lifecycle debug clock | The tests expect RGW's `rgw_lc_debug_interval`, which turns a rule's days into seconds
+s3tests/functional/test_s3.py::test_lifecycle_expiration
+s3tests/functional/test_s3.py::test_lifecyclev2_expiration
+s3tests/functional/test_s3.py::test_lifecycle_multipart_expiration
+
+## assumption | Requests botocore cannot send | The tests strip or replace headers that botocore then signs again, or call it in a way the pinned version rejects; the 100-continue test does not use the configured certificate
+s3tests/functional/test_headers.py::test_*_bad_authorization_*
+s3tests/functional/test_headers.py::test_*_bad_contentlength_empty
+s3tests/functional/test_headers.py::test_*_bad_contentlength_none
+s3tests/functional/test_headers.py::test_*_bad_expect_mismatch
+s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
+s3tests/functional/test_s3.py::test_100_continue
+
+## assumption | RGW behaviour S3 does not have | Tests marked as failing on S3: bucket names with `.-` or `-.`, which SkyS3 accepts as S3 does, and a bucket deleted while a PUT to it streams
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dot_dash
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_dot
+s3tests/functional/test_s3.py::test_atomic_write_bucket_gone
+
+## assumption | Location constraint | Skipped unless an `api_name` is configured, which SkyS3's single region has no use for
+s3tests/functional/test_s3.py::test_bucket_get_location
+
+## assumption | s3-tests' own helpers | Unit tests of s3-tests' code, not of a server
+s3tests/functional/test_utils.py

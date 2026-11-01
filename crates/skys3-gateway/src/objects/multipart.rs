@@ -22,7 +22,10 @@
 //!   position. The shard applies it only if those are still the stored
 //!   parts, so a part uploaded again meanwhile fails the completion instead
 //!   of changing it. `If-Match` and `If-None-Match: *` are checked as for
-//!   PutObject.
+//!   PutObject. A completion sent again once the upload completed, as a
+//!   client retries one whose answer it lost, answers as the completion
+//!   did while the key still holds the version it completed: the version
+//!   whose write identity is the upload's.
 //! - **Abort** commits an `MPU_ABORT`, which releases the parts' bytes for
 //!   compaction (§10.3).
 //! - **Listing** of uploads merges every shard's uploads in key order, then
@@ -37,7 +40,7 @@ use s3s::dto::{
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
     MultipartUpload, Part as S3Part, Timestamp, UploadPartInput, UploadPartOutput,
 };
-use s3s::{S3Request, S3Result, s3_error};
+use s3s::{S3ErrorCode, S3Request, S3Result, s3_error};
 use skys3_index::{Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{CompletedPart, MpuAbort, MpuComplete, MpuCreate, MpuPart, UploadChecksum};
@@ -344,14 +347,21 @@ impl<H: Shards> Objects<H> {
             self.conditional_entry(bucket, &shard, &input.key).await?;
         }
         let every_part = (0, MAX_PARTS as usize);
-        let (upload, state, stored) = open_upload(
+        let opened = open_upload(
             &self.shards,
             &shard,
             &input.key,
             &input.upload_id,
             every_part,
         )
-        .await?;
+        .await;
+        let (upload, state, stored) = match opened {
+            Ok(opened) => opened,
+            Err(error) if *error.code() == S3ErrorCode::NoSuchUpload => {
+                return self.completed(bucket, &shard, input).await?.ok_or(error);
+            }
+            Err(error) => return Err(error),
+        };
         let checksum = effective_checksum(&state);
         if let Some(requested) = &input.checksum_type
             && requested.as_str() != checksum.checksum_type.as_str()
@@ -454,6 +464,39 @@ impl<H: Shards> Objects<H> {
         };
         set_checksums!(output, &checksums);
         Ok(output)
+    }
+
+    /// The answer to a CompleteMultipartUpload of an upload that is no
+    /// longer open, if it completed the key's current version: the answer
+    /// the completion gave. `None` if the upload was aborted, never
+    /// existed, or the key changed since.
+    async fn completed(
+        &self,
+        bucket: &BucketDocument,
+        shard: &ShardRef,
+        input: CompleteMultipartUploadInput,
+    ) -> S3Result<Option<CompleteMultipartUploadOutput>> {
+        let Some(upload) = parse_upload_id(&input.upload_id) else {
+            return Ok(None);
+        };
+        let entry = self.conditional_entry(bucket, shard, &input.key).await?;
+        let Some(object) = entry
+            .and_then(|entry| entry.object)
+            .filter(|object| object.write_identity == Some(upload))
+        else {
+            return Ok(None);
+        };
+        let mut output = CompleteMultipartUploadOutput {
+            bucket: Some(input.bucket.clone()),
+            location: Some(format!("/{}/{}", input.bucket, input.key)),
+            key: Some(input.key),
+            e_tag: Some(s3s::dto::ETag::Strong(
+                object.local_etag.as_str().to_owned(),
+            )),
+            ..CompleteMultipartUploadOutput::default()
+        };
+        set_checksums!(output, &object.checksums);
+        Ok(Some(output))
     }
 
     pub(crate) async fn abort_upload(

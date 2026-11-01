@@ -22,6 +22,15 @@
 //! environment `tests/sdk/run.sh` documents, all at once, in containers
 //! unless `SKYS3_SDK_LOCAL=1` runs them on the host. CI's `sdk` job runs
 //! them all.
+//!
+//! It also keeps three sections of the compatibility matrix
+//! (`docs/skys3-s3-compatibility.md`, plan M7-01) current: the STS
+//! operations, each of which the Rust client sends; the SDK clients and
+//! their pinned versions, which `the_matrix_lists_the_sdk_clients` reads
+//! from the clients' manifests without running them; and, when the
+//! s3-tests client runs, its results per group. A section that differs
+//! from what the run found fails the test, and `SKYS3_UPDATE_DOCS=1`
+//! rewrites it instead.
 
 mod support;
 
@@ -320,6 +329,7 @@ async fn the_sdk_matrix_passes() {
         .collect();
     rust_features(&matrix).await;
     rust_web_identity(&matrix).await;
+    let sts = rust_sts_operations(&matrix).await;
     let mut results = Vec::new();
     for handle in external {
         results.push(handle.await.unwrap());
@@ -358,6 +368,18 @@ async fn the_sdk_matrix_passes() {
             println!("{line}");
         }
         panic!("SDK matrix clients failed: {failed:?}");
+    }
+
+    // The matrix's sections this run generates, once every client passed:
+    // the STS operations, and the s3-tests subset's results per group,
+    // unless the run was one of every test.
+    check_section("sts", &sts);
+    let every_test = std::env::var("SKYS3_S3TESTS_ALL").is_ok_and(|all| all == "1");
+    if clients.iter().any(|client| client == "s3-tests") && !every_test {
+        let report = matrix.dir.path().join("clients/s3-tests/s3-tests.md");
+        let report = std::fs::read_to_string(&report)
+            .unwrap_or_else(|error| panic!("the s3-tests report {}: {error}", report.display()));
+        check_section("s3-tests", &report);
     }
     matrix.stop().await;
 }
@@ -1270,4 +1292,204 @@ async fn assume_role(matrix: &Matrix, token: &str) -> (u16, String) {
     )
     .await;
     (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The operations of the STS API, as the AWS SDK for Rust's STS client
+/// (`aws-sdk-sts`) lists them, with a note on each SkyS3 supports. The
+/// others answer `400 InvalidAction`, which [`rust_sts_operations`] checks.
+const STS_OPERATIONS: &[(&str, Option<&str>)] = &[
+    ("AssumeRole", None),
+    ("AssumeRoleWithSAML", None),
+    (
+        "AssumeRoleWithWebIdentity",
+        Some(
+            "OIDC trust policies (design §11); `PolicyArns` and `ProviderId` answer \
+             `400 InvalidParameterValue`",
+        ),
+    ),
+    ("AssumeRoot", None),
+    ("DecodeAuthorizationMessage", None),
+    ("GetAccessKeyInfo", None),
+    ("GetCallerIdentity", None),
+    ("GetDelegatedAccessToken", None),
+    ("GetFederationToken", None),
+    ("GetSessionToken", None),
+    ("GetWebIdentityToken", None),
+];
+
+/// Every STS operation but `AssumeRoleWithWebIdentity`, which
+/// [`rust_web_identity`] uses, answers `400 InvalidAction`. Returns the
+/// matrix's STS section, which lists them so.
+async fn rust_sts_operations(matrix: &Matrix) -> String {
+    let mut section = String::from("| Operation | Status | Notes |\n|---|---|---|\n");
+    for (operation, supported) in STS_OPERATIONS {
+        if let Some(note) = supported {
+            section.push_str(&format!("| {operation} | Supported | {note} |\n"));
+            continue;
+        }
+        let (status, body) = https_request(
+            &matrix.ca(),
+            "POST",
+            &format!("{}/", matrix.endpoint),
+            &[("content-type", "application/x-www-form-urlencoded")],
+            format!("Action={operation}&Version=2011-06-15").as_bytes(),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{operation}: {body}");
+        assert!(
+            body.contains("<Code>InvalidAction</Code>"),
+            "{operation}: {body}"
+        );
+        section.push_str(&format!(
+            "| {operation} | Not supported | `400 InvalidAction` |\n"
+        ));
+    }
+    section
+}
+
+/// The clients of the SDK matrix and the versions they are pinned to, as
+/// the files that pin them say.
+#[test]
+fn the_matrix_lists_the_sdk_clients() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path)).unwrap_or_else(|error| panic!("{path}: {error}"))
+    };
+    let image = |client: &str| {
+        let dockerfile = read(&format!("tests/sdk/{client}/Dockerfile"));
+        after(&dockerfile, "FROM ", &['@'])
+    };
+    let lock = read("Cargo.lock");
+    let crate_version = |name: &str| {
+        let package = format!("name = \"{name}\"\nversion = \"");
+        let start = lock.find(&package).unwrap_or_else(|| panic!("{name}")) + package.len();
+        lock[start..].split('"').next().unwrap().to_owned()
+    };
+    let python = read("tests/sdk/python/requirements.txt");
+    let go = read("tests/sdk/go/go.mod");
+    let javascript = read("tests/sdk/javascript/package.json");
+    let java = read("tests/sdk/java/pom.xml");
+    let s3_tests = read("tests/sdk/s3-tests/Dockerfile");
+    let s3_tests_python = read("tests/sdk/s3-tests/requirements.txt");
+    let rows = [
+        (
+            "Python (`python`)",
+            format!(
+                "boto3 {}, botocore {}",
+                after(&python, "boto3==", &[' ']),
+                after(&python, "botocore[crt]==", &[' '])
+            ),
+            image("python"),
+        ),
+        (
+            "Go (`go`)",
+            format!(
+                "aws-sdk-go-v2 {}, service/s3 {}",
+                after(&go, "github.com/aws/aws-sdk-go-v2 ", &[' ']),
+                after(&go, "github.com/aws/aws-sdk-go-v2/service/s3 ", &[' '])
+            ),
+            image("go"),
+        ),
+        (
+            "JavaScript (`javascript`)",
+            format!(
+                "@aws-sdk/client-s3 {}",
+                after(&javascript, "\"@aws-sdk/client-s3\": \"", &['"'])
+            ),
+            image("javascript"),
+        ),
+        (
+            "Java (`java`)",
+            format!(
+                "AWS SDK for Java {}",
+                after(&java, "<awssdk.version>", &['<'])
+            ),
+            image("java"),
+        ),
+        (
+            "Rust (`rust`)",
+            format!(
+                "aws-sdk-s3 {}, aws-config {}",
+                crate_version("aws-sdk-s3"),
+                crate_version("aws-config")
+            ),
+            String::new(),
+        ),
+        (
+            "AWS CLI (`cli`)",
+            format!(
+                "AWS CLI {}",
+                after(&image("cli"), "amazon/aws-cli:", &[' '])
+            ),
+            image("cli"),
+        ),
+        (
+            "ceph/s3-tests (`s3-tests`)",
+            format!(
+                "commit `{}`, boto3 {}",
+                after(&s3_tests, "ARG S3TESTS_COMMIT=", &[' ']),
+                after(&s3_tests_python, "boto3==", &[' '])
+            ),
+            image("s3-tests"),
+        ),
+    ];
+    let mut section = String::from("| Client | Pinned versions | Image |\n|---|---|---|\n");
+    for (client, versions, image) in rows {
+        let image = if image.is_empty() {
+            "none: it runs in the test".to_owned()
+        } else {
+            format!("`{image}`")
+        };
+        section.push_str(&format!("| {client} | {versions} | {image} |\n"));
+    }
+    check_section("sdk-clients", &section);
+}
+
+/// The text after `prefix` on the first line of `text` that starts with
+/// it, once trimmed, up to the first of the characters `end`.
+fn after(text: &str, prefix: &str, end: &[char]) -> String {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix))
+        .and_then(|rest| rest.split(end).next())
+        .unwrap_or_else(|| panic!("no line starts with {prefix:?}"))
+        .to_owned()
+}
+
+/// The compatibility matrix, relative to the workspace root.
+const MATRIX: &str = "docs/skys3-s3-compatibility.md";
+
+/// Checks that the generated `section` of the compatibility matrix holds
+/// `generated`, or with `SKYS3_UPDATE_DOCS=1`, writes it there. A section
+/// is the text between a line `<!-- BEGIN <section>: ... -->` and a line
+/// `<!-- END <section> -->`. The gateway's compatibility test
+/// (`crates/skys3-gateway/tests/compatibility.rs`) checks the other
+/// sections the same way.
+fn check_section(section: &str, generated: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(MATRIX);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let begin = format!("<!-- BEGIN {section}:");
+    let start = text
+        .find(&begin)
+        .and_then(|at| text[at..].find('\n').map(|end| at + end + 1))
+        .unwrap_or_else(|| panic!("{MATRIX} has no `{begin}...` line"));
+    let end = format!("<!-- END {section} -->");
+    let stop = text[start..]
+        .find(&end)
+        .map(|at| start + at)
+        .unwrap_or_else(|| panic!("{MATRIX} has no `{end}` line"));
+    if text[start..stop] == *generated {
+        return;
+    }
+    if std::env::var("SKYS3_UPDATE_DOCS").is_ok_and(|value| value == "1") {
+        let updated = format!("{}{generated}{}", &text[..start], &text[stop..]);
+        std::fs::write(&path, updated).unwrap();
+        return;
+    }
+    panic!(
+        "the `{section}` section of {MATRIX} is out of date; rerun with SKYS3_UPDATE_DOCS=1 \
+         to rewrite it. It should read:\n{generated}"
+    );
 }

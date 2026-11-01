@@ -46,8 +46,8 @@ impl Payload {
     ///
     /// # Errors
     ///
-    /// `InvalidArgument` for a value that is not a payload hash,
-    /// `NotImplemented` for SigV4a streaming.
+    /// `InvalidArgument` for a value that is not a payload hash, and
+    /// `InvalidRequest` for SigV4a streaming, as for a SigV4a signature.
     pub(crate) fn declared(headers: &HeaderMap) -> Result<Option<Self>, S3Error> {
         let mut values = headers.get_all(CONTENT_SHA256).iter();
         let Some(value) = values.next() else {

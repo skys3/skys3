@@ -975,6 +975,8 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - The selected `ceph/s3-tests` subset, explicit tests for every rejected feature, and the SDK matrix, published as a compatibility matrix under `docs/`.
 - **Done when:** the matrix is published and CI keeps it current.
+- **How CI keeps it current (decided in M7-01).** `docs/skys3-s3-compatibility.md` is hand-written prose around tables that tests generate and check, failing when the committed table differs (`SKYS3_UPDATE_DOCS=1` rewrites them): the gateway's `tests/compatibility.rs` sends a request for each of the 113 operations `s3s` 0.17 routes and each rejected request, and checks the operation `s3s` routed it to and the answer; the SDK matrix (`crates/skys3/tests/sdk.rs`) checks the STS operations against the binary, the clients' pinned versions, and, in the `sdk` job, the `ceph/s3-tests` results per group. The `sdk` job is extended rather than a new job added.
+- **The s3-tests selection (decided in M7-01).** Every test of the pinned commit is classified: `tests/sdk/s3-tests/subset.txt` selects, `excluded.txt` excludes by group with a reason (not supported, a known divergence, a test-suite assumption, or an open point in a supported feature), and the run fails before any test starts if a test is in neither or a line matches no test. Small gaps the full run found in supported features were fixed instead (an echoed empty delimiter, and a repeated CompleteMultipartUpload); request IDs and the `x-amz-expiration` header remain open points.
 
 #### M7-02 Remote provider matrix
 

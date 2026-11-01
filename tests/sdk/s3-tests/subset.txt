@@ -1,42 +1,23 @@
-# The ceph/s3-tests subset the SDK matrix runs (plan M1-25), one pytest
-# node ID per line, from the commit pinned in Dockerfile. M7-01 completes
-# the selection and publishes the compatibility matrix.
+# The ceph/s3-tests subset the SDK matrix runs (plans M1-25 and M7-01):
+# `## <group>`, then the group's pytest node IDs, from the commit pinned
+# in Dockerfile. skys3_s3tests.py describes the format.
 #
-# Included: every test of s3tests/functional/test_s3.py and
-# test_headers.py that passed against SkyS3 at that commit, grouped by
-# feature, except those that pass only by accident: tests of rejected
-# features (SSE-C, SSE-KMS, Object Lock, ACLs other than private, which
-# answer an error the test happens to accept), POST object uploads (not
-# supported; their tests expect an error), and three slow ones (the
-# 1,000-key DeleteObjects limits and delimiter_not_skip_special, about
-# 35 s together) whose features other tests here cover.
+# Every test of that commit is either here or excluded by a rule of
+# excluded.txt, which says why: a feature SkyS3 does not support, a known
+# divergence from what the test expects, a test-suite assumption that
+# does not hold for SkyS3, or an open point. A selected test that fails
+# fails the SDK matrix, and the results per group are published in
+# docs/skys3-s3-compatibility.md, section 6.
 #
-# Not included, and why (from a full run of both files):
-# - Rejected features (design section 11): versioning, SSE-S3, SSE-KMS,
-#   SSE-C, Object Lock, ACL grants and canned ACLs other than private,
-#   object ownership other than BucketOwnerEnforced.
-# - Features SkyS3 does not offer: bucket policies, public access blocks,
-#   lifecycle configuration APIs, CORS, website, logging, POST object,
-#   GetObjectAttributes, STS other than
-#   AssumeRoleWithWebIdentity, IAM, SNS, S3 Select, and RGW extensions
-#   (unordered listings, account usage, tenants, append).
-# - SigV2 (refused by design), and conditional writes SkyS3 answers with
-#   501 (If-None-Match with an ETag, both headers together, DeleteObject's
-#   size and modification-time conditions).
-# - Behaviour that differs from what these tests expect, left for M7-01
-#   to check against AWS S3: `encoding-type=url` writes a space as `+`
-#   (design section 11) where the tests expect `%20`, and encodes the V1
-#   `Prefix`; an empty `Delimiter` is echoed; an empty continuation token
-#   is refused; CreateBucket of an existing bucket answers
-#   409 BucketAlreadyOwnedByYou; completing an already completed upload
-#   answers 404 NoSuchUpload, where AWS S3 answers 200; a malformed
-#   whole-object checksum on CompleteMultipartUpload answers
-#   400 InvalidRequest, not BadDigest; ListBuckets ignores MaxBuckets and
-#   Prefix; a completion that lists part 1 twice, once with the ETag of
-#   an upload of it replaced since, answers InvalidPart
-#   (multipart_resend_first_finishes_last).
+# Selected: every test of a supported feature that passes, including the
+# slow ones (the 1,000-key DeleteObjects limits, delimiter_not_skip_special,
+# and an expiration by date, about 45 s together), and the tests of
+# rejected features whose answer is the one SkyS3 documents (Object Lock on
+# a bucket without it, canned ACLs that change nothing). Not selected:
+# tests that pass only by accident, such as a test of a rejected feature
+# that accepts any error, which excluded.txt lists with their feature.
 
-# Buckets: create, name rules, head, list, delete
+## Buckets: create, name rules, head, list, delete
 s3tests/functional/test_s3.py::test_bucket_notexist
 s3tests/functional/test_s3.py::test_bucketv2_notexist
 s3tests/functional/test_s3.py::test_bucket_delete_notexist
@@ -72,7 +53,7 @@ s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_empty
 s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_negative
 s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_none
 
-# Listing V1 and V2: prefixes, delimiters, markers, continuation tokens, max-keys, owners
+## Listing V1 and V2: prefixes, delimiters, markers, continuation tokens, max-keys, owners
 s3tests/functional/test_s3.py::test_bucket_list_empty
 s3tests/functional/test_s3.py::test_bucket_list_distinct
 s3tests/functional/test_s3.py::test_bucket_list_many
@@ -98,6 +79,8 @@ s3tests/functional/test_s3.py::test_bucket_list_delimiter_unreadable
 s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_unreadable
 s3tests/functional/test_s3.py::test_bucket_list_delimiter_none
 s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_none
+s3tests/functional/test_s3.py::test_bucket_list_delimiter_empty
+s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_empty
 s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_notempty
 s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_defaultempty
 s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_empty
@@ -144,12 +127,15 @@ s3tests/functional/test_s3.py::test_bucket_listv2_startafter_after_list
 s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous_fail
 s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous_fail
 s3tests/functional/test_s3.py::test_bucket_list_special_prefix
+s3tests/functional/test_s3.py::test_bucket_list_delimiter_not_skip_special
 
-# Objects: write, read, metadata, headers, delete
+## Objects: write, read, metadata, headers, delete
 s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
 s3tests/functional/test_s3.py::test_object_read_not_exist
 s3tests/functional/test_s3.py::test_multi_object_delete
 s3tests/functional/test_s3.py::test_multi_objectv2_delete
+s3tests/functional/test_s3.py::test_multi_object_delete_key_limit
+s3tests/functional/test_s3.py::test_multi_objectv2_delete_key_limit
 s3tests/functional/test_s3.py::test_object_head_zero_bytes
 s3tests/functional/test_s3.py::test_object_write_check_etag
 s3tests/functional/test_s3.py::test_object_write_cache_control
@@ -163,7 +149,7 @@ s3tests/functional/test_s3.py::test_object_write_file
 s3tests/functional/test_s3.py::test_object_raw_response_headers
 s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked
 
-# Conditional requests
+## Conditional requests
 s3tests/functional/test_s3.py::test_get_object_ifmatch_good
 s3tests/functional/test_s3.py::test_get_object_ifmatch_failed
 s3tests/functional/test_s3.py::test_get_object_ifnonematch_good
@@ -184,7 +170,7 @@ s3tests/functional/test_s3.py::test_copy_object_ifnonematch_good
 s3tests/functional/test_s3.py::test_copy_object_ifnonematch_failed
 s3tests/functional/test_s3.py::test_delete_objects_if_match
 
-# Ranges
+## Ranges
 s3tests/functional/test_s3.py::test_ranged_request_response_code
 s3tests/functional/test_s3.py::test_ranged_big_request_response_code
 s3tests/functional/test_s3.py::test_ranged_request_skip_leading_bytes_response_code
@@ -192,7 +178,7 @@ s3tests/functional/test_s3.py::test_ranged_request_return_trailing_bytes_respons
 s3tests/functional/test_s3.py::test_ranged_request_invalid_range
 s3tests/functional/test_s3.py::test_ranged_request_empty_object
 
-# CopyObject
+## CopyObject
 s3tests/functional/test_s3.py::test_object_copy_zero_size
 s3tests/functional/test_s3.py::test_object_copy_16m
 s3tests/functional/test_s3.py::test_object_copy_same_bucket
@@ -204,9 +190,15 @@ s3tests/functional/test_s3.py::test_object_copy_retaining_metadata
 s3tests/functional/test_s3.py::test_object_copy_replacing_metadata
 s3tests/functional/test_s3.py::test_object_copy_bucket_not_found
 s3tests/functional/test_s3.py::test_object_copy_key_not_found
+s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1]
+s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1024]
+s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1048576]
+s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
 
-# Multipart uploads
+## Multipart uploads
 s3tests/functional/test_s3.py::test_multipart_upload_empty
+s3tests/functional/test_s3.py::test_multipart_upload
+s3tests/functional/test_s3.py::test_multipart_upload_small
 s3tests/functional/test_s3.py::test_multipart_upload_complete_without_create
 s3tests/functional/test_s3.py::test_multipart_upload_resend_part
 s3tests/functional/test_s3.py::test_multipart_upload_multiple_sizes
@@ -221,8 +213,7 @@ s3tests/functional/test_s3.py::test_multipart_upload_incorrect_etag
 s3tests/functional/test_s3.py::test_atomic_multipart_upload_write
 s3tests/functional/test_s3.py::test_set_multipart_tagging
 
-# UploadPartCopy (plan M4-05). Not included: the versioned and SSE
-# variants (rejected features), and those of bucket policies and logging.
+## UploadPartCopy
 s3tests/functional/test_s3.py::test_multipart_copy_small
 s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
 s3tests/functional/test_s3.py::test_multipart_copy_improper_range
@@ -230,8 +221,23 @@ s3tests/functional/test_s3.py::test_multipart_copy_without_range
 s3tests/functional/test_s3.py::test_multipart_copy_special_names
 s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes
 s3tests/functional/test_s3.py::test_upload_part_copy_percent_encoded_key
+s3tests/functional/test_s3.py::test_copy_part_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
 
-# Tagging
+## Lifecycle configuration and expiration by date
+s3tests/functional/test_s3.py::test_lifecycle_set
+s3tests/functional/test_s3.py::test_lifecycle_get
+s3tests/functional/test_s3.py::test_lifecycle_get_no_id
+s3tests/functional/test_s3.py::test_lifecycle_delete
+s3tests/functional/test_s3.py::test_lifecycle_id_too_long
+s3tests/functional/test_s3.py::test_lifecycle_same_id
+s3tests/functional/test_s3.py::test_lifecycle_invalid_status
+s3tests/functional/test_s3.py::test_lifecycle_set_date
+s3tests/functional/test_s3.py::test_lifecycle_set_invalid_date
+s3tests/functional/test_s3.py::test_lifecycle_set_multipart
+s3tests/functional/test_s3.py::test_lifecycle_expiration_days0
+s3tests/functional/test_s3.py::test_lifecycle_expiration_date
+
+## Tagging
 s3tests/functional/test_s3.py::test_get_obj_tagging
 s3tests/functional/test_s3.py::test_get_obj_head_tagging
 s3tests/functional/test_s3.py::test_put_max_tags
@@ -243,11 +249,12 @@ s3tests/functional/test_s3.py::test_put_modify_tags
 s3tests/functional/test_s3.py::test_put_delete_tags
 s3tests/functional/test_s3.py::test_put_obj_with_tags
 
-# Checksums
+## Checksums
 s3tests/functional/test_s3.py::test_object_checksum_sha256
 s3tests/functional/test_s3.py::test_object_checksum_crc64nvme
+s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag
 
-# Atomicity of concurrent reads and writes
+## Atomicity of concurrent reads and writes
 s3tests/functional/test_s3.py::test_atomic_read_1mb
 s3tests/functional/test_s3.py::test_atomic_read_4mb
 s3tests/functional/test_s3.py::test_atomic_read_8mb
@@ -260,7 +267,7 @@ s3tests/functional/test_s3.py::test_atomic_dual_write_8mb
 s3tests/functional/test_s3.py::test_atomic_conditional_write_1mb
 s3tests/functional/test_s3.py::test_atomic_dual_conditional_write_1mb
 
-# Authentication and bad request headers
+## Authentication and bad request headers
 s3tests/functional/test_s3.py::test_object_anon_put
 s3tests/functional/test_s3.py::test_object_put_authenticated
 s3tests/functional/test_s3.py::test_100_continue_error_retry
@@ -276,3 +283,13 @@ s3tests/functional/test_headers.py::test_object_create_bad_contenttype_empty
 s3tests/functional/test_headers.py::test_object_create_bad_contenttype_none
 s3tests/functional/test_headers.py::test_object_create_date_and_amz_date
 s3tests/functional/test_headers.py::test_object_create_amz_date_and_no_date
+
+## Rejected features answer as documented
+s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private
+s3tests/functional/test_s3.py::test_object_presigned_put_object_with_acl
+s3tests/functional/test_headers.py::test_bucket_put_bad_canned_acl
+s3tests/functional/test_s3.py::test_object_lock_get_obj_lock_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_get_legal_hold_invalid_bucket
