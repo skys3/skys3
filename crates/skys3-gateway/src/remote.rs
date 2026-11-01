@@ -44,6 +44,9 @@ pub struct RemoteObject {
     pub object: ObjectVersion,
     /// Its remote version ID, on a versioned remote.
     pub version_id: Option<String>,
+    /// The `Last-Modified` the remote sent, if it sent one. Without it,
+    /// `object` carries when the remote was asked instead.
+    pub last_modified_ms: Option<u64>,
 }
 
 /// One request for a page of a remote listing.
