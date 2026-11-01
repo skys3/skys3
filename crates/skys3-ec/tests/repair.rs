@@ -18,10 +18,11 @@ use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::read::ReadFuture;
 use skys3_ec::repair::RepairBug;
 use skys3_ec::{
-    Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment, FragmentBytes,
-    FragmentId, FragmentLocation, FragmentReadError, FragmentRequest, FragmentSource,
-    FragmentWriter, PlannerSource, RepairBandwidth, RepairEvent, RepairMetrics, RepairReport,
-    RepairSettings, RepairStep, Repairer, TransferError, codec, read_coded, rebuild_layouts,
+    AttemptState, Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment,
+    FragmentBytes, FragmentId, FragmentLocation, FragmentReadError, FragmentRequest,
+    FragmentSource, FragmentWriter, PlannerSource, RepairBandwidth, RepairEvent, RepairMetrics,
+    RepairReport, RepairSettings, RepairStep, Repairer, TransferError, codec, read_coded,
+    rebuild_layouts,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
@@ -894,6 +895,56 @@ fn an_attempt_abandoned_by_the_fence_never_relocates() {
             after["object-0"][stripe as usize],
             before["object-0"][stripe as usize]
         );
+    });
+}
+
+#[test]
+fn a_repair_whose_caller_is_dropped_still_settles_and_reports_it() {
+    runtime().block_on(async {
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        f.nodes.wipe(5);
+        let repairer = Arc::new(f.repairer(planner(6, EcConfig::default(), Vec::new()), SETTINGS));
+        let pass = tokio::spawn({
+            let repairer = Arc::clone(&repairer);
+            async move { repairer.pass().await }
+        });
+        let attempt = loop {
+            let publishing = f.attempts.in_progress().into_iter().find(|&attempt| {
+                matches!(
+                    f.attempts.state(attempt),
+                    Some(AttemptState::Publishing { .. })
+                )
+            });
+            if let Some(attempt) = publishing {
+                break attempt;
+            }
+            assert!(!pass.is_finished(), "the pass ended before it published");
+            tokio::task::yield_now().await;
+        };
+        // The pass is cancelled while the record commits: the attempt is
+        // settled all the same, and the observer hears that it committed.
+        pass.abort();
+        let committed = |events: &[RepairEvent]| {
+            events.iter().any(|event| {
+                event.attempt == attempt
+                    && matches!(
+                        event.step,
+                        RepairStep::Committed {
+                            relocated: true,
+                            ..
+                        }
+                    )
+            })
+        };
+        // The commit's writes run on blocking threads: wait in real time.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (f.attempts.state(attempt).is_some() || !committed(&f.events.lock().unwrap()))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(f.attempts.state(attempt), None);
+        assert!(committed(&f.events.lock().unwrap()), "{:?}", f.steps());
     });
 }
 
