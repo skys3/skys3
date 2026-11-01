@@ -20,6 +20,7 @@
 - [11. M5 Local erasure coding](#11-m5-local-erasure-coding)
 - [12. M6 Native peer transport](#12-m6-native-peer-transport)
 - [13. M7 Hardening](#13-m7-hardening)
+- [M8 Cluster binary](#m8-cluster-binary)
 - [14. Design gaps assigned to PRs](#14-design-gaps-assigned-to-prs)
 - [15. Open questions from design section 19](#15-open-questions-from-design-section-19)
 
@@ -67,9 +68,10 @@
 | M4 Large objects | 13 | M1-16; M4-02 also needs M1-16b, and M4-04 needs M2-12 | No partial remote objects under fault injection; ETags match |
 | M5 Local erasure coding | 12 | M5-01 and M5-02 early; the encoder after M3-03; coded reads after M2-18 | All loss combinations up to `m` fragments pass; node loss heals with no operator action |
 | M6 Native peer transport | 9 | M6-01 and M6-02 early; staging after M2-07; the source side after M4-03 and M4-09 | The §17 M6 criteria, measured on shaped lossy links |
-| M7 Hardening | 9 | Continuous; closes after M5 and M6 | Published compatibility matrix; §16.3 targets met or the design revised |
+| M7 Hardening | 9 | Continuous; closes after M5, M6, and M8 | Published compatibility matrix; §16.3 targets met or the design revised |
+| M8 Cluster binary | 11 | M8-01 after M1-25; the cluster wiring after M8-01 and M2 | The binary runs the cluster by default and passes the end-to-end suite; the nightly kill, partition, and peering suite loses no acknowledged write |
 
-The exit criteria of M1 to M7 are quoted from §17.
+The exit criteria of M1 to M7 are quoted from §17. M8, which §17 does not have, brings the cluster the simulation runs into the node binary.
 
 ```mermaid
 flowchart LR
@@ -86,6 +88,9 @@ flowchart LR
     M4 --> M6
     M5 --> M7["M7 Hardening"]
     M6 --> M7
+    M5 --> M8["M8 Cluster binary"]
+    M6 --> M8
+    M8 -. "packaging (M7-09)" .-> M7
 ```
 
 **Critical path.** Counted in PRs, the longest chain runs through the storage engine and the first object operations (M1-01 to M1-04, M1-09, M1-13), then replication (M2-03, M2-07, M2-10 to M2-12, M2-14, M2-15), then replacement, rebalancing, and heal tests (M3-05, M3-06, M3-08). The large-object and peer chain (M1-12, M1-16b, M4-02, M4-03, M4-09, M6-06 to M6-09) is nearly as long, so it should run beside M2 rather than after M3. The protocol model (M2-01) must merge before M2-07, so it starts during M1.
@@ -118,7 +123,7 @@ crates/
   skys3-cluster-sim/    cluster simulation harness: real nodes, faults, workload (§16.1)
 spec/                   protocol model
 deploy/                 Prometheus alerting rules and Grafana dashboard (M7-04)
-tests/                  SDK matrix, s3-tests subset, provider and fault-injection tests
+tests/                  SDK matrix, s3-tests subset, end-to-end suite (tests/e2e), provider and fault-injection tests
 bench/                  performance suite (§16.3)
 ```
 
@@ -134,6 +139,8 @@ bench/                  performance suite (§16.3)
 | Protocol model check | M2-01 | Changes under `spec/`, and nightly |
 | etcd integration | M2-05 | Every push and PR |
 | SDK matrix | M1-25 | PRs that touch the gateway or identity, and nightly |
+| End-to-end suite: the binary against MinIO, an OIDC issuer, the AWS CLI, and a peer cluster; multi-node scenarios join as M8 wires them | M8-01 | Every push and PR, in 15 minutes or less |
+| Multi-node kill, partition, and peering suite against the binary | M8-08 | Nightly |
 | Remote providers (AWS S3 and a second provider) | M1-26 | Nightly, with credentials held as CI secrets |
 | Crash consistency: power loss at every sync boundary, and `kill -9` loops against the binary | M1-14 | Every push and PR with fixed seeds and a few kills; nightly with random seeds and many kills |
 | Control-store conformance against AWS S3 and R2 | M2-06 | Nightly, when their credentials are set as CI secrets |
@@ -1021,12 +1028,115 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 #### M7-09 Packaging and release
 
-**Design:** §2.3 · **After:** M7-01 to M7-08 · **Size:** S
+**Design:** §2.3 · **After:** M7-01 to M7-08, M8 exit · **Size:** S
 
 - x86-64 and AArch64 builds, a container image, the configuration reference, and upgrade rules for the format versions of log records, the index, snapshots, codec IDs, and the peer protocol.
 - **Done when:** a release candidate installs from the published artifacts, and an upgrade test from the previous build passes.
 
 **M7 exit.** Published compatibility matrix: M7-01 and M7-02. §16.3 targets met or the design revised: M7-06.
+
+## M8 Cluster binary
+
+This section is unnumbered so that sections 14 and 15, which other documents cite, keep their numbers.
+
+**Design scope:** the cluster the simulation runs, in the node binary: control stores other than `file`, the intra-cluster transport and node registration, replicated shards and routing, the coordinator, handoff and member lifecycle, and erasure coding. Today the binary refuses every control store but `file` and serves each shard alone (`LocalShards`); `ReplicatedShards`, the handoff driver, and register following live only in `skys3-cluster-sim`. An end-to-end suite runs the binary on every PR from the first M8 PR on, and each later PR adds its scenarios to it.
+
+**Gates.** Each part arrives behind a configuration flag that defaults to off, by the rule in section 1.1: `[cluster] multi_node = false` from M8-04, `[cluster] coordinator = false` from M8-06, and `[ec] enabled = false` from M8-07a. M8-09 removes them.
+
+**Time budget.** The PR suite takes 15 minutes or less: M8-01's single-node suite, then a 3-node CRUD, failover, and handoff run, a 4-node EC run, and 1+1-node peering, each added as its wiring lands. M8-08, larger peer clusters, random kill seeds, and the provider matrix run nightly.
+
+**Order.** M8-01, M8-02, and M8-05a are disjoint from the rest and start at once, beside M7-07 and M5-07, with M5-12 after them. Then M8-03, M8-04, M8-05b, and M8-06 in sequence. After M8-06, M8-07a and M8-08 run in parallel, then M8-07b and M8-09.
+
+#### M8-01 End-to-end harness and single-node suite
+
+**Design:** §16.2, §17 · **After:** M1-25 · **Size:** S
+
+- `tests/e2e/`: a runner (`run.sh`), the PKI (`pki.sh`), a static OIDC issuer (`oidc.py`), and one script per scenario (`scenarios/*.sh`), and CI's `e2e` job, in the needs of `ci-passed`. One build with the `e2e` profile (a debug build without debug info) and rust-cache. MinIO, and etcd once a scenario uses it, run beside the binary.
+- The PKI is generated with openssl in the job: a CA and node certificates with `spiffe://<cluster>/node/<id>` URI SANs, a second cluster's CA for peering, an etcd server and client pair, and an issuer certificate whose CA is added to the system trust store.
+- `skys3 control identity put`, which loads OIDC providers and roles into any control store, so that neither the suite nor operators write identity registers by hand.
+- Single-node scenarios with the AWS CLI: put, get, and head; ListObjectsV2 with continuation; multipart with 8 MiB parts; copy, tagging, and DeleteObjects; flush to MinIO, checking `x-amz-meta-skys3-wid`; a fill of an object written to MinIO out of band; import of 1,000 pre-seeded keys; the reconciliation scan (M7-07); STS `AssumeRoleWithWebIdentity` against a static issuer; two single-node clusters peered over QUIC, then UDP 7443 dropped with iptables so that `skys3_flush_transport{transport="s3"}` reads 1, and QUIC back within 60 s; and `/metrics`, `/v1/health`, and `/v1/buckets`.
+- **Done when:** the job takes 15 minutes or less, uploads logs and data directories when it fails, is in the needs of `ci-passed`, and fails with a seeded fault (flusher off).
+
+#### M8-02 Refused-flush metric and alert
+
+**Design:** §7.6, §7.8, §13 · **After:** M6-07 · **Size:** S
+
+- Source side: the flusher sorts `401` and `403` answers (AccessDenied, InvalidAccessKeyId, SignatureDoesNotMatch) into `skys3_flush_refusals_total{bucket,code}` and the gauge `skys3_flush_refused_keys{bucket}`. They are still retried with backoff, and the admin bucket status names the last refusal.
+- Destination side: `skys3_peer_s3_refusals_total{peer,reason}` in `skys3-gateway/src/peer_s3.rs`, for a `peer_source` mismatch, a foreign bucket pair, and unsigned `x-skys3-*` headers.
+- The alert `SkyS3FlushRefused` (refused keys above 0 for 10 minutes), a runbook section, and rows in the metrics reference.
+- **Done when:** an e2e destination bucket without `peer_source` stalls the flush, both counters rise, a `promtool test rules` case fires the alert, and fixing the configuration drains the keys.
+
+#### M8-03 Control stores in the binary
+
+**Design:** §6.1, §6.2, §12 · **After:** M8-01 · **Size:** M
+
+- A backend enum replaces `NodeStore<FileControlStore>`. `open_control` runs the startup probe and keeps the local copies.
+- Security findings: **T3**, `[control_store] etcd_tls_ca_file`, `etcd_tls_cert_file`, and `etcd_tls_key_file` build `EtcdStoreConfig::tls`, and `http://` is refused except on loopback; **T4**, a `MAX_REGISTER_BYTES` bound; **T8**, a versioning warning and gauge; **K1**, a failed file store is reopened.
+- Until M8-05b, a node refuses to start if `nodes/` holds another node's registration.
+- **Done when:** the single-node suite passes on etcd over mutual TLS and on MinIO as an S3 control store, and the refusal is tested.
+
+#### M8-04 Transport and node registration in the binary
+
+**Design:** §6.7, §12 · **After:** M8-03 · **Size:** M
+
+- At startup: the `skys3-net` listener, with the new keys `[transport] advertise` and `[node] zone` and `rack`; `register`, the `Heartbeater`, and the `ControlHints` receiver.
+- **T7:** a cap on in-flight handshakes for the transport, QUIC, and the gateway.
+- Cluster services move into `crates/skys3/src/cluster/`, one file per service.
+- **Done when:** 3 nodes register and heartbeat; a node with a foreign CA, or with another cluster's SPIFFE ID, is refused; and a handshake flood stays within its memory bound.
+
+#### M8-05a Replicated shards as library code
+
+**Design:** §5, §6.3–§6.6 · **After:** M2-17 · **Size:** M
+
+- `ReplicatedShards`, the handoff driver, and register following move from `skys3-cluster-sim` into a `cluster` module of `skys3-shard`, generic over disk and network, and the simulation uses them from there.
+- **Done when:** the fixed-seed simulation set passes unchanged.
+
+#### M8-05b Replication and routing in the binary
+
+**Design:** §5, §6.2–§6.6, §7.1, §9 · **After:** M8-04, M8-05a · **Size:** L
+
+- CreateBucket goes through `skys3_coord::create_bucket`. The gateway uses `RoutedShards` and `serve_peers`, with leases, member removal, takeover, backfill, and holder fetch.
+- Flush, import, lifecycle, snapshots, and the reconciliation scan run on primaries only. The admin API gains `GET /v1/shards`.
+- **Done when:** on a 3-node e2e cluster, writes and reads work through any node; after `kill -9` of a shard's primary, writes resume within 10 s; every acknowledged key reads back and is flushed exactly once; and the restarted node rejoins as a learner.
+
+#### M8-06 Coordinator, handoff, and member lifecycle in the binary
+
+**Design:** §6.7 · **After:** M8-05b · **Size:** M
+
+- The `Elector`, the `Coordinator`, and the `Pusher`. The admin API gains `GET /v1/cluster`, `POST /v1/shards/<bucket>/<n>/handoff`, and `POST /v1/nodes/<id>/drain`.
+- **T6:** a `Handoff` is accepted only from the holder of the coordinator lease or from an `admin` certificate.
+- **Done when:** an e2e handoff moves a primary with no client errors beyond SDK retries, a 4th node joins and receives shards, and killing the coordinator delays only placement.
+
+#### M8-07a Erasure coding in the binary: encoding and coded reads
+
+**Design:** §8.2–§8.5 · **After:** M5-07, M8-06 · **Size:** M
+
+- The fragment store, the fragment server, an encoder per primary of `local` buckets, coded read plans, and the orphan reclaimer.
+- **Done when:** on 4 nodes with `min_eligible_nodes = 3`, `parity_fragments = 1`, and `ec_after_seconds = 0`, a 16 MiB object is coded and the members drop their replicas, and with one holder killed, GET returns the same SHA-256.
+
+#### M8-07b Repair and fragment moves in the binary
+
+**Design:** §8.3, §8.6 · **After:** M8-07a, M5-12 · **Size:** S
+
+- The repairer, under `repair_bytes_per_second_per_node`, and fragment moves when a node is drained.
+- **Done when:** after a holder is lost for good, its stripes are rebuilt on the survivors, the repair counters rise, and `SkyS3FragmentsUnrepaired` clears.
+
+#### M8-08 Multi-node kill, partition, and peering suite
+
+**Design:** §16.1, §17 · **After:** M8-06 · **Size:** M
+
+- Covers M2-20 and the real-binary part of M3-08: a 5-node cluster with a 3-member etcd, and a 3-node peer cluster.
+- Faults: `tc netem` delay and loss, iptables partitions of a primary, kill loops, rack loss with `failure_domain = "rack"`, coordinator loss in the middle of a change, and the loss of an etcd member.
+- **Done when:** no acknowledged write is lost on 7 nights in a row, and failover-time distributions are reported.
+
+#### M8-09 Enable the cluster by default
+
+**Design:** §12, §14 · **After:** M8-07b, M8-08 · **Size:** S
+
+- Remove the gating flags, update the configuration reference, re-review the "Not applicable yet" rows of the security review, and run on the binary the runbook drills it cannot run today.
+- **Done when:** T3, T6, and T7 are closed, and those security-review rows are updated.
+
+**M8 exit.** The binary runs the cluster by default: control stores, transport, replication, the coordinator, and erasure coding are wired in and pass the end-to-end suite on every PR (M8-01 to M8-07b), the nightly kill, partition, and peering suite loses no acknowledged write (M8-08), and the gates are gone (M8-09).
 
 ## 14. Design gaps assigned to PRs
 
@@ -1050,6 +1160,13 @@ The design leaves these points open. Each named PR decides the point and records
 | The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07: the reserved key `.skys3/peer-descriptor` of the receiving bucket, through the target's own S3 endpoint; signed by the destination node's `[transport]` key, with its chain, for an hour; verified against the named peer's trust bundle |
 | How a destination accepts a peer's write identity over S3 REST, which a SkyS3 gateway refuses from clients (§7.2, §7.8) | M6-07: requests signed with an access key listed in the peer's `s3_access_key_ids` may carry identities of that peer's bucket pairs |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
+| Gating the cluster: a `[cluster] multi_node` flag, or inferred from `[transport]`. `file` is never allowed with more than one node. | M8-03, M8-04 |
+| New keys: `[transport] advertise`, `[node] zone` and `rack`, and the key that caps in-flight handshakes | M8-04 |
+| How operators manage the identity registers: a CLI or the admin API, and how they authenticate | M8-01: `skys3 control identity put` and `delete`, which reach the control store with the nodes' configuration and credentials, so the store's own access control is the only gate; no admin API route (design §11) |
+| `replicas` above the node count, and migrating `LocalShards` data directories | M8-05b |
+| Who may trigger a handoff or a drain: any node or only the coordinator, a token or an `admin` certificate (T1, T6), and the admin cluster API | M8-06 |
+| Where the fragment store lives: `[node] disks` or `[ec] fragment_disks` | M8-07a |
+| A `401` or `403` from a target: does it only stall flushing, retried, or hold the key as a conflict? | M8-02 |
 
 ## 15. Open questions from design section 19
 

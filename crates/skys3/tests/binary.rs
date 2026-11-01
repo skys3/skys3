@@ -245,3 +245,109 @@ async fn the_command_line_rebuilds_a_lost_control_store() {
     s3.create_bucket().bucket("more").send().await.unwrap();
     assert!(node.terminate().await.success());
 }
+
+/// `skys3 control identity put` and `delete` against the file control
+/// store: refused before the node's first start and while it runs, and
+/// otherwise written so that the node starts from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_command_line_manages_identity_registers() {
+    use std::ffi::OsStr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("node.log");
+    let config = configure(dir.path());
+    let file = dir.path().join("identity.json");
+    let identity = serde_json::json!({
+        "providers": {"ci": {"issuer": "https://token.example", "audiences": ["sts"]}},
+        "roles": {"builder": {
+            "trust_policy": {
+                "Version": "2012-10-17",
+                "Statement": {
+                    "Effect": "Allow",
+                    "Principal": {"Federated": "https://token.example"},
+                    "Action": "sts:AssumeRoleWithWebIdentity"
+                }
+            },
+            "policies": [{
+                "Version": "2012-10-17",
+                "Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}
+            }]
+        }}
+    });
+    std::fs::write(&file, identity.to_string()).unwrap();
+    // `skys3 control identity <command> --config <config> <args>`.
+    let identity_command = |command: &str, args: &[&OsStr]| {
+        Command::new(BINARY)
+            .args(["control", "identity", command, "--config"])
+            .arg(&config)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let put = || identity_command("put", &[OsStr::new("--file"), file.as_os_str()]);
+    let delete = |names: &[&str]| {
+        let names: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
+        identity_command("delete", &names)
+    };
+    let stdout =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // Before the first start there is no store to write into.
+    let output = put();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        stderr(&output).contains("start the node once"),
+        "{output:?}"
+    );
+
+    // The running node holds the store.
+    let node = Process::start(&config, &log).await;
+    let output = put();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr(&output).contains("in use"), "{output:?}");
+    assert!(node.terminate().await.success());
+
+    let output = put();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        stdout(&output),
+        "created: identity/providers/ci.json\ncreated: identity/roles/builder.json\n\
+         announced at generation 2; nodes follow it on their next sync\n"
+    );
+    assert!(
+        dir.path()
+            .join("data/control/identity/roles/builder.json")
+            .is_file()
+    );
+    // A rerun changes nothing, and announces the registers again, in case
+    // the first run's announcement had failed.
+    let output = put();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        stdout(&output),
+        "unchanged: identity/providers/ci.json\nunchanged: identity/roles/builder.json\n\
+         announced at generation 3; nodes follow it on their next sync\n"
+    );
+
+    // An invalid file is a usage error, and writes nothing.
+    std::fs::write(&file, r#"{"roles": {".bad": {"trust_policy": {}}}}"#).unwrap();
+    let output = put();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(stderr(&output).contains("role \".bad\""), "{output:?}");
+
+    let output = delete(&["--role", "builder", "--provider", "gone"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        stdout(&output),
+        "absent: identity/providers/gone.json\ndeleted: identity/roles/builder.json\n\
+         announced at generation 4; nodes follow it on their next sync\n"
+    );
+    let output = delete(&["--role", "a/../b"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+
+    // The node starts from the store the command wrote.
+    let node = Process::start(&config, &log).await;
+    assert!(node.terminate().await.success());
+}

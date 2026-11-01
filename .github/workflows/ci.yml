@@ -422,6 +422,87 @@ jobs:
         env:
           SKYS3_SDK_CLIENTS: python go javascript java cli s3-tests
 
+  # The end-to-end suite (plan M8-01, design sections 16.2 and 17): the
+  # node binary, built once with the `e2e` profile, against MinIO, a static
+  # OIDC issuer, and the runner's AWS CLI, and two clusters peered over QUIC
+  # and S3 REST (tests/e2e/run.sh). MinIO no longer publishes binaries, so
+  # tests/e2e/minio.sh builds it from source while the node compiles, once
+  # per version: the cache keeps it. The suite's CA goes into the system
+  # trust store, which the node's OIDC fetcher reads, and the peering
+  # scenario drops UDP with iptables through sudo. When the suite fails,
+  # its directory (logs, configurations, and data directories) is
+  # uploaded.
+  e2e:
+    name: End-to-end suite
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # Saved even when the suite fails, so the next run builds only the
+      # workspace.
+      - name: Cache the build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+          cache-on-failure: true
+
+      - name: Find the MinIO version
+        id: minio
+        run: echo "version=$(sed -n 's/^MINIO_VERSION=//p' tests/e2e/minio.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore MinIO
+        id: minio-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/skys3-e2e
+          key: e2e-minio-${{ steps.minio.outputs.version }}
+
+      - name: Build the node binary and MinIO
+        run: |
+          bash tests/e2e/minio.sh >"$RUNNER_TEMP/minio-path" &
+          minio=$!
+          cargo build --profile e2e -p skys3
+          wait "$minio"
+          echo "SKYS3_E2E_MINIO=$(cat "$RUNNER_TEMP/minio-path")" >> "$GITHUB_ENV"
+
+      - name: Save MinIO
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/skys3-e2e
+          key: e2e-minio-${{ steps.minio.outputs.version }}
+
+      - name: Make the PKI and trust its CA
+        run: |
+          bash tests/e2e/pki.sh "$RUNNER_TEMP/pki"
+          sudo cp "$RUNNER_TEMP/pki/e2e-ca.pem" /usr/local/share/ca-certificates/skys3-e2e.crt
+          sudo update-ca-certificates
+          aws --version
+
+      - name: Run the suite
+        run: tests/e2e/run.sh
+        env:
+          SKYS3_E2E_BINARY: target/e2e/skys3
+          SKYS3_E2E_PKI: ${{ runner.temp }}/pki
+          SKYS3_E2E_SYSTEM_TRUST: 1
+
+      - name: Upload the suite's directory
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-run
+          path: target/e2e-run/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Model-checks the shard protocol (spec/ShardProtocol.tla) with TLC at the
   # PR bounds, and checks that every seeded bug is still caught, so the
   # model cannot silently lose its teeth. spec/check.sh downloads the pinned
@@ -450,7 +531,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, simulation, etcd, fuzz, sdk, model]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation, etcd, fuzz, sdk, e2e, model]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
