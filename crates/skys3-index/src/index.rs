@@ -731,6 +731,11 @@ impl Index {
     /// whose epoch the replica has reached since is settled, so it is
     /// ignored rather than removed.
     ///
+    /// A record of a newer epoch stays: proposals only move to newer
+    /// epochs, so `config` is then a stopped replica's proposal whose
+    /// record committed late, after the replica the node opened in its
+    /// place recorded its own (§6.7).
+    ///
     /// # Errors
     ///
     /// Returns an [`IndexError`] if encoding or redb fails; nothing changes
@@ -738,25 +743,45 @@ impl Index {
     pub fn store_takeover(&self, config: &ShardConfig) -> Result<(), IndexError> {
         let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
         let value = codec::encode_route(config).map_err(IndexError::codec("takeovers"))?;
+        let key = codec::shard_key(&shard);
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
-        txn.open_table(tables::TAKEOVERS)?
-            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        {
+            let mut table = txn.open_table(tables::TAKEOVERS)?;
+            let newer = table.get(key.as_slice())?.is_some_and(|held| {
+                codec::decode_route(held.value()).is_ok_and(|held| held.epoch > config.epoch)
+            });
+            if !newer {
+                table.insert(key.as_slice(), value.as_slice())?;
+            }
+        }
         txn.commit()?;
         Ok(())
     }
 
-    /// Removes the takeover this node's replica of `shard` recorded, in one
-    /// durable commit, once it learned that the proposal lost.
+    /// Removes `proposed`, the takeover this node's replica of its shard
+    /// recorded, in one durable commit, once it learned that the proposal
+    /// lost. Another record stays: it is a later proposal, of the replica
+    /// the node opened in a stopped one's place (§6.7), which a stopped
+    /// replica's late removal must not take with it.
     ///
     /// # Errors
     ///
     /// Returns an [`IndexError`] if redb fails; nothing changes then.
-    pub fn forget_takeover(&self, shard: &ShardRef) -> Result<(), IndexError> {
+    pub fn forget_takeover(&self, proposed: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(proposed.bucket_id.clone(), proposed.shard);
+        let key = codec::shard_key(&shard);
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
-        txn.open_table(tables::TAKEOVERS)?
-            .remove(codec::shard_key(shard).as_slice())?;
+        {
+            let mut table = txn.open_table(tables::TAKEOVERS)?;
+            let held = table.get(key.as_slice())?.is_some_and(|held| {
+                codec::decode_route(held.value()).is_ok_and(|held| held == *proposed)
+            });
+            if held {
+                table.remove(key.as_slice())?;
+            }
+        }
         txn.commit()?;
         Ok(())
     }

@@ -4,20 +4,27 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use skys3_control::{
-    Expected, MemoryControlStore, ProposalIds, RetryPolicy, TypedKey, propose_document,
+    ControlError, Expected, MemoryControlStore, ProposalIds, RetryPolicy, TypedKey,
+    propose_document,
 };
 use skys3_io::SimMount;
+use skys3_log::ShardRef;
 use skys3_net::TokioNetwork;
 use skys3_types::{Epoch, NodeId, ProposalId, ShardConfig};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::removal::{Proxy, initial, ms, put, register, timing, until};
 use super::{Pki, WAIT, node, shard_set};
 use crate::error::ShardError;
+use crate::replication::removal::Removal;
+use crate::replication::takeover::Candidate;
 use crate::replication::{
-    ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters as _,
+    BoxFuture, ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters,
 };
 use crate::shard::{Role, Shard};
 
@@ -335,4 +342,201 @@ async fn removed_while_up() {
     // The others go on.
     primary.commit(put("c", 10)).await.unwrap();
     assert_eq!(nodes[1].shard.role(), Role::Member);
+}
+
+#[test]
+fn a_member_readmitted_and_removed_again_stops_once_its_grace_passes() {
+    run(readmitted_and_removed_again());
+}
+
+/// Node 3 is removed and added back as a learner in one change while it
+/// is up, as a coordinator's rebalancing does, before its grace passes:
+/// its replica stops and opens again as a learner, which the primary
+/// promotes. Removed again while up, the new replica stops once its grace
+/// passes, as the first would have: the watch over the primary follows
+/// the replica the node holds now, not the one it watched before, whose
+/// grace the new replica kept renewing (found by the kill, partition, and
+/// peering suite, plan M8-08).
+async fn readmitted_and_removed_again() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    // Node 3's grace outlasts its readmission by far.
+    let grace = ms(2000);
+    let timing = |n: u8| {
+        let timing = patient(n);
+        if n == 3 {
+            ReplicationConfig {
+                primary_grace: grace,
+                ..timing
+            }
+        } else {
+            timing
+        }
+    };
+    let nodes = cluster(&pki, 3, &initial(), &store, timing).await;
+    let primary = &nodes[0].shard;
+    until(|| primary.is_serving() && primary.leader().unwrap().holds_leases()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let readmitted = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1), node(2)],
+        learners: vec![node(3)],
+        proposal_id: ProposalId::new("readmit-3").unwrap(),
+        ..initial()
+    };
+    assert_eq!(
+        registers.replace(&initial(), &readmitted).await.unwrap(),
+        Replaced::Accepted
+    );
+    let learner = nodes[2].replication.open(&readmitted).await.unwrap();
+    assert_eq!(learner.role(), Role::Learner);
+    assert!(nodes[2].shard.is_stopped());
+    nodes[0].replication.open(&readmitted).await.unwrap();
+    // The primary promotes the learner.
+    until(|| learner.role() == Role::Member && learner.config().members.len() == 3).await;
+    let promoted = learner.config();
+    assert_eq!(register(&store).await, promoted);
+
+    let removed = ShardConfig {
+        epoch: promoted.epoch.checked_next().unwrap(),
+        members: vec![node(1), node(2)],
+        proposal_id: ProposalId::new("remove-3").unwrap(),
+        ..promoted.clone()
+    };
+    assert_eq!(
+        registers.replace(&promoted, &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    nodes[0].replication.open(&removed).await.unwrap();
+    primary.commit(put("b", 10)).await.unwrap();
+    let started = Instant::now();
+    until(|| learner.is_stopped()).await;
+    assert!(started.elapsed() < grace * 3, "{:?}", started.elapsed());
+    assert_eq!(learner.config(), removed);
+    primary.commit(put("c", 10)).await.unwrap();
+}
+
+/// Shard registers whose replaces wait until the test opens a gate.
+struct Gated {
+    registers: ControlRegisters<MemoryControlStore>,
+    open: watch::Receiver<bool>,
+    waiting: Arc<AtomicBool>,
+}
+
+impl ShardRegisters for Gated {
+    fn replace<'a>(
+        &'a self,
+        current: &'a ShardConfig,
+        next: &'a ShardConfig,
+    ) -> BoxFuture<'a, Result<Replaced, ControlError>> {
+        Box::pin(async move {
+            self.waiting.store(true, Ordering::SeqCst);
+            let mut open = self.open.clone();
+            let _ = open.wait_for(|open| *open).await;
+            self.registers.replace(current, next).await
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
+        self.registers.read(shard)
+    }
+}
+
+#[test]
+fn a_superseded_watch_leaves_the_grace_to_the_replica_in_its_place() {
+    run(superseded_watch());
+}
+
+/// A watch over node 3's replica proposes itself, and its proposal is
+/// slow to reach the register. Meanwhile node 3 is re-admitted as a
+/// learner, which replaces its replica, and promoted; the new replica's
+/// own watch stops granting to propose itself (R1). The old proposal then
+/// loses to a configuration naming node 3, which the old replica, stopped,
+/// cannot adopt: the old watch must not resume the grace, which is the
+/// shard's, while the new watch's proposal may land, or node 3 would grant
+/// the old primary a lease past it.
+async fn superseded_watch() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    // No watch of node 3's own proposes during the test.
+    let timing = |n: u8| {
+        let timing = patient(n);
+        if n == 3 {
+            ReplicationConfig {
+                primary_grace: WAIT,
+                ..timing
+            }
+        } else {
+            timing
+        }
+    };
+    let nodes = cluster(&pki, 3, &initial(), &store, timing).await;
+    let primary = &nodes[0].shard;
+    until(|| primary.is_serving() && primary.leader().unwrap().holds_leases()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+    let replication = &nodes[2].replication;
+    let old = nodes[2].shard.clone();
+    let grace = replication.grace(old.shard()).unwrap();
+
+    // The old watch stops granting and proposes; the register does not
+    // answer yet.
+    let (gate, open) = watch::channel(false);
+    let waiting = Arc::new(AtomicBool::new(false));
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let superseded = Candidate {
+        replication: replication.clone(),
+        shard: old.clone(),
+        grace: Arc::clone(&grace),
+        removal: Arc::new(Removal {
+            registers: Box::new(Gated {
+                registers: registers.clone(),
+                open,
+                waiting: Arc::clone(&waiting),
+            }),
+            ids: Mutex::new(ProposalIds::seeded(99)),
+        }),
+    };
+    let proposal = ShardConfig {
+        epoch: Epoch::new(2),
+        primary: node(3),
+        members: vec![node(2), node(3)],
+        proposal_id: ProposalId::new("takeover-3").unwrap(),
+        ..initial()
+    };
+    grace.stop_over(Epoch::new(1));
+    let proposing = tokio::spawn(async move {
+        superseded.send(&initial(), &proposal).await;
+    });
+    until(|| waiting.load(Ordering::SeqCst)).await;
+
+    // Re-admitted and promoted meanwhile.
+    let readmitted = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1), node(2)],
+        learners: vec![node(3)],
+        proposal_id: ProposalId::new("readmit-3").unwrap(),
+        ..initial()
+    };
+    assert_eq!(
+        registers.replace(&initial(), &readmitted).await.unwrap(),
+        Replaced::Accepted
+    );
+    let replica = replication.open(&readmitted).await.unwrap();
+    assert!(old.is_stopped());
+    nodes[0].replication.open(&readmitted).await.unwrap();
+    until(|| replica.role() == Role::Member && replica.config().members.len() == 3).await;
+    // The new replica's watch stops granting to propose itself.
+    let promoted = replica.config();
+    grace.stop_over(promoted.epoch);
+
+    // The old proposal loses to the promotion.
+    gate.send_replace(true);
+    proposing.await.unwrap();
+    assert_eq!(register(&store).await, promoted);
+    assert!(grace.is_stopped());
 }

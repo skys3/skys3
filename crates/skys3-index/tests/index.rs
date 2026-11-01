@@ -474,7 +474,7 @@ fn takeovers_are_durable_at_once_and_go_with_their_shard() {
     index.store_takeover(&route(0, 4)).unwrap();
     index.store_takeover(&route(1, 2)).unwrap();
     index.store_takeover(&route(2, 2)).unwrap();
-    index.forget_takeover(&shard(2)).unwrap();
+    index.forget_takeover(&route(2, 2)).unwrap();
     disk.crash();
     drop(index);
 
@@ -486,6 +486,34 @@ fn takeovers_are_durable_at_once_and_go_with_their_shard() {
     drop(read);
     index.remove_shard(&shard(1)).unwrap();
     assert_eq!(index.read().unwrap().takeover(&shard(1)).unwrap(), None);
+}
+
+#[test]
+fn a_late_takeover_record_of_a_stopped_replica_leaves_a_newer_one() {
+    let disk = SimDisk::new(4);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    // A replica the node opened in a stopped one's place recorded its
+    // proposal; the stopped one's record and removal commit after it.
+    index.store_takeover(&route(0, 7)).unwrap();
+    index.store_takeover(&route(0, 3)).unwrap();
+    index.forget_takeover(&route(0, 3)).unwrap();
+    assert_eq!(
+        index.read().unwrap().takeover(&shard(0)).unwrap(),
+        Some(route(0, 7))
+    );
+    // Its own proposal, the same one sent again, and its removal.
+    index.store_takeover(&route(0, 7)).unwrap();
+    let other = ShardConfig {
+        proposal_id: ProposalId::new("q").unwrap(),
+        ..route(0, 7)
+    };
+    index.forget_takeover(&other).unwrap();
+    assert_eq!(
+        index.read().unwrap().takeover(&shard(0)).unwrap(),
+        Some(route(0, 7))
+    );
+    index.forget_takeover(&route(0, 7)).unwrap();
+    assert_eq!(index.read().unwrap().takeover(&shard(0)).unwrap(), None);
 }
 
 /// An applier that keeps the configuration of every `CONFIG` record, as

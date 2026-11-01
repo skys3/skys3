@@ -58,7 +58,7 @@ pub(super) struct Candidate<N: Network, D: Disk> {
 }
 
 /// How a proposal ended.
-enum Proposed {
+pub(super) enum Proposed {
     /// The member took over, or can no longer: the watch ends.
     Done,
     /// The member follows another configuration: it watches again.
@@ -79,7 +79,9 @@ impl<N: Network, D: Disk> Candidate<N, D> {
         let mut again = false;
         if let Some(proposed) = self.shard.outstanding_takeover() {
             let over = self.shard.config();
-            self.grace.stop_over(over.epoch);
+            if self.on_grace(|grace| grace.stop_over(over.epoch)).is_none() {
+                return;
+            }
             tracing::info!(shard = %self.shard.shard(), epoch = %proposed.epoch,
                 "sending a recorded takeover again");
             match self.send(&over, &proposed).await {
@@ -103,7 +105,10 @@ impl<N: Network, D: Disk> Candidate<N, D> {
                     tokio::time::sleep(self.delay()).await;
                 }
                 // A grant in between means the primary is back.
-                if !self.is_member() || !self.grace.stop_if_passed(self.shard.config().epoch) {
+                let epoch = self.shard.config().epoch;
+                if !self.is_member()
+                    || self.on_grace(|grace| grace.stop_if_passed(epoch)) != Some(true)
+                {
                     continue;
                 }
             }
@@ -157,7 +162,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
             return Proposed::Done;
         };
         if over.primary == *node || !over.is_member(node) {
-            self.grace.resume();
+            self.resume();
             return Proposed::Done;
         }
         let next = ShardConfig {
@@ -176,7 +181,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
         tracing::info!(%shard, %epoch, old = %over.primary, "proposing a takeover");
         if let Err(error) = self.shard.record_takeover(&next).await {
             tracing::warn!(%shard, %error, "cannot record a takeover; not proposing it");
-            self.grace.resume();
+            self.resume();
             return Proposed::Lost;
         }
         self.send(&over, &next).await
@@ -184,7 +189,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
 
     /// Sends `next`, a proposal over `over`, until the register answers,
     /// and acts on the outcome. A proposal that lost is forgotten.
-    async fn send(&self, over: &ShardConfig, next: &ShardConfig) -> Proposed {
+    pub(super) async fn send(&self, over: &ShardConfig, next: &ShardConfig) -> Proposed {
         let inner = &self.replication.inner;
         let shard = self.shard.shard();
         loop {
@@ -193,7 +198,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
             // grace passes again (R1).
             if self.shard.config() != *over
                 || !self.is_member()
-                || !self.grace.propose_over(over.epoch)
+                || self.on_grace(|grace| grace.propose_over(over.epoch)) != Some(true)
             {
                 return Proposed::Lost;
             }
@@ -220,7 +225,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
                 Ok(Replaced::Holds(held)) => {
                     tracing::warn!(%shard, ?held, "the shard's register is not newer");
                     if self.shard.forget_takeover().await {
-                        self.grace.resume();
+                        self.resume();
                     }
                     return Proposed::Lost;
                 }
@@ -258,7 +263,26 @@ impl<N: Network, D: Disk> Candidate<N, D> {
             return Proposed::Again;
         }
         tracing::info!(%shard, epoch = %held.epoch, primary = %held.primary, "a takeover lost");
-        self.grace.resume();
+        self.resume();
         Proposed::Lost
+    }
+
+    /// Acts on the shard's grace through `act` while this watch's replica
+    /// runs ([`Shard::while_running`]), and returns what `act` returned, or
+    /// `None` once the replica stopped. The grace is the shard's: a replica
+    /// the node opened in this one's place, as a learner it was re-admitted
+    /// as (§6.7), shares it, and once a member has a watch of its own,
+    /// which may stop granting to propose itself (R1). This watch, left
+    /// waiting on its own proposal meanwhile, must not resume the grace
+    /// then: the new replica would grant the old primary a lease while its
+    /// own proposal may land.
+    fn on_grace<T>(&self, act: impl FnOnce(&Grace) -> T) -> Option<T> {
+        self.shard.while_running(|| act(&self.grace))
+    }
+
+    /// Grants again after a proposal lost ([`Grace::resume`]), while the
+    /// replica runs.
+    fn resume(&self) {
+        self.on_grace(Grace::resume);
     }
 }
