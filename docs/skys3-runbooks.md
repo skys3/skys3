@@ -57,6 +57,7 @@ exist.
   - [Control store loss](#control-store-loss)
   - [etcd majority loss](#etcd-majority-loss)
 - [7. Drills](#7-drills)
+  - [The nightly kill, partition, and peering suite](#the-nightly-kill-partition-and-peering-suite)
 - [8. Open points](#8-open-points)
 
 ## 1. Using these runbooks
@@ -1685,6 +1686,68 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Identity staleness](#identity-staleness) | `runbooks::drill_control_store_outage`; `sts::a_stale_identity_copy_stops_new_sessions_only` | `skys3_identity_synced_timestamp_seconds` stops during the outage and advances after a restart with the store answering; a stale copy refuses new sessions and keeps issued ones. | The drill cannot age a copy past `identity_max_staleness` (an hour at least) on the binary; the STS test does it on a simulated clock. |
 | [Control store loss](#control-store-loss) | `runbooks::drill_control_store_loss`; `simulation::rebuild::a_lost_control_store_is_rebuilt_and_membership_changes_resume` | A node without its registers serves from its copy and logs `the control store looks reset`; an export refuses a running node; the export, the dry run, and the rebuild write the store at the next generation, and buckets and objects are all there. In a cluster, membership changes resume on the rebuilt store. | Nothing. |
 | [etcd majority loss](#etcd-majority-loss) | None | Not drilled: CI's etcd job and the end-to-end suite run a single member, so a majority cannot be lost and recovered. The SkyS3 side is the [Control store unreachable](#control-store-unreachable) and [Control store loss](#control-store-loss) drills. | Section 8. |
+
+### The nightly kill, partition, and peering suite
+
+`tests/e2e/chaos/run.sh` (plan M8-08) drills the replication and
+placement runbooks on the binary together: a five-node cluster `ka` in
+racks `ra`, `rb`, and `rc` (`failure_domain = "rack"`) over a
+three-member etcd, which bucket `peered` replicates to a three-node
+cluster `kb`, every process in a network namespace of its own on the
+bridge `skc0` (10.77.0.0/24). After n5 joins (with the coordinator killed
+while it moves shards onto it), a schedule drawn from a seed strikes, in
+rounds, each of: `kill-primary` (`SIGKILL` of a shard's primary),
+`kill-loop`, `partition` (iptables, of a shard's primary, from the other
+nodes only or from everything), `netem` (tc netem delay and loss on nodes
+or etcd members), `rack-loss` (killed or cut off), `coordinator-handoff`
+(the coordinator killed just after it was asked for a handoff), and
+`etcd-loss` (a member killed or cut off). After each fault every node
+must be back and every shard must have `replicas` members, all serving,
+and no learner, within 300 s, with no operator action. A client workload
+writes, overwrites, and deletes throughout and reads a third of its
+acknowledged writes back through another node at once.
+
+**Running it.** As root, with iproute2, iptables, and python3:
+`sudo tests/e2e/chaos/run.sh`. `SKYS3_CHAOS_MINUTES` sets how long faults
+are struck (30), `SKYS3_E2E_BINARY` a binary already built, and
+`SKYS3_CHAOS_DIR` where the run goes (`target/chaos-run`). A kernel
+without the netem qdisc (as in some containers) gets packet loss by
+iptables instead and no delay; CI requires netem
+(`SKYS3_CHAOS_NETEM=require`). `net.sh down` removes what a killed run
+left behind.
+
+**Reading a night.** The job summary and the `chaos-report` artifact hold
+`report.md` and `report.json`: the seed, each step with its target and how
+long the cluster took to heal, the writes, the reads after
+acknowledgment, the keys read back, the peering result, and failover
+times, from a primary's loss to the first acknowledged write on its
+shard, as percentiles per fault. For each partition it shows that the
+partition took: the packets its rules dropped (none fails the run),
+whether the clients still reached the node (they should in `cluster`
+mode, not in `full`), and how long the other nodes took to name another
+primary of its shard. A failed night also uploads `chaos-run`:
+every process's log under `logs/`, the data directories, and `ops.jsonl`,
+one line per write with its key, version, content hash, start and end
+times, answer, and node. A violation names the key, the node read
+through, what it held, and the write last acknowledged.
+
+**Replaying a night.** `sudo SKYS3_CHAOS_SEED=<seed>
+SKYS3_CHAOS_MINUTES=<minutes> tests/e2e/chaos/run.sh`, as the report
+prints it, or the Nightly workflow by hand with `suite: chaos` and the
+seed. The seed fixes the schedule (every fault, its target shard, node,
+rack, or member, and its durations) and each client thread's choices; the
+cluster's own timing is the machine's, so a replay strikes the same
+targets in the same order rather than repeating the night exactly.
+`python3 tests/e2e/chaos/chaos.py schedule --seed <seed>` prints the
+steps without running them.
+
+**Seven clean nights.** The M8 exit asks for 7 scheduled nights in a row
+without a failure of this job. Its last step,
+`tests/e2e/chaos/nights.sh`, lists the job's results in the scheduled runs
+of the Nightly workflow on the default branch and the current streak in
+the job summary; runs started by hand do not count. A failure resets the
+streak: the bug is fixed or recorded with its seed before the count
+starts again.
 
 ## 8. Open points
 
