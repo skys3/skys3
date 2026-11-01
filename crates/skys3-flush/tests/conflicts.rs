@@ -488,3 +488,33 @@ fn a_new_flusher_does_not_answer_a_dropped_version_flushed() {
         drop(flusher);
     });
 }
+
+/// A flusher started after a version was committed, as after a primary
+/// change, flushes the version itself and stops tracking its key while
+/// the `FLUSHED` rides the next group commit, up to a second later: a
+/// wait for the version that arrives meanwhile, while the index still
+/// shows it dirty, is answered `Flushed` at once.
+#[test]
+fn a_wait_while_the_flushed_is_on_its_way_is_answered_at_once() {
+    runtime().block_on(async {
+        // The index runs on this thread, so the paused clock advances only
+        // while the test sleeps, never ahead to the lazy commit.
+        let node = Node::open_inline(25).await;
+        let store = store(25, true);
+        let seq = node.put("k", "k ours").await;
+        let flusher = node.flusher(&target(&store, protected(), ConflictPolicy::Hold));
+        let patience = support::Patience::new();
+        while store.object("k").is_none() || flusher.phase("k").is_some() {
+            assert!(!patience.is_exhausted(), "k is not flushed");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(node.entry("k").await.unwrap().state, EntryState::Dirty);
+        let mut wait = node.shard.await_flush("k", at(seq)).unwrap();
+        let answer = tokio::time::timeout(Duration::from_millis(100), wait.answered()).await;
+        assert_eq!(answer, Ok(Some(FlushState::Flushed)));
+        // Answered before the index learned of the flush.
+        assert_eq!(node.entry("k").await.unwrap().state, EntryState::Dirty);
+        node.settle(&flusher).await;
+        assert_eq!(node.entry("k").await.unwrap().state, EntryState::Clean);
+    });
+}
