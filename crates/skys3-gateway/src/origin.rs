@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use skys3_log::record::Metadata;
 use skys3_types::{ETag, RemoteTarget};
 use tokio::time::Instant;
 
@@ -118,12 +119,16 @@ impl From<&OriginHead> for Seen {
 /// Which version of an object an origin holds. The ETag alone does not
 /// tell: a re-upload of the same bytes, or a copy onto itself that
 /// replaces the metadata, keeps it, but not the `Last-Modified`, nor on a
-/// versioned origin the version ID.
+/// versioned origin the version ID. `Last-Modified` has one-second
+/// resolution, and an origin may not send it, so the metadata the HEAD
+/// answered is part of the version too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OriginVersion {
     pub(crate) etag: ETag,
-    pub(crate) last_modified_ms: u64,
+    /// The `Last-Modified` the origin sent, if it sent one.
+    pub(crate) last_modified_ms: Option<u64>,
     pub(crate) version_id: Option<String>,
+    pub(crate) metadata: Metadata,
 }
 
 impl OriginVersion {
@@ -131,8 +136,9 @@ impl OriginVersion {
     pub(crate) fn of(object: &RemoteObject) -> Self {
         Self {
             etag: object.object.local_etag.clone(),
-            last_modified_ms: object.object.last_modified_ms,
+            last_modified_ms: object.last_modified_ms,
             version_id: object.version_id.clone(),
+            metadata: object.object.metadata.clone(),
         }
     }
 }
@@ -315,8 +321,9 @@ mod tests {
     fn etag(n: u8) -> OriginVersion {
         OriginVersion {
             etag: ETag::new(format!("{n:032x}")).unwrap(),
-            last_modified_ms: 0,
+            last_modified_ms: Some(0),
             version_id: None,
+            metadata: Metadata::new(),
         }
     }
 

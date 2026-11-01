@@ -35,6 +35,7 @@ use skys3_types::{
 use super::*;
 use crate::LocalShards;
 use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
+use crate::objects::write_through::reach_remote;
 use crate::shard::{ShardError, ShardRef, Shards};
 use crate::stub::{EntryState, MemoryShards};
 
@@ -688,6 +689,56 @@ async fn a_lost_answer_fails_a_write_and_moves_a_read_on() {
     let error = lost.unwrap_err();
     assert!(error.to_string().contains("may have applied it"), "{error}");
     assert_eq!(gateway.stats().register_reads, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_through_wait_moves_on_from_a_silent_primary() {
+    // The default request timeout, which outlasts the write's own.
+    let timing = RoutingConfig {
+        request_timeout: Duration::from_secs(30),
+        ..timing()
+    };
+    let cluster = Cluster::start(timing).await;
+    let shard = shard(0);
+    let delete = RecordBody::Delete(Delete { key: "k".into() });
+    let written = timed(cluster.gateway(1).write(&shard, delete, Precondition::None)).await;
+    let at = written.unwrap().unwrap();
+    let primary = &cluster.nodes[0].0;
+    let replica = primary.local().set().get(&(&shard).into()).await.unwrap();
+    let mut changes = replica.subscribe();
+
+    // The gateway's map still names node 3 as the primary, which takes
+    // the ask and never answers; the register names node 1.
+    let gateway = cluster.gateway(2);
+    gateway.map().learn(config(0, 1, &[3])).await;
+    let timeout = Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let mut waited = tokio::spawn({
+        let (gateway, shard) = (gateway.clone(), shard.clone());
+        async move { reach_remote(&gateway, &shard, "k", at, timeout).await }
+    });
+    let awaited = async {
+        loop {
+            match changes.recv().await {
+                Some(Change::Awaited(waiter)) => break waiter,
+                Some(_) => {}
+                None => panic!("the replica's changes ended"),
+            }
+        }
+    };
+    let waiter = timed(async {
+        tokio::select! {
+            waiter = awaited => waiter,
+            ended = &mut waited => panic!("the wait never reached node 1: {ended:?}"),
+        }
+    })
+    .await;
+    waiter.answer(FlushState::Flushed);
+    timed(waited).await.unwrap().unwrap();
+    // One flush wait and its grace on node 3, then node 1.
+    assert!(started.elapsed() < timeout, "{:?}", started.elapsed());
+    assert_eq!(gateway.map().get(&shard).unwrap().epoch, Epoch::new(2));
+    assert_eq!(gateway.stats().register_reads, 1);
 }
 
 #[tokio::test]
