@@ -2498,6 +2498,27 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
+    /// The entry of `key` as the index holds it, read as
+    /// [`Shard::entries`] reads: on any replica, without admitting a client
+    /// read or making a clean payload recently used. Background work that
+    /// must change nothing reads with it, such as the reconciliation scan
+    /// (§9.1).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn peek(&self, key: &str) -> Result<Option<Entry>, ShardError> {
+        let (index, shard, owned) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.entry(&shard, &owned)
+        })
+        .await
+    }
+
     /// The latest import progress the shard applied (§9.1): the number of
     /// its `IMPORT_PROGRESS` record and the import's ranges, or `None` if
     /// it applied none. Every `IMPORT` of a key the ranges have passed was

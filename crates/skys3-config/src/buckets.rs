@@ -84,6 +84,10 @@ pub struct BucketSettings {
     /// `index_snapshot_interval_seconds`: how often per-shard index
     /// snapshots are written (§8.9).
     pub index_snapshot_interval_seconds: u64,
+    /// `reconcile_interval_seconds`: how long each node waits between the
+    /// reconciliation scans of a `write_back` bucket (§9.1); 0, the
+    /// default, scans never.
+    pub reconcile_interval_seconds: u64,
     /// `target_transport` (§7.8).
     pub target_transport: TargetTransport,
     /// `ack_policy` (§7.5).
@@ -124,6 +128,8 @@ crate::durations! {
         ec_after => ec_after_seconds, Duration::from_secs;
         /// `index_snapshot_interval_seconds`.
         index_snapshot_interval => index_snapshot_interval_seconds, Duration::from_secs;
+        /// `reconcile_interval_seconds`.
+        reconcile_interval => reconcile_interval_seconds, Duration::from_secs;
         /// `freshness_ttl_seconds`.
         freshness_ttl => freshness_ttl_seconds, Duration::from_secs;
     }
@@ -166,6 +172,7 @@ pub(crate) struct BucketTable {
     ec_after_seconds: Option<u64>,
     backup_ack: Option<AckPolicy>,
     index_snapshot_interval_seconds: Option<u64>,
+    reconcile_interval_seconds: Option<u64>,
     target_transport: Option<TargetTransport>,
     max_dirty_bytes: Option<u64>,
     ack_policy: Option<AckPolicy>,
@@ -192,6 +199,7 @@ struct Defaults {
     ec_after_seconds: u64,
     backup_ack: AckPolicy,
     index_snapshot_interval_seconds: u64,
+    reconcile_interval_seconds: u64,
     target_transport: TargetTransport,
     max_dirty_bytes: u64,
     ack_policy: AckPolicy,
@@ -215,6 +223,7 @@ impl Defaults {
             ec_after_seconds: 600,
             backup_ack: AckPolicy::Local,
             index_snapshot_interval_seconds: 3600,
+            reconcile_interval_seconds: 0,
             target_transport: TargetTransport::Auto,
             max_dirty_bytes: flush.max_dirty_bytes,
             ack_policy: flush.ack_policy,
@@ -247,6 +256,9 @@ impl Defaults {
             index_snapshot_interval_seconds: table
                 .index_snapshot_interval_seconds
                 .unwrap_or(self.index_snapshot_interval_seconds),
+            reconcile_interval_seconds: table
+                .reconcile_interval_seconds
+                .unwrap_or(self.reconcile_interval_seconds),
             target_transport: table.target_transport.unwrap_or(self.target_transport),
             max_dirty_bytes: table.max_dirty_bytes.unwrap_or(self.max_dirty_bytes),
             ack_policy: table.ack_policy.unwrap_or(self.ack_policy),
@@ -490,6 +502,22 @@ fn settle<'a>(
             ),
         );
     }
+    // In `[buckets.defaults]` it applies to the `write_back` buckets only.
+    if named
+        && table
+            .reconcile_interval_seconds
+            .is_some_and(|seconds| seconds > 0)
+        && values.mode != BucketMode::WriteBack
+    {
+        checker.report(
+            key("reconcile_interval_seconds"),
+            format!(
+                "only a write_back bucket's remote target is its system of record, which the \
+                 reconciliation scan compares with the index (§9.1); this bucket's mode is {}",
+                values.mode
+            ),
+        );
+    }
     // Checked for named buckets only: the defaults cannot name a target.
     if named
         && values.mode == BucketMode::Local
@@ -548,6 +576,7 @@ fn settle<'a>(
         ec_after_seconds: values.ec_after_seconds,
         backup_ack: values.backup_ack,
         index_snapshot_interval_seconds: values.index_snapshot_interval_seconds,
+        reconcile_interval_seconds: values.reconcile_interval_seconds,
         target_transport: values.target_transport,
         ack_policy: values.ack_policy,
         flush_conflict_policy: values.flush_conflict_policy,

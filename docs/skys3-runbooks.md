@@ -25,6 +25,7 @@ exist.
   - [Dirty budget](#dirty-budget)
   - [Held conflicts](#held-conflicts)
   - [Discarded conflicts](#discarded-conflicts)
+  - [Reconciliation differences](#reconciliation-differences)
   - [Peer link](#peer-link)
   - [Peer transport fallback](#peer-transport-fallback)
 - [4. Replication and placement](#4-replication-and-placement)
@@ -70,6 +71,7 @@ curl -fsS -H "$AUTH" $ADMIN/v1/health
 curl -fsS -H "$AUTH" $ADMIN/v1/buckets/<bucket>
 curl -fsS -H "$AUTH" $ADMIN/v1/buckets/<bucket>/conflicts
 curl -fsS -H "$AUTH" -X POST $ADMIN/v1/buckets/<bucket>/conflicts/<policy>/<key>
+curl -fsS -H "$AUTH" $ADMIN/v1/buckets/<bucket>/reconcile
 curl -fsS -H "$AUTH" $ADMIN/metrics
 curl -fsS $ADMIN/readyz
 ```
@@ -117,7 +119,7 @@ Each row of design section 13, in its order, with the runbooks to follow.
 | High-latency link to the control store | [Control store latency](#control-store-latency) |
 | Coordinator dies | [Coordinator](#coordinator) |
 | Primary partitioned from its backups | [Network partition](#network-partition) |
-| Out-of-band write at the remote | [Held conflicts](#held-conflicts), [Discarded conflicts](#discarded-conflicts) |
+| Out-of-band write at the remote | [Held conflicts](#held-conflicts), [Discarded conflicts](#discarded-conflicts), [Reconciliation differences](#reconciliation-differences) |
 | Disk full or sync failure | [Disk space](#disk-space), [Disk out of service](#disk-out-of-service) |
 | Clock rate drift beyond `ρ` | [Clock drift](#clock-drift) |
 
@@ -348,6 +350,65 @@ after the last discard.
 
 **Do not.** Do not try to restore a dropped version from the node's disks:
 its log records are reclaimed by compaction, and no tool reads them.
+
+### Reconciliation differences
+
+**Symptoms.** `sum by (bucket, kind) (skys3_reconcile_differences) > 0`,
+for a bucket whose `reconcile_interval_seconds` is set; no alert reads it
+yet. `skys3_reconcile_scans_total` counts finished scans: a rate of 0 over
+several intervals means the latest report is old. The log has `the
+reconciliation scan found the remote differing from the index` for each
+difference, at most 100 a scan.
+
+**Impact.** The remote under the bucket's prefix no longer holds what SkyS3
+last wrote or imported there, for keys no pending flush covers (design
+section 9.1). Clients still read SkyS3's version of a cached key; an
+evicted key fills from the remote and adopts the other writer's object
+(`skys3_fill_conflicts_total`), and a read of an evicted `index_only` key
+fails unless a versioned remote still holds its version. The next client
+write of an `etag_mismatch` key conflicts, as in
+[Held conflicts](#held-conflicts); one of an `index_only` key is flushed
+as a new object. A `remote_only` object stays invisible to clients. The
+scan itself changed nothing.
+
+**Diagnosis.**
+
+1. On each node, `GET /v1/buckets/<bucket>/reconcile`: `last` is the node's
+   latest finished report over the shards it leads (`shards`); ask every
+   node. Each difference has its `key`, `shard`, `kind`, what the `index`
+   holds (`version`, `remote_etag`, `size`), and what the `remote` holds
+   (`etag`, `size`, `version_id`, `write_identity`).
+2. The kind: `remote_only`, an object SkyS3 never wrote or imported;
+   `index_only`, an object SkyS3 flushed or imported is gone;
+   `etag_mismatch` or `size_mismatch`, it was replaced.
+3. The writer: `outside`, a writer outside SkyS3 (find it in the provider's
+   access logs); `foreign`, another SkyS3 bucket, named by
+   `write_identity` (`<cluster>/<bucket-id>/<shard>/<epoch>.<seq>`), flushes
+   to the same prefix, a misconfiguration; `own`, a write of this bucket the
+   index does not show, such as a request a deposed primary sent late,
+   which is worth an issue; `unknown`, a `skys3-wid` value that is no
+   identity.
+4. `unconfirmed` above 0 means more than 1,000 differences: the prefix was
+   probably written in bulk, or the bucket points at the wrong prefix.
+
+**Remediation.** Stop the other writer first: point it elsewhere, or
+detach its SkyS3 bucket from the prefix. Then, per key:
+
+- SkyS3's version is right: read it through SkyS3's S3 endpoint and write
+  it back to the remote with the remote's own tools, as one `PutObject`, so
+  that its ETag is the MD5 the index expects (a multipart object needs the
+  same part sizes); remove a `remote_only` object.
+- The remote's version is right: overwrite the key through SkyS3 with it.
+  Its flush conflicts with the remote's object; resolve it with
+  `overwrite`, as in [Held conflicts](#held-conflicts).
+
+**Verification.** The node's next report has no differences, and
+`skys3_reconcile_differences` returns to 0 for every kind.
+
+**Do not.** Do not lower `reconcile_interval_seconds` to hurry a report
+during an incident: each scan lists the whole prefix. Do not delete a
+`remote_only` object whose `writer` is `own` before escalating: it may be
+the only copy of an acknowledged write.
 
 ### Peer link
 
@@ -1187,6 +1248,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Dirty budget](#dirty-budget) | `runbooks::drill_dirty_budget` | The share fills, a write gets `503 SlowDown`, `skys3_admission_refusals_total{reason="bucket_budget"}` counts it, and `GET /v1/buckets/<bucket>` shows `dirty_bytes` at `dirty_budget_bytes`. A larger `max_dirty_bytes` and a restart admit writes, and the dirty data stays dirty. | Nothing. |
 | [Held conflicts](#held-conflicts) | `runbooks::drill_out_of_band_writes` (in process); `conflicts::conflicts_are_listed_and_resolved_under_each_policy`; `simulation::conflicts::hold_keeps_conflicts_until_an_operator_resolves_them` | `skys3_conflicted_keys` and `skys3_flush_conflicts_total` count the held keys; the conflicts list shows each with `remote_identity` null for a writer outside SkyS3; `overwrite` puts the local version at the remote and counts it; `hold` after the other writer's object is removed flushes; a key not held answers `404`. | Nothing. |
 | [Discarded conflicts](#discarded-conflicts) | `runbooks::drill_out_of_band_writes` (in process) | A `discard_local` resolution adopts the remote's version and counts it in `skys3_flush_conflicts_discarded_total`, the series the alert reads. | The log lines the runbook quotes were not checked: the in-process drill has no log. |
+| [Reconciliation differences](#reconciliation-differences) | `runbooks::drill_reconciliation_report` (in process); `reconcile::keys_written_and_flushed_during_scans_are_never_reported` | Another writer's new, replaced, and deleted objects appear in the report as `remote_only`, `etag_mismatch`, and `index_only`, with the writer `outside`, and in `skys3_reconcile_differences` by kind; once SkyS3's versions are written back and the other object removed, the next scan reports nothing. Scans during a workload of writes, deletes, and flushes report nothing. | The log lines were not checked: the in-process drill has no log. No command re-imports a `remote_only` key or re-flushes a clean one (section 8). |
 | [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary. |
 | [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
 | [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over` | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. | Not drilled on the binary: it does not run replication, so its metrics and alerts and the `placement` report cannot be read yet. |
@@ -1235,6 +1297,10 @@ meets today, not a plan of this document.
   lets only a member take over. An operator needs a command that writes a
   new configuration for the shard, empty or from the restore drill's index,
   and a way to delete a bucket one of whose shards cannot be sealed.
+- **Re-importing or re-flushing one key.** After a reconciliation scan
+  reports a difference, nothing imports a `remote_only` object once the
+  import is done, or flushes a clean key again; the operator writes the
+  remote with its own tools or overwrites the key through SkyS3.
 - **Placement and membership status.** `GET /v1/health` `placement` and
   bucket status with each shard's members arrive with the coordinator and
   replication in the binary.

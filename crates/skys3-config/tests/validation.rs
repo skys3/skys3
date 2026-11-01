@@ -326,6 +326,7 @@ fn durations_and_sizes_must_be_positive() {
         ("flush", "streaming_flush_min_bytes"),
         ("flush", "max_dirty_bytes"),
         ("flush", "import_max_keys_per_second"),
+        ("flush", "reconcile_requests_per_second"),
         ("ec", "max_data_fragments"),
         ("ec", "fragment_orphan_after_seconds"),
         ("ec", "fragment_repair_after_seconds"),
@@ -1019,6 +1020,28 @@ fn backup_targets_belong_to_local_buckets() {
          [buckets.vault]\nmode = \"local\"\nbackup_target = \"https://h/b\"",
     )
     .unwrap();
+}
+
+#[test]
+fn only_write_back_buckets_are_reconciled() {
+    for mode in ["local", "read_only"] {
+        assert_violations(
+            &format!("[buckets.vault]\nmode = \"{mode}\"\nreconcile_interval_seconds = 60"),
+            &["buckets.vault.reconcile_interval_seconds"],
+        );
+    }
+    // 0, the default, is no scan, and the defaults apply to the
+    // write_back buckets only.
+    let config = load(
+        "[buckets.defaults]\nmode = \"local\"\nreconcile_interval_seconds = 600\n\
+         [buckets.vault]\nreconcile_interval_seconds = 0\n\
+         [buckets.cache]\nmode = \"write_back\"",
+    )
+    .unwrap();
+    let cache = config.buckets().get(&BucketName::new("cache").unwrap());
+    assert_eq!(cache.reconcile_interval().as_secs(), 600);
+    let vault = config.buckets().get(&BucketName::new("vault").unwrap());
+    assert_eq!(vault.reconcile_interval_seconds, 0);
 }
 
 #[test]
