@@ -12,15 +12,22 @@ use super::*;
 /// than the link timeout by itself.
 const SLOW_READ: Duration = Duration::from_millis(1500);
 
-/// A simulated disk whose reads can be made slow.
+/// A simulated disk whose reads are slow while `slow` is set.
 #[derive(Debug, Clone)]
-struct SlowMount {
+pub(super) struct SlowMount {
     inner: SimMount,
     slow: Arc<AtomicBool>,
 }
 
+impl SlowMount {
+    pub(super) fn new(inner: SimMount, slow: Arc<AtomicBool>) -> Self {
+        Self { inner, slow }
+    }
+}
+
+/// A file of a [`SlowMount`].
 #[derive(Debug)]
-struct SlowFile {
+pub(super) struct SlowFile {
     inner: <SimMount as Disk>::File,
     slow: Arc<AtomicBool>,
 }

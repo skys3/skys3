@@ -41,6 +41,7 @@ use skys3_log::ShardRef;
 use skys3_net::{Frame, MessageKind, Network, PeerIdentity, Receiver, Sender};
 use skys3_types::{Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 
 use super::primary::Link;
 use super::wire::{self, Backfill, BackfillAck, Row, Run, SnapshotRows};
@@ -78,7 +79,18 @@ impl<N: Network, D: Disk> Link<N, D> {
         let keep = match keeps {
             None => false,
             Some(Epoch::ZERO) => !self.leader.wants_snapshot(&self.member),
-            Some(epoch) => self.shard.record_epoch(last).await == Some(epoch),
+            Some(epoch) => {
+                // Naming the epoch of its own record at `last` may read the
+                // log back, for longer than the link timeout: the link
+                // beacons meanwhile, and the learner waits past the beacons
+                // for the verdict (§6.6).
+                let named = self.shard.record_epoch(last);
+                let mut beaconed = Some(Instant::now());
+                let held = self
+                    .beaconing(sender, config.epoch.get(), &mut beaconed, named)
+                    .await?;
+                held == Some(epoch)
+            }
         };
         if keep {
             let verdict = Backfill {

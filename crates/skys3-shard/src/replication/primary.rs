@@ -309,8 +309,9 @@ impl<N: Network, D: Disk> Link<N, D> {
     /// takes longer than [`ReplicationConfig::link_timeout`]: without
     /// beacons, both ends gave the session up, and the next one read the
     /// log again, so a re-admitted learner never caught up (§6.7; found by
-    /// the kill, partition, and peering suite, plan M8-08).
-    async fn beaconing<S: AsyncRead + AsyncWrite + Unpin, T>(
+    /// the kill, partition, and peering suite, plan M8-08). Verifying a
+    /// re-admitted learner's log may read it back too (§6.6).
+    pub(super) async fn beaconing<S: AsyncRead + AsyncWrite + Unpin, T>(
         &self,
         sender: &mut Sender<S>,
         epoch: u64,

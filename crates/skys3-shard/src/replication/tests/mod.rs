@@ -35,6 +35,7 @@ mod learners;
 mod removal;
 mod resume;
 mod takeover;
+mod verify;
 
 use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use super::{Replication, ReplicationConfig};
