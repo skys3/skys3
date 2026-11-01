@@ -68,6 +68,7 @@ impl Remote {
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         };
         let remote = RemoteObject {
             object,

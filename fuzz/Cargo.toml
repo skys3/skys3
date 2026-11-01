@@ -20,6 +20,7 @@ cargo-fuzz = true
 [dependencies]
 crc32c = "0.6"
 libfuzzer-sys = "0.4"
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
 skys3-control = { path = "../crates/skys3-control" }
 skys3-coord = { path = "../crates/skys3-coord" }
@@ -80,6 +81,13 @@ bench = false
 [[bin]]
 name = "ec_fragment_header"
 path = "fuzz_targets/ec_fragment_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_transfer"
+path = "fuzz_targets/ec_transfer.rs"
 test = false
 doc = false
 bench = false

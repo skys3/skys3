@@ -36,8 +36,12 @@ use crate::tables::{
 /// table: a part of a completed upload may hold no bytes, once its object
 /// is evicted (§9.3), which older builds fail to decode. Version 8 adds
 /// the remote uploads of streaming flushes and their parts (§7.3); an
-/// older build would never complete or abort them.
-pub const FORMAT_VERSION: u64 = 8;
+/// older build would never complete or abort them. Version 9 adds the
+/// coded layouts of entries (value format 4), each shard's index from node
+/// to fragments, and the attempt numbers a primary reserved (§8.4); an
+/// older build could not read a coded entry, and could reuse an attempt
+/// number.
+pub const FORMAT_VERSION: u64 = 9;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -250,6 +254,8 @@ impl Index {
             txn.open_table(tables::PROMOTIONS)?;
             txn.open_table(tables::CONFIGS)?;
             txn.open_table(tables::TAKEOVERS)?;
+            txn.open_table(tables::FRAGMENTS)?;
+            txn.open_table(tables::ATTEMPTS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -468,6 +474,7 @@ impl Index {
                 tables::ShardTable::Parts => tables::PARTS,
                 tables::ShardTable::RemoteUploads => tables::REMOTE_UPLOADS,
                 tables::ShardTable::RemoteParts => tables::REMOTE_PARTS,
+                tables::ShardTable::Fragments => tables::FRAGMENTS,
             };
             let mut table = txn.open_table(definition)?;
             for (key, value) in rows {
@@ -639,6 +646,36 @@ impl Index {
             .insert(codec::shard_key(shard).as_slice(), epoch.get())?;
         txn.commit()?;
         Ok(())
+    }
+
+    /// Reserves `count` attempt numbers for this node as the primary of
+    /// `shard` (§8.4), in one durable commit, and returns them. Numbers
+    /// only grow, so no two reservations on this node overlap, across
+    /// restarts too; numbers a node reserved and never used are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails, or the numbers are
+    /// exhausted; nothing is reserved then.
+    pub fn reserve_attempts(
+        &self,
+        shard: &ShardRef,
+        count: u64,
+    ) -> Result<std::ops::Range<u64>, IndexError> {
+        let key = codec::shard_key(shard);
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        let reserved = {
+            let mut table = txn.open_table(tables::ATTEMPTS)?;
+            let first = table.get(key.as_slice())?.map_or(0, |next| next.value());
+            let end = first.checked_add(count).ok_or_else(|| {
+                IndexError::codec("attempts")(codec::CodecError::exhausted("attempts"))
+            })?;
+            table.insert(key.as_slice(), end)?;
+            first..end
+        };
+        txn.commit()?;
+        Ok(reserved)
     }
 
     /// Records, in one durable commit, that this node's replica of a shard,

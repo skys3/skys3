@@ -62,7 +62,7 @@
 //! Each defined kind's fields are encoded in the declaration order of its
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
-//! [`PartFlushed`], [`Import`], [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
+//! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
 //! without the bucket, shard, and epoch the fixed header holds, and
 //! `TRUNCATE`, which has no fields):
 //!
@@ -85,7 +85,11 @@
 //!   number (`u16`) and position, in increasing part number,
 //! - a `PART_FLUSHED`'s step as a tag byte: 0 for `Opened`, 2 for `Ended`,
 //!   or 1 for a part, followed by its number (`u16`), its `MPU_PART`
-//!   position, and the remote ETag.
+//!   position, and the remote ETag,
+//! - an `EC_PUBLISH`'s stripes as a `u32` count and, per stripe, its data
+//!   length, `k` and `m` (`u8` each), codec ID (`u16`), and each fragment's
+//!   node ID (`u8` length) and fragment ID (`u128`); a stripe's number and
+//!   offset follow from its place in the list.
 //!
 //! # Decoding
 //!
@@ -101,6 +105,7 @@
 //! bytes. A record of an older version re-encodes in the current one.
 
 mod body;
+mod coding;
 mod error;
 mod header;
 mod multipart;
@@ -115,6 +120,7 @@ pub use body::{
     MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
     Metadata, Put, PutData, RecordBody, TagSet, Tags, UploadBegin,
 };
+pub use coding::{EcPublish, MAX_STRIPES};
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
 pub use multipart::{

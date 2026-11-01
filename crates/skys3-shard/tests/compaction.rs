@@ -417,6 +417,66 @@ fn the_latest_config_record_stays_and_held_shards_wait() {
 }
 
 #[test]
+fn a_coded_versions_replicated_bytes_go_once_it_is_published() {
+    use skys3_log::record::EcPublish;
+    use skys3_types::{
+        AttemptId, CodecId, CodedStripe, Epoch, FragmentId, FragmentLocation, Geometry,
+    };
+
+    runtime().block_on(async {
+        let disk = SimDisk::new(6);
+        let node = Node::open(&disk).await;
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        let mut extents = Vec::new();
+        for n in 0..3 {
+            let appended = shard.append_extent(extent("big", n * 700, 700)).await;
+            extents.push(appended.unwrap());
+        }
+        let version = shard.commit(put_extents("big", extents.clone(), 1)).await;
+        let version = version.unwrap().position;
+        let fragments = (0..3)
+            .map(|n| FragmentLocation {
+                node: format!("n{n}").parse().unwrap(),
+                fragment: FragmentId::new(n),
+            })
+            .collect();
+        let geometry = Geometry::new(2, 1).unwrap();
+        let stripe = CodedStripe::new(0, 0, 2100, geometry, CodecId::CURRENT, fragments).unwrap();
+        let publish = RecordBody::EcPublish(EcPublish {
+            key: "big".into(),
+            version,
+            etag: support::etag(1),
+            attempt: AttemptId::new(Epoch::new(1), 0),
+            size: 2100,
+            stripes: vec![stripe],
+        });
+        let published = shard.commit(publish).await.unwrap();
+        assert_eq!(published.outcome, Outcome::Applied(Effect::Published));
+        // Later writes fill hot and bulk segments, so the extents' segment
+        // is not the last.
+        overwrite(&shard, 2, 40).await;
+        for round in 0..12 {
+            let appended = shard.append_extent(extent("garbage", 0, 1000)).await;
+            let body = put_extents("garbage", vec![appended.unwrap()], round);
+            shard.commit(body).await.unwrap();
+        }
+        node.checkpointer.checkpoint().await.unwrap();
+
+        // Alone, the replica knows the record committed once it applied
+        // it: nothing names the bytes now.
+        let report = node.compactor(Duration::ZERO).compact().await.unwrap();
+        assert!(report.segments > 0, "{report:?}");
+        let reader = node.index.read().unwrap();
+        for extent in &extents {
+            let located = reader.location(shard.shard(), extent.position).unwrap();
+            assert_eq!(located, None, "a coded version's extent stayed");
+        }
+        let entry = reader.entry(shard.shard(), "big").unwrap().unwrap();
+        assert!(entry.object.unwrap().coded.is_some());
+    });
+}
+
+#[test]
 fn a_replica_holds_what_its_members_may_lack() {
     runtime().block_on(async {
         let disk = SimDisk::new(5);

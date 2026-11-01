@@ -14,6 +14,7 @@ use skys3_types::{
     BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity, WriteIdentity,
 };
 
+use super::coding::EcPublish;
 use super::error::{FieldError, Problem};
 use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed};
 use super::wire::{Reader, Writer};
@@ -257,6 +258,8 @@ pub enum RecordBody {
     Import(Import),
     /// `ADOPT`.
     Adopt(Adopt),
+    /// `EC_PUBLISH`.
+    EcPublish(EcPublish),
     /// `CONFIG`: the replica's full shard configuration (§6.2). Its bucket,
     /// shard, and epoch are the record's.
     Config(ShardConfig),
@@ -286,6 +289,7 @@ impl RecordBody {
             Self::PartFlushed(_) => RecordKind::PartFlushed,
             Self::Import(_) => RecordKind::Import,
             Self::Adopt(_) => RecordKind::Adopt,
+            Self::EcPublish(_) => RecordKind::EcPublish,
             Self::Config(_) => RecordKind::Config,
             Self::Truncate => RecordKind::Truncate,
         }
@@ -307,7 +311,8 @@ impl RecordBody {
             | Self::Flushed(Flushed { key, .. })
             | Self::PartFlushed(PartFlushed { key, .. })
             | Self::Import(Import { key, .. })
-            | Self::Adopt(Adopt { key, .. }) => Some(key),
+            | Self::Adopt(Adopt { key, .. })
+            | Self::EcPublish(EcPublish { key, .. }) => Some(key),
             Self::Config(_) | Self::Truncate => None,
         }
     }
@@ -348,6 +353,7 @@ impl RecordBody {
             Self::PartFlushed(flushed) => flushed.encode(w, position),
             Self::Import(import) => import.encode(w),
             Self::Adopt(adopt) => adopt.encode(w),
+            Self::EcPublish(publish) => publish.encode(w, position),
             Self::Config(config) => encode_config(w, config, shard, position),
             Self::Truncate => Ok(()),
         }
@@ -385,6 +391,7 @@ impl RecordBody {
             RecordKind::PartFlushed => Self::PartFlushed(PartFlushed::decode(&mut r, position)?),
             RecordKind::Import => Self::Import(Import::decode(&mut r)?),
             RecordKind::Adopt => Self::Adopt(Adopt::decode(&mut r)?),
+            RecordKind::EcPublish => Self::EcPublish(EcPublish::decode(&mut r, position)?),
             RecordKind::Config => Self::Config(decode_config(&mut r, shard, position)?),
             RecordKind::Truncate => Self::Truncate,
             // `RecordHeader::decode` admits only defined kinds.

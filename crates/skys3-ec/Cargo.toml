@@ -19,18 +19,25 @@ test-util = []
 [dependencies]
 bytes.workspace = true
 crc32c.workspace = true
+prost.workspace = true
 reed-solomon-simd.workspace = true
 skys3-config.workspace = true
+skys3-coord.workspace = true
+skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
+skys3-net.workspace = true
+skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 rand.workspace = true
+rcgen.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-ec = { path = ".", features = ["test-util"] }
 skys3-sim.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

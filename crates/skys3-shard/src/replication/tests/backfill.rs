@@ -258,6 +258,7 @@ async fn snapshot(link: &mut Link, epoch: u64, seq: u64) -> BackfillAck {
             storage_class: None,
             copy_source: None,
             payload: Payload::Inline(EpochSeq::new(Epoch::new(3), Seq::new(2))),
+            coded: None,
         }),
         remote_etag: None,
         remote_version_id: None,

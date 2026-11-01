@@ -894,10 +894,10 @@ impl<D: Disk> Shard<D> {
             .seq
             .checked_next()
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
-        // A `FLUSHED` changes no object version, so conditional checks
-        // need not wait for it (see `commit_if`).
+        // A `FLUSHED` or an `EC_PUBLISH` changes no object version, so
+        // conditional checks need not wait for it (see `commit_if`).
         let key = entry_key(&body)
-            .filter(|_| !matches!(body, RecordBody::Flushed(_)))
+            .filter(|_| !matches!(body, RecordBody::Flushed(_) | RecordBody::EcPublish(_)))
             .map(str::to_owned);
         let receiver = self.sequence(sequencer, position, body, None, lazy)?;
         sequencer.next = EpochSeq::new(position.epoch, next);
