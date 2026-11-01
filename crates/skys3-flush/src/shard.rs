@@ -412,9 +412,11 @@ impl State {
     /// may have dropped it, and untracked the key, before the wait
     /// arrived, so the drop is remembered for it. The flusher knows which
     /// only for a version it tracked itself, after [`State::since`], and
-    /// whose drop it would still remember; for any other, an earlier
-    /// flusher's drop leaves no trace here, and the caller asks the index
-    /// ([`prove`]).
+    /// whose drop it would still remember, or for the very version a flush
+    /// of its own put at the remote while the `FLUSHED` is not yet applied
+    /// (until then the index still shows it dirty); for any other, an
+    /// earlier flusher's drop leaves no trace here, and the caller asks
+    /// the index ([`prove`]).
     #[must_use]
     fn awaited(&mut self, waiter: FlushWaiter) -> Option<FlushWaiter> {
         let version = waiter.version();
@@ -424,7 +426,10 @@ impl State {
             return None;
         }
         let Some(tracked) = self.keys.get_mut(waiter.key()) else {
-            if version > self.since && version > self.forgotten {
+            let recording = self.recording.get(waiter.key());
+            if recording.is_some_and(|remote| remote.seq == version.seq)
+                || (version > self.since && version > self.forgotten)
+            {
                 waiter.answer(FlushState::Flushed);
                 return None;
             }
@@ -1247,6 +1252,42 @@ mod tests {
         let (later, mut later_wait) = FlushWaiter::new("k".to_owned(), position(6));
         assert!(state.awaited(later).is_none());
         assert_eq!(answer_now(&mut later_wait), Some(FlushState::Flushed));
+    }
+
+    /// A flusher that started after a version was committed, as after a
+    /// primary change, may flush it itself: once the flush untracks the
+    /// key, a wait for the version is answered `Flushed` at once, while
+    /// its `FLUSHED` is still on its way to the index, which shows the
+    /// version dirty until then.
+    #[test]
+    fn a_wait_for_a_version_whose_flushed_is_in_flight_is_answered() {
+        let mut state = State {
+            since: position(5),
+            ..State::default()
+        };
+        // The startup scan finds `k` dirty at seq 3.
+        state.changed("k", position(3), Some(10), Duration::from_secs(1));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(3), None))
+        );
+        // The flush lands, as `finish` records it.
+        state.reached("k", position(3));
+        let remote = Remote {
+            seq: Seq::new(3),
+            etag: Some(ETag::new("ours").unwrap()),
+            version_id: None,
+        };
+        state.recording.insert("k".to_owned(), remote);
+        state.finished("k", position(3));
+        assert!(state.keys.is_empty());
+
+        let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(3));
+        assert!(state.awaited(waiter).is_none());
+        assert_eq!(answer_now(&mut wait), Some(FlushState::Flushed));
+        // Only the version recorded: an older one is left to the index.
+        let (older, _older_wait) = FlushWaiter::new("k".to_owned(), position(2));
+        assert_eq!(state.awaited(older.clone()), Some(older));
     }
 
     #[test]
