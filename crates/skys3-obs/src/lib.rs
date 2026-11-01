@@ -47,5 +47,5 @@ pub use admin::{
 };
 pub use health::{Health, Readiness};
 pub use logging::{LogConfig, LogFormat, TracingInitError, init_tracing};
-pub use metrics::MetricsRegistry;
+pub use metrics::{MetricsRegistry, Registered};
 pub use prometheus_client;

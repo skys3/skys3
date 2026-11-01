@@ -117,6 +117,7 @@ crates/
   skys3-sim/            seeded runner, simulated S3 store, history checkers (§16.1)
   skys3-cluster-sim/    cluster simulation harness: real nodes, faults, workload (§16.1)
 spec/                   protocol model
+deploy/                 Prometheus alerting rules and Grafana dashboard (M7-04)
 tests/                  SDK matrix, s3-tests subset, provider and fault-injection tests
 bench/                  performance suite (§16.3)
 ```

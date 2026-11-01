@@ -1568,6 +1568,8 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 | Disk full or sync failure | No acknowledgement is issued. Admission control engages, and the disk is taken out of service on a sync error. A node checks the free space of its log disks and data directory every second: below `disk_min_free_bytes`, writes that add data to the shards on a disk get `503 SlowDown` (all of them for the data directory), and deletes are still admitted. The margin keeps the disk from filling, since any write error takes it out of service (section 10.4). |
 | Clock rate drift beyond `ρ` | Read linearizability is at risk. Write safety is unaffected. |
 
+The [metrics reference](skys3-metrics.md) (section 6) names the metrics and alerts that show each row.
+
 ## 14. Illustrative configuration
 
 The [configuration reference](skys3-config.md) lists every key with its type, default, and the rules checked at load time. The values are starting points to be tuned by measurement. Unknown keys are rejected. `[buckets.defaults]` applies to every bucket, and a `[buckets.<name>]` table overrides it for the bucket with that S3 name.

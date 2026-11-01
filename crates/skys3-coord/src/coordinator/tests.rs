@@ -140,6 +140,7 @@ async fn a_coordinator_changes_only_during_its_tenure_and_announces_each_change(
     let (leadership, follower) = watch::channel(Leadership::Follower { holder: None });
     let ledger = Ledger::default();
     let hints = ControlHints::new();
+    let metrics = CoordinatorMetrics::default();
     let coordinator = Coordinator::new(
         store.clone(),
         Arc::clone(&clock),
@@ -148,12 +149,14 @@ async fn a_coordinator_changes_only_during_its_tenure_and_announces_each_change(
         hints.clone(),
         config(),
         ProposalIds::seeded(1),
-    );
+    )
+    .with_metrics(metrics.clone());
     assert!(format!("{coordinator:?}").starts_with("Coordinator"));
     let waker = coordinator.waker();
     let running = tokio::spawn(coordinator.run());
     clock.sleep(Duration::from_secs(5)).await;
     assert!(ledger.lock().unwrap().is_empty());
+    assert_eq!(metrics.values().0, 0, "not coordinator yet");
 
     // A tenure of two seconds.
     let until = clock.now().saturating_add(Duration::from_secs(2));
@@ -161,7 +164,10 @@ async fn a_coordinator_changes_only_during_its_tenure_and_announces_each_change(
         version: Version::new("1"),
         until,
     });
-    clock.sleep(Duration::from_secs(5)).await;
+    clock.sleep(Duration::from_secs(1)).await;
+    assert_eq!(metrics.values().0, 1, "serving its tenure");
+    clock.sleep(Duration::from_secs(4)).await;
+    assert_eq!(metrics.values().0, 0, "the tenure ended");
     let made = ledger.lock().unwrap().len();
     assert!((5..=20).contains(&made), "{made} changes");
     // Every change is announced by its own generation, and pushed.

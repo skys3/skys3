@@ -1,0 +1,210 @@
+# Prometheus alerting rules for SkyS3.
+#
+# Load this file with `rule_files` in prometheus.yml. It assumes that every
+# node's admin listener is scraped by a job named `skys3` (docs/skys3-metrics.md,
+# section 1), and, for SkyS3ClockUnsynchronized only, that node_exporter's
+# timex collector runs on every host.
+#
+# docs/skys3-metrics.md section 4 explains each rule, and section 6 maps the
+# failure matrix of the design (section 13) to these rules. Every rule links
+# the runbook section an operator follows; the anchors are stable, and the
+# runbooks (docs/skys3-runbooks.md) keep a section for each.
+#
+# Severities: `critical` pages (data is at risk now, or writes or sessions
+# are refused); `warning` opens a ticket (exposure is growing, or something
+# needs an operator, but nothing is refused yet).
+#
+# Thresholds are starting points for the defaults in docs/skys3-config.md;
+# tune them to each deployment's loss exposure (RPO) target.
+
+groups:
+  - name: skys3-flush
+    rules:
+      - alert: SkyS3DirtyDataOld
+        expr: max by (bucket) (skys3_oldest_dirty_age_seconds) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} has had data not at its remote target for over 15 minutes."
+          description: "The oldest change of bucket {{ $labels.bucket }} not yet flushed is {{ $value | humanizeDuration }} old. That is the bucket's loss exposure if every member of a shard were lost now (design section 7.6)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#dirty-data-age
+      - alert: SkyS3DirtyDataVeryOld
+        expr: max by (bucket) (skys3_oldest_dirty_age_seconds) > 3600
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} has had data not at its remote target for over an hour."
+          description: "The oldest change of bucket {{ $labels.bucket }} not yet flushed is {{ $value | humanizeDuration }} old (design section 7.6)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#dirty-data-age
+      - alert: SkyS3FlushStalled
+        expr: >-
+          max by (bucket) (skys3_flush_lag_seconds) > 600
+          and on (bucket)
+          sum by (bucket) (rate(skys3_flush_retries_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Flushes of bucket {{ $labels.bucket }} keep failing."
+          description: "The oldest change the flushers of bucket {{ $labels.bucket }} work on is {{ $value | humanizeDuration }} old, and their attempts are being retried: the remote target is unreachable, refusing, or throttling (design sections 7.7 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#flush-stalled
+      - alert: SkyS3DirtyBudgetNearlyFull
+        expr: max by (instance, bucket) (skys3_dirty_bytes / skys3_dirty_budget_bytes) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} has used over 80% of its share of bucket {{ $labels.bucket }}'s dirty-data budget."
+          description: "Once the share is used up, new writes to the bucket get 503 SlowDown until flushing drains it (design section 7.6)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#dirty-budget
+      - alert: SkyS3WritesRefusedOverBudget
+        expr: sum by (instance, reason) (rate(skys3_admission_refusals_total{reason=~"bucket_budget|cluster_budget"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} refuses writes: a dirty-data budget is used up ({{ $labels.reason }})."
+          description: "Clients get 503 SlowDown for new writes while the dirty data stays at its budget, for example during a remote outage (design sections 7.6 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#dirty-budget
+      - alert: SkyS3ConflictsHeld
+        expr: sum by (bucket) (skys3_conflicted_keys) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} holds {{ $value }} keys in conflict."
+          description: "A flush found an out-of-band write at the remote target, and the hold policy keeps the key until an operator resolves it through the admin API. Held keys never drain and count against the dirty-data budget (design section 7.2)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#held-conflicts
+      - alert: SkyS3ConflictsDiscarded
+        expr: sum by (bucket) (increase(skys3_flush_conflicts_discarded_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} discarded acknowledged writes in favor of out-of-band remote writes."
+          description: "The discard_local policy or an operator's resolution adopted the remote's version and dropped the local one, an acknowledged write, in the last hour (design section 7.2)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#discarded-conflicts
+
+  - name: skys3-replication
+    rules:
+      - alert: SkyS3UnderReplicated
+        expr: max(skys3_oldest_under_replicated_age_seconds) > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A shard has had fewer members than its replicas setting for over 15 minutes."
+          description: "Data of the shard has fewer copies until a replacement finishes backfill; a further failure in that window can lose data (design section 6.4). It has lasted {{ $value | humanizeDuration }}."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#under-replication
+      - alert: SkyS3UnderReplicatedLong
+        expr: max(skys3_oldest_under_replicated_age_seconds) > 3600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A shard has had fewer members than its replicas setting for over an hour."
+          description: "No replacement has restored the shard's copies; check for spare eligible nodes and the placement policy (design sections 6.4 and 6.7)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#under-replication
+      - alert: SkyS3PlacementPolicyUnsatisfied
+        expr: max(skys3_placement_unsatisfied_buckets) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The cluster does not satisfy the placement policy of {{ $value }} buckets."
+          description: "Their shards run with fewer members in separate failure domains than their replicas setting until capacity returns; the coordinator never co-locates members to make up the difference (design section 6.7). The admin API's placement health lists them."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#placement-policy
+      - alert: SkyS3CoordinatorMissing
+        expr: sum(skys3_coordinator) != 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} nodes act as coordinator instead of one."
+          description: "With none, placement work (replacing lost members, rebalancing, new buckets' shards) waits; with more than one, all but one have their changes rejected. Client requests are unaffected (design sections 6.7 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#coordinator
+
+  - name: skys3-control-store
+    rules:
+      - alert: SkyS3ControlStoreUnreachable
+        expr: >-
+          skys3_control_store_live == 0
+          or (time() - skys3_control_store_last_success_timestamp_seconds) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }} cannot reach the control store."
+          description: "The data path continues from the node's local copy, but no membership change can happen: a node failure now makes its shards unavailable until the store returns (design sections 6.2 and 6.10)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#control-store-unreachable
+      - alert: SkyS3IdentityCopyAging
+        expr: (time() - skys3_identity_synced_timestamp_seconds) > 0.75 * skys3_identity_max_staleness_seconds
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.instance }}'s identity copy is close to identity_max_staleness."
+          description: "The node syncs its identity copy at least every half of identity_max_staleness while the control store answers. Once the copy is older than identity_max_staleness, STS issues no new sessions (design section 6.10)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#identity-staleness
+      - alert: SkyS3IdentityCopyStale
+        expr: (time() - skys3_identity_synced_timestamp_seconds) > skys3_identity_max_staleness_seconds
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} issues no new STS sessions: its identity copy is stale."
+          description: "The identity copy is older than identity_max_staleness. Sessions already issued stay valid until they expire (design sections 6.10 and 11)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#identity-staleness
+
+  - name: skys3-node
+    rules:
+      - alert: SkyS3NodeDown
+        expr: up{job="skys3"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} does not answer scrapes."
+          description: "The node or its admin listener is down. Its shards fail over or lose a member; watch under-replication and repair (design sections 6.4, 6.5, and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#node-down
+      - alert: SkyS3DiskOutOfService
+        expr: skys3_disks_out_of_service > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} took {{ $value }} disks out of service after an I/O error."
+          description: "Each stays out of service until the host restarts; the shards on it lose this member (design sections 10.4 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#disk-out-of-service
+      - alert: SkyS3DiskSpaceLow
+        expr: sum by (instance) (rate(skys3_admission_refusals_total{reason="disk_space"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.instance }} refuses writes: a disk is below disk_min_free_bytes."
+          description: "Writes that add data to the shards on the disk (or every write, for the data directory) get 503 SlowDown; deletes are still admitted (design section 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#disk-space
+      - alert: SkyS3ClockUnsynchronized
+        expr: node_timex_sync_status == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The clock of host {{ $labels.instance }} is not synchronized."
+          description: "An unsynchronized clock may drift faster than the rate bound the leases assume, which puts read linearizability at risk; write safety is unaffected (design sections 5.4 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#clock-drift
+
+  - name: skys3-erasure-coding
+    rules:
+      - alert: SkyS3FragmentsUnrepaired
+        expr: max(skys3_oldest_unrepaired_age_seconds) > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Coded objects have had lost fragments unrepaired for over an hour."
+          description: "Degraded reads decode from the remaining fragments, but each further loss brings a stripe closer to unreadable (design sections 8.6 and 13)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#fragment-repair

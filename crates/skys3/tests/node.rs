@@ -75,6 +75,23 @@ async fn objects_and_buckets_survive_restarts() {
         metrics.contains("skys3_disks_out_of_service 0"),
         "{metrics}"
     );
+    // The store answered at startup, and the identity copy came from a
+    // sync of it; both are recent Unix times.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    for name in [
+        "skys3_control_store_last_success_timestamp_seconds",
+        "skys3_identity_synced_timestamp_seconds",
+    ] {
+        let at = gauge(&metrics, name);
+        assert!(at > now - 600.0 && at <= now + 1.0, "{name} {at}");
+    }
+    assert_eq!(
+        gauge(&metrics, "skys3_identity_max_staleness_seconds"),
+        86400.0
+    );
 
     // A deleted object stays deleted after a restart.
     s3.delete_object()
@@ -141,6 +158,25 @@ async fn a_node_runs_from_its_copy_while_the_control_store_fails() {
     })
     .await;
     node.shutdown().await.unwrap();
+}
+
+/// The value of the unlabeled gauge `name` in a scrape.
+fn gauge(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no {name} in {metrics}"))
+        .parse()
+        .unwrap()
+}
+
+/// The admin listener's scrape.
+async fn scrape(node: &Node) -> String {
+    let (status, metrics) = http_get(&node.admin_addr().to_string(), "/metrics")
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    metrics
 }
 
 /// Health's `control_store.live`.
@@ -222,11 +258,29 @@ async fn a_node_runs_from_its_copy_until_the_store_opens() {
     let s3 = client(&endpoint(&node));
     assert_eq!(get(&s3, "kept", "a").await, b"alpha");
     assert!(s3.create_bucket().bucket("new").send().await.is_err());
+    let metrics = scrape(&node).await;
+    assert!(metrics.contains("skys3_control_store_live 0"), "{metrics}");
+    let name = "skys3_control_store_last_success_timestamp_seconds";
+    assert_eq!(
+        gauge(&metrics, name),
+        0.0,
+        "not read since the node started"
+    );
+    // The identity copy is the stored one, as old as the sync that made it.
+    let synced = gauge(&metrics, "skys3_identity_synced_timestamp_seconds");
+    assert!(synced > 0.0, "{metrics}");
 
     // Once the store can be opened, the running node uses it.
     std::fs::remove_file(&control).unwrap();
     std::fs::rename(&moved, &control).unwrap();
     eventually("the node opens the control store", || live(&node)).await;
+    let metrics = scrape(&node).await;
+    assert!(metrics.contains("skys3_control_store_live 1"), "{metrics}");
+    assert!(gauge(&metrics, name) > 0.0, "{metrics}");
+    assert!(
+        gauge(&metrics, "skys3_identity_synced_timestamp_seconds") > synced,
+        "the identity copy is synced from the store: {metrics}"
+    );
     s3.create_bucket().bucket("new").send().await.unwrap();
     put(&s3, "new", "b", b"beta").await;
     node.shutdown().await.unwrap();
