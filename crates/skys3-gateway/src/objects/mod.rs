@@ -67,7 +67,7 @@ mod coded;
 mod download;
 mod holders;
 mod upload;
-mod write_through;
+pub(crate) mod write_through;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
