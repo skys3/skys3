@@ -424,6 +424,76 @@ async fn peers_must_speak_the_cluster_protocol() {
     assert!(matches!(error, TransportError::WrongProtocol), "{error}");
 }
 
+/// A client session store that counts the TLS 1.3 tickets a server
+/// issues, and keeps none.
+#[derive(Debug, Default)]
+struct TicketCounter(std::sync::atomic::AtomicUsize);
+
+impl rustls::client::ClientSessionStore for TicketCounter {
+    fn set_kx_hint(&self, _: ServerName<'static>, _: rustls::NamedGroup) {}
+
+    fn kx_hint(&self, _: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        None
+    }
+
+    fn set_tls12_session(
+        &self,
+        _: ServerName<'static>,
+        _: rustls::client::Tls12ClientSessionValue,
+    ) {
+    }
+
+    fn tls12_session(&self, _: &ServerName<'_>) -> Option<rustls::client::Tls12ClientSessionValue> {
+        None
+    }
+
+    fn remove_tls12_session(&self, _: &ServerName<'static>) {}
+
+    fn insert_tls13_ticket(
+        &self,
+        _: ServerName<'static>,
+        _: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        _: &ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn a_node_issues_no_session_tickets() {
+    // Design §12: no session resumption, so every connection verifies a
+    // full chain, and without a ticket no client can send early data.
+    let ca = TestCa::new("ca");
+    let mut server = serve(&ca.credentials(&Leaf::node("n1"))).bounded().await;
+    let tickets = Arc::new(TicketCounter::default());
+    let mut config = (*raw_client(Some(ca.issue(&Leaf::node("n2"))), &[ALPN_PROTOCOL])).clone();
+    config.resumption = rustls::client::Resumption::store(tickets.clone());
+    config.enable_early_data = true;
+    let stream = TcpStream::connect(server.addr).bounded().await.unwrap();
+    let name = ServerName::try_from("skys3-node").unwrap();
+    let mut client = TlsConnector::from(Arc::new(config))
+        .connect(name, stream)
+        .bounded()
+        .await
+        .unwrap();
+    let mut inbound = server.next().bounded().await.unwrap();
+    // A TLS 1.3 server sends its tickets after the handshake; reading a
+    // frame the node sends afterwards processes any that came before it.
+    let beacon = Frame::new(Header::new(MessageKind::Beacon).with_request_id(1), "");
+    inbound.send(&beacon).bounded().await.unwrap();
+    let received = read_frame(&mut client).bounded().await.unwrap();
+    assert_eq!(received, Some(beacon));
+    assert_eq!(tickets.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let (_, session) = client.get_ref();
+    assert!(!session.is_early_data_accepted());
+}
+
 #[tokio::test]
 async fn admins_may_send_only_admin_messages() {
     let ca = TestCa::new("ca");

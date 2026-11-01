@@ -541,6 +541,36 @@ async fn reads_send_ranges_and_conditions() {
 }
 
 #[tokio::test]
+async fn a_ranged_read_answered_with_more_than_the_range_is_refused() {
+    let mock = Mock::start().await;
+    let store = mock.client();
+    let ranged = |last| GetObject::new("k").with_range(ByteRange::inclusive(0, last).unwrap());
+
+    // A store that ignores the range answers the whole object.
+    let whole = "x".repeat(100);
+    mock.reply(ok(&[("etag", "\"g1\""), ("content-length", "100")], &whole));
+    let error = store.get_object(ranged(9)).await.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("100 body bytes for a range of at most 10"),
+        "{error}"
+    );
+    mock.received();
+
+    // A suffix bounds the answer too.
+    mock.reply(ok(&[("etag", "\"g1\""), ("content-length", "100")], &whole));
+    let suffix = GetObject::new("k").with_range(ByteRange::suffix(4));
+    assert!(store.get_object(suffix).await.is_err());
+    mock.received();
+
+    // An object smaller than the range may be answered whole.
+    mock.reply(ok(&[("etag", "\"g1\""), ("content-length", "5")], "hello"));
+    let output = store.get_object(ranged(99)).await.unwrap();
+    assert_eq!(output.body, "hello");
+}
+
+#[tokio::test]
 async fn listings_parse_pages() {
     let mock = Mock::start().await;
     let store = mock.client();
