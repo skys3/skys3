@@ -6376,6 +6376,20 @@ of this file. A task with nothing unexpected keeps "None."
   `attempts::publish`, which the repairer uses too; the merge into M5-08
   applies the same fix there, with a oneshot telling the caller when the
   record is sequenced so it can still emit its `Appended` event.
+- **A commit task that panics (found in review).** The detached publish
+  task settled the attempt on every outcome of the inner commit task but
+  a `JoinError`, where it returned an error and left the attempt
+  publishing with no position. Nothing settles such an attempt, so
+  orphan reclamation's fence would hold its fragments for the encoder's
+  life: a leak, not a loss. Once the commit task is gone nothing more is
+  appended for it, so that arm now finishes the attempt (and emits
+  `Abandoned`) when nothing was appended, and otherwise records it as
+  sequenced at the shard's last sequenced position, at or after the
+  record, so it settles once the shard applies past it. Waiting for the
+  commit task moved into `Publishing::settle`, which takes the task's
+  handle; that is the seam the unit test
+  `a_commit_task_that_panics_still_settles_its_attempt` uses to hand it
+  a task that panics, before and after its record is sequenced.
 
 ### M5-10 Lifecycle expiration and multipart cleanup
 
