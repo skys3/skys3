@@ -547,18 +547,32 @@ fn a_publish_whose_caller_is_dropped_still_settles_its_attempt() {
         }
         // The scan is cancelled while the record commits: the record
         // commits all the same, and its attempt must not stay publishing,
-        // which would hold orphan reclamation's fence for good.
+        // which would hold orphan reclamation's fence for good. The
+        // observer still hears that it committed.
         encoding.abort();
+        let committed = |steps: &[EncodeStep]| {
+            steps.iter().any(|step| {
+                matches!(
+                    step,
+                    EncodeStep::Committed {
+                        published: true,
+                        ..
+                    }
+                )
+            })
+        };
         // The commit's writes run on blocking threads, so wait in real
         // time: a count of yields can run out on a busy machine.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while encoder.attempts().state(attempt).is_some() && tokio::time::Instant::now() < deadline
+        while (encoder.attempts().state(attempt).is_some() || !committed(&f.steps()))
+            && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(encoder.attempts().state(attempt), None);
         let entry = f.shard.entry("k").await.unwrap().unwrap();
         assert!(entry.object.unwrap().coded.is_some());
+        assert!(committed(&f.steps()), "{:?}", f.steps());
     });
 }
 
