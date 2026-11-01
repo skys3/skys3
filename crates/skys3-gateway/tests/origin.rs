@@ -54,6 +54,9 @@ struct State {
     change_after_head: Option<String>,
     /// The most items one page of the origin's listing holds.
     page_limit: Option<usize>,
+    /// Whether HEADs answer without `Last-Modified`, so a reader stamps
+    /// each answer with when it asked.
+    no_last_modified: bool,
 }
 
 fn etag_of(body: &[u8]) -> ETag {
@@ -91,6 +94,7 @@ impl Origin {
         let remote = RemoteObject {
             object,
             version_id: None,
+            last_modified_ms: Some(1_700_000_000_000),
         };
         let bytes = Bytes::copy_from_slice(body);
         self.lock().objects.insert(key.to_owned(), (remote, bytes));
@@ -240,7 +244,15 @@ impl RemoteReads for Origin {
                 OriginHead::Denied
             } else {
                 match state.objects.get(key) {
-                    Some((object, _)) => OriginHead::Found(Box::new(object.clone())),
+                    Some((object, _)) => {
+                        let mut found = object.clone();
+                        found.last_modified_ms = Some(found.object.last_modified_ms);
+                        if state.no_last_modified {
+                            found.last_modified_ms = None;
+                            found.object.last_modified_ms += 1_000 * state.heads as u64;
+                        }
+                        OriginHead::Found(Box::new(found))
+                    }
                     None => OriginHead::Missing,
                 }
             };
@@ -381,6 +393,12 @@ impl World {
         let shard = ShardRef::for_key(bucket, key);
         let entry = self.setup.shards.entry(&shard, key).await.unwrap();
         entry.map(|entry| entry.state)
+    }
+
+    async fn entry_version(&self, bucket: &BucketDocument, key: &str) -> Option<EpochSeq> {
+        let shard = ShardRef::for_key(bucket, key);
+        let entry = self.setup.shards.entry(&shard, key).await.unwrap();
+        entry.map(|entry| entry.version)
     }
 }
 
@@ -577,6 +595,70 @@ async fn a_metadata_only_change_at_the_origin_is_seen_by_the_next_read() {
     // Cached now, the new metadata is served again.
     let again = world.get("/mirror/k").await;
     assert_eq!(again.headers["content-type"], "application/json");
+}
+
+#[tokio::test]
+async fn a_metadata_only_change_within_the_same_second_is_seen_by_the_next_read() {
+    let world = World::new("").await;
+    world.bucket("mirror", "default").await;
+    world.origin.put("k", b"same");
+    let got = world.get("/mirror/k").await;
+    assert_eq!(got.headers["content-type"], "text/plain");
+    let modified = got.headers["last-modified"].clone();
+
+    // A copy onto itself with new metadata, within the second of the
+    // cached version: its ETag and `Last-Modified` stay.
+    {
+        let mut state = world.origin.lock();
+        let (object, _) = state.objects.get_mut("k").unwrap();
+        object
+            .object
+            .metadata
+            .insert("content-type".to_owned(), "application/json".to_owned());
+    }
+    let got = world.get("/mirror/k").await;
+    got.assert(200, None);
+    assert_eq!(got.body, "same");
+    assert_eq!(got.headers["last-modified"], modified);
+    assert_eq!(got.headers["content-type"], "application/json");
+    let (heads, gets, _) = world.origin.counts();
+    let again = world.get("/mirror/k").await;
+    assert_eq!(again.headers["content-type"], "application/json");
+    assert_eq!(world.origin.counts(), (heads + 1, gets, 0));
+}
+
+#[tokio::test]
+async fn an_origin_that_sends_no_last_modified_is_still_served_from_the_cache() {
+    let ttl = "freshness = \"ttl\"\nfreshness_ttl_seconds = 1\n";
+    // Under a TTL, each read comes after the answer before it expired.
+    for (buckets, expiry) in [("", Duration::ZERO), (ttl, Duration::from_millis(1100))] {
+        let world = World::new(buckets).await;
+        let bucket = world.bucket("mirror", "default").await;
+        world.origin.lock().no_last_modified = true;
+        world.origin.put("k", b"first");
+        assert_eq!(world.get("/mirror/k").await.body, "first");
+        assert_eq!(world.fills(), 1);
+        let version = world.entry_version(&bucket, "k").await;
+
+        // Every HEAD is stamped differently, yet names the cached version:
+        // reads serve it, without an `ADOPT` or another fill.
+        for _ in 0..3 {
+            tokio::time::sleep(expiry).await;
+            let (heads, _, _) = world.origin.counts();
+            let got = world.get("/mirror/k").await;
+            got.assert(200, None);
+            assert_eq!(got.body, "first");
+            assert_eq!(world.origin.counts().0, heads + 1);
+        }
+        assert_eq!(world.entry_version(&bucket, "k").await, version);
+        assert_eq!(world.fills(), 1);
+
+        // A change is still seen.
+        world.origin.put("k", b"second");
+        tokio::time::sleep(expiry).await;
+        assert_eq!(world.get("/mirror/k").await.body, "second");
+        assert_eq!(world.fills(), 2);
+    }
 }
 
 #[tokio::test]
