@@ -12,9 +12,13 @@ use skys3_flush::{Phase, ShardFlusher};
 use skys3_index::EntryState;
 use skys3_log::RecordBody;
 use skys3_remote::{ObjectStore, PutObject, UserMetadata};
+use skys3_shard::FlushState;
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Fault, Operation};
-use support::{Node, Patience, identity, md5_etag, remote, runtime, target, target_with, writes};
+use support::{
+    Node, Patience, at, body_target, identity, md5_etag, remote, runtime, target, target_with,
+    writes,
+};
 
 /// Waits until `key`'s phase satisfies `check`.
 async fn wait_for(flusher: &ShardFlusher, key: &str, check: impl Fn(Option<&Phase>) -> bool) {
@@ -431,4 +435,34 @@ fn an_error_is_reported_until_its_key_gets_past_it() {
         node.settle(&flusher).await;
         assert_eq!(flusher.status().last_error, None);
     });
+}
+
+/// A flusher follows its shard from the moment it is started, before its
+/// task first runs: a streamed body announced and a write-through wait
+/// asked at once both reach it. On this current-thread runtime nothing
+/// yields between the start and the asks, so the task cannot have run.
+#[tokio::test]
+async fn a_flusher_follows_its_shard_from_its_start() {
+    let node = Node::open(15).await;
+    let store = remote(15, false);
+    let seq = node.put("k", "k body").await;
+    let begun = node.begin("big").await;
+    let extents = node.extents("big", "0123456789abcdef", 4).await;
+    let target = body_target(
+        &store,
+        writes(true, true, true),
+        8,
+        Duration::from_secs(600),
+    );
+    let flusher = node.flusher(&target);
+    node.announce("big", begun, &extents);
+    let mut wait = node.shard.await_flush("k", at(seq)).unwrap();
+    assert_eq!(wait.answered().await, Some(FlushState::Flushed));
+    // The body's `PUT` never commits; its stream opened a remote upload.
+    let patience = Patience::new();
+    while flusher.status().streams == 0 {
+        assert!(!patience.is_exhausted(), "the body was never streamed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    flusher.stop().await;
 }
