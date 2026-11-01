@@ -35,6 +35,9 @@ const REFUSED_KEY: &str = "refused";
 /// A key whose appends the sink holds until [`TestSink::release`].
 const HELD_KEY: &str = "held";
 
+/// A key whose appends panic, as a sink with a bug might.
+const PANICKING_KEY: &str = "panicking";
+
 fn identity(seq: u64) -> WriteIdentity {
     format!("{US}/{SOURCE_BUCKET}/5/42.{seq}").parse().unwrap()
 }
@@ -71,8 +74,9 @@ struct Appended {
 
 /// Stands in for the shard primaries: stores each extent at the next
 /// position, fails the first append at each offset in `fail_once`,
-/// refuses every append of [`REFUSED_KEY`], and holds each append of
-/// [`HELD_KEY`] until it is released.
+/// refuses every append of [`REFUSED_KEY`], holds each append of
+/// [`HELD_KEY`] until it is released, and panics in each append of
+/// [`PANICKING_KEY`].
 #[derive(Debug, Clone, Default)]
 struct TestSink {
     state: Arc<Mutex<SinkState>>,
@@ -86,6 +90,8 @@ struct SinkState {
     attempts: usize,
     /// Appends of [`HELD_KEY`] that started.
     holding: usize,
+    /// Appends of [`PANICKING_KEY`] that started.
+    panicking: usize,
 }
 
 impl TestSink {
@@ -107,6 +113,10 @@ impl TestSink {
         self.state.lock().unwrap().holding
     }
 
+    fn panicking(&self) -> usize {
+        self.state.lock().unwrap().panicking
+    }
+
     /// Lets one held append go on.
     fn release(&self) {
         self.held.notify_one();
@@ -125,6 +135,10 @@ impl ExtentSink for TestSink {
         if key == HELD_KEY {
             self.state.lock().unwrap().holding += 1;
             self.held.notified().await;
+        }
+        if key == PANICKING_KEY {
+            self.state.lock().unwrap().panicking += 1;
+            panic!("the sink failed to stage an extent");
         }
         // Let other appends and messages interleave.
         tokio::task::yield_now().await;
@@ -848,5 +862,81 @@ async fn a_commit_waits_for_frames_another_stream_has_in_flight() {
     assert_eq!(staged.unwrap().extents(1, FRAME).unwrap().len(), 1);
     assert_eq!(sink.appended().len(), 1);
     assert_eq!(sink.holding(), 1);
+    second.close();
+}
+
+/// An append whose task panics still settles what it admitted, as failed:
+/// a `COMMIT` on another stream, which waits for every frame in flight of
+/// its staging, is answered at once with what is staged, and the staging
+/// expires once nothing more comes for it.
+#[tokio::test]
+async fn a_panicking_append_neither_holds_a_commit_nor_keeps_its_staging() {
+    let sink = TestSink::default();
+    let commits = TestCommits::default();
+    let setup = setup_with(sink.clone(), LIMITS, commits.clone());
+    let body = body(FRAME);
+    let id = identity(1);
+    commits.answer(
+        &id,
+        Outcome::Failed {
+            error: ApplyError::Incomplete,
+            reason: "piece 1 has a gap".into(),
+        },
+    );
+
+    // The first stream's append panics.
+    let (first, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, PANICKING_KEY))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    async {
+        while sink.panicking() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    .bounded()
+    .await;
+
+    // The second stream commits without resending the frame.
+    let (second, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, PANICKING_KEY))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&staged_commit(&id, PANICKING_KEY, FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(5), applied(&mut stream))
+        .await
+        .expect("the COMMIT waited on the panicked append");
+    assert!(matches!(
+        answer.outcome,
+        Outcome::Failed {
+            error: ApplyError::Incomplete,
+            ..
+        }
+    ));
+    let (seen, staged) = commits.seen().pop().unwrap();
+    assert_eq!(seen, id);
+    assert_eq!(staged.unwrap().extents(1, FRAME), None);
+
+    // Unpinned, the staging expires, and its source's quota is released.
+    let later = tokio::time::Instant::now() + LIMITS.ttl;
+    assert_eq!(setup.staging.expire(later), [id]);
+    assert!(setup.staging.is_empty());
+    assert_eq!(setup.staging.used(&common::id(US)), 0);
+    first.close();
     second.close();
 }

@@ -37,6 +37,13 @@ const MOVE_PAUSE: Duration = Duration::from_millis(20);
 /// The longest pause between two asks of a shard moving to a new primary.
 const MOVE_PAUSE_MAX: Duration = Duration::from_millis(200);
 
+/// How much longer than its wait a forwarded [`Request::Flushed`] may take
+/// before its answer counts as lost: long enough for the replica's
+/// `Pending` to arrive. A primary that took the ask and fell silent then
+/// holds a write-through write for one wait, not the request timeout,
+/// before the call asks the shard's other members and its register.
+const FLUSH_ANSWER_GRACE: Duration = Duration::from_secs(1);
+
 /// The timing of [`RoutedShards`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingConfig {
@@ -488,15 +495,11 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
             self.forget_idle(node);
             Attempt::Lost(error)
         };
-        let reply: Frame = match tokio::time::timeout(self.config.request_timeout, exchange).await {
+        let timeout = self.answer_timeout(request);
+        let reply: Frame = match tokio::time::timeout(timeout, exchange).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(error)) => return lost(error),
-            Err(_) => {
-                return lost(format!(
-                    "no answer within {:?}",
-                    self.config.request_timeout
-                ));
-            }
+            Err(_) => return lost(format!("no answer within {timeout:?}")),
         };
         match wire::decode_reply(&reply, shard) {
             Ok(reply) => {
@@ -510,6 +513,17 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// Drops the idle connections to `node`.
     fn forget_idle(&self, node: &NodeId) {
         lock(&self.inner.idle).remove(node);
+    }
+
+    /// How long the answer to `request` may take once sent: a flush wait's
+    /// own wait and [`FLUSH_ANSWER_GRACE`], and the request timeout at most.
+    fn answer_timeout(&self, request: &Request) -> Duration {
+        match request {
+            Request::Flushed { wait, .. } => {
+                (*wait + FLUSH_ANSWER_GRACE).min(self.config.request_timeout)
+            }
+            _ => self.config.request_timeout,
+        }
     }
 
     /// Sends `request`, a holder's (see [`Request::is_holder`]), to the
@@ -858,7 +872,9 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
         wait: Duration,
     ) -> Result<FlushState, ShardError> {
         // Answered well within the request's timeout: a wait that ends
-        // unanswered is `Pending`, and the caller asks again.
+        // unanswered is `Pending`, and the caller asks again. A member that
+        // does not answer within the wait and `FLUSH_ANSWER_GRACE` is passed
+        // over (`answer_timeout`).
         let wait = wait
             .min(self.config.request_timeout / 2)
             .min(wire::MAX_FLUSH_WAIT);
