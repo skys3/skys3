@@ -44,9 +44,9 @@ use skys3_coord::{FragmentPlanner, NoGeometry, StripeRequest};
 use skys3_index::{Entry, EntryState, IndexError, ObjectVersion, Payload};
 use skys3_io::{Disk, WallClock};
 use skys3_log::record::{EcPublish, ExtentRef, LogRecord, MAX_HEADER_LEN, MAX_STRIPES, RecordBody};
-use skys3_shard::{Effect, Outcome, Rejection, Role, Shard, ShardError};
+use skys3_shard::{Committed, Effect, Outcome, Rejection, Role, Shard, ShardError};
 use skys3_types::{AttemptId, CodedStripe, Epoch, EpochSeq, NodeId, Seq};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 pub use attempts::{AttemptState, Attempts};
 
@@ -670,19 +670,30 @@ impl<D: Disk> Publishing<D> {
     /// record commits or is never appended, and publishing, at the
     /// record's position if known, while the record may commit yet.
     async fn run(self, publish: EcPublish) -> Result<Encoded, EncodeError> {
-        let (key, attempt) = (self.key.as_str(), self.attempt);
-        let emit = |step| emit(self.observer.as_ref(), key, attempt, step);
         // The commit runs on a task of its own too, so an observer hears
         // that the record is sequenced before it commits.
         let before = self.shard.last_sequenced();
         let shard = self.shard.clone();
         // Only in the attempt's epoch: a later primary may have judged its
         // fragments orphans (§8.4).
-        let commit = tokio::spawn(async move {
-            shard
-                .commit_in(attempt.epoch, RecordBody::EcPublish(publish))
-                .await
-        });
+        let epoch = self.attempt.epoch;
+        let commit =
+            tokio::spawn(
+                async move { shard.commit_in(epoch, RecordBody::EcPublish(publish)).await },
+            );
+        self.settle(before, commit).await
+    }
+
+    /// Waits for `commit`, the task committing the record, which started
+    /// when the shard's last sequenced record was `before`, and settles the
+    /// attempt as [`Publishing::run`] says.
+    async fn settle(
+        self,
+        before: Seq,
+        commit: JoinHandle<Result<Committed, ShardError>>,
+    ) -> Result<Encoded, EncodeError> {
+        let (key, attempt) = (self.key.as_str(), self.attempt);
+        let emit = |step| emit(self.observer.as_ref(), key, attempt, step);
         while self.shard.last_sequenced() == before && !commit.is_finished() {
             tokio::task::yield_now().await;
         }
@@ -708,6 +719,19 @@ impl<D: Disk> Publishing<D> {
                 return Err(EncodeError::Publish(error));
             }
             Err(error) => {
+                // The commit task panicked. Once it is gone nothing more is
+                // appended for it: an attempt that appended nothing never
+                // publishes, and one whose record may be sequenced is
+                // settled once the shard applies past everything sequenced
+                // so far, which the record is at or before.
+                if appended {
+                    let through =
+                        EpochSeq::new(self.shard.sequencing(), self.shard.last_sequenced());
+                    self.attempts.sequenced(attempt, Some(through));
+                } else {
+                    self.attempts.finish(attempt);
+                    emit(EncodeStep::Abandoned);
+                }
                 return Err(EncodeError::Publish(ShardError::Unavailable {
                     shard: self.shard.shard().clone(),
                     reason: error.to_string(),
@@ -883,5 +907,116 @@ impl<'a, D: Disk> StripeReader<'a, D> {
             out.extend_from_slice(&bytes[from..to]);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use skys3_index::IndexConfig;
+    use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
+    use skys3_log::record::Delete;
+    use skys3_log::{LogConfig, SegmentLog, ShardRef};
+    use skys3_types::{BucketId, ProposalId, ShardConfig, ShardId};
+
+    use super::*;
+
+    /// A shard alone in epoch 1, on its own disk.
+    async fn open_shard(disk: &SimDisk) -> Shard<SimMount> {
+        let config = LogConfig {
+            inline_max_bytes: 512,
+            segment_bytes: 1 << 20,
+            group_commit_max_delay: Duration::ZERO,
+            group_commit_max_bytes: 256 * 1024,
+        };
+        let clock = Arc::new(MonotonicClock::new());
+        let (log, _) = SegmentLog::open(disk.mount(), config, clock).await.unwrap();
+        let index =
+            skys3_index::Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default())
+                .unwrap();
+        let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+        let shard = ShardRef::new(BucketId::new("b-ec").unwrap(), ShardId::new(0));
+        let node: NodeId = "n0".parse().unwrap();
+        let config = ShardConfig {
+            bucket_id: shard.bucket.clone(),
+            shard: shard.shard,
+            epoch: Epoch::new(1),
+            primary: node.clone(),
+            members: vec![node],
+            learners: Vec::new(),
+            min_write_replicas: 1,
+            replicas: 1,
+            proposal_id: ProposalId::new("p-1").unwrap(),
+        };
+        Shard::open(&config, log, Arc::new(index), pool)
+            .await
+            .unwrap()
+    }
+
+    /// A publishing attempt on `shard`, and the steps its observer sees.
+    fn publishing_attempt(
+        shard: &Shard<SimMount>,
+        attempts: &Attempts,
+    ) -> (Publishing<SimMount>, Arc<Mutex<Vec<EncodeStep>>>) {
+        let attempt = AttemptId::new(Epoch::new(1), 0);
+        attempts.begin(attempt);
+        assert!(attempts.publish(attempt));
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&steps);
+        let publishing = Publishing {
+            shard: shard.clone(),
+            attempts: attempts.clone(),
+            observer: Some(Arc::new(move |event: &EncodeEvent| {
+                seen.lock().unwrap().push(event.step.clone());
+            })),
+            key: "k".to_owned(),
+            attempt,
+        };
+        (publishing, steps)
+    }
+
+    #[tokio::test]
+    async fn a_commit_task_that_panics_still_settles_its_attempt() {
+        let disk = SimDisk::new(7);
+        let shard = open_shard(&disk).await;
+        let attempts = Attempts::default();
+
+        // It panics before anything is appended: the attempt can never
+        // publish, so it is forgotten, which lifts reclamation's fence.
+        let (publishing, steps) = publishing_attempt(&shard, &attempts);
+        let attempt = publishing.attempt;
+        let commit = tokio::spawn(async { panic!("the commit task panics") });
+        let error = publishing
+            .settle(shard.last_sequenced(), commit)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EncodeError::Publish(_)), "{error}");
+        assert_eq!(attempts.state(attempt), None);
+        assert_eq!(*steps.lock().unwrap(), [EncodeStep::Abandoned]);
+
+        // It panics once its record is sequenced: the attempt stays
+        // publishing until the shard applies past the record.
+        let (publishing, steps) = publishing_attempt(&shard, &attempts);
+        let before = shard.last_sequenced();
+        let committer = shard.clone();
+        let commit = tokio::spawn(async move {
+            let body = RecordBody::Delete(Delete {
+                key: "k".to_owned(),
+            });
+            committer.commit(body).await.unwrap();
+            panic!("the commit task panics")
+        });
+        publishing.settle(before, commit).await.unwrap_err();
+        let through = EpochSeq::new(Epoch::new(1), shard.last_sequenced());
+        assert_eq!(
+            attempts.state(attempt),
+            Some(AttemptState::Publishing {
+                position: Some(through)
+            })
+        );
+        assert_eq!(*steps.lock().unwrap(), [EncodeStep::Appended]);
+        attempts.settle(shard.applied());
+        assert_eq!(attempts.state(attempt), None);
     }
 }
