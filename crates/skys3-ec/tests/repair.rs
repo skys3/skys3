@@ -1,12 +1,13 @@
 //! Repair on a shard alone (§8.6): which fragments count as lost, the
 //! order stripes are repaired in, what an `EC_RELOCATE` moves, and how a
 //! repair fails; and the fragment moves of a pass that found nothing lost
-//! (§8.3, plan M5-09): drains, balance, their fence, and their place after
-//! repairs.
+//! (§8.3, plan M5-09): drains, balance, their fence, their place after
+//! repairs, and, on a replicated shard, their wait for a relocation whose
+//! commit was not confirmed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,18 +18,20 @@ use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::read::ReadFuture;
 use skys3_ec::repair::RepairBug;
 use skys3_ec::{
-    Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment, FragmentBytes,
-    FragmentId, FragmentLocation, FragmentReadError, FragmentRequest, FragmentSource,
-    FragmentWriter, PlannerSource, RepairBandwidth, RepairEvent, RepairMetrics, RepairReport,
-    RepairSettings, RepairStep, Repairer, TransferError, codec, read_coded, rebuild_layouts,
+    AttemptState, Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment,
+    FragmentBytes, FragmentId, FragmentLocation, FragmentReadError, FragmentRequest,
+    FragmentSource, FragmentWriter, PlannerSource, RepairBandwidth, RepairEvent, RepairMetrics,
+    RepairReport, RepairSettings, RepairStep, Repairer, TransferError, codec, read_coded,
+    rebuild_layouts,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Extent, Put, PutData, Tags};
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
-use skys3_shard::Shard;
+use skys3_shard::{AckTimeout, Shard};
 use skys3_types::{
-    BucketId, CodedStripe, ETag, Epoch, EpochSeq, NodeId, ProposalId, ShardConfig, ShardId,
+    BucketId, CodedStripe, ETag, Epoch, EpochSeq, Label, NodeId, ProposalId, Seq, ShardConfig,
+    ShardId,
 };
 use tokio::sync::watch;
 
@@ -77,6 +80,68 @@ async fn open_shard(disk: &SimDisk) -> Shard<SimMount> {
     Shard::open(&config, log, Arc::new(index), pool)
         .await
         .unwrap()
+}
+
+/// The primary of the shard [`open_shard`] opens, replicated to two more
+/// members, which acknowledge every record sequenced while `acking` holds.
+/// A record sequenced while it does not fails as not acknowledged, after
+/// 100 ms, and waits through (§5.2): it commits once `acking` holds again.
+async fn open_replicated(disk: &SimDisk, acking: Arc<AtomicBool>) -> Shard<SimMount> {
+    let config = LogConfig {
+        inline_max_bytes: 512,
+        segment_bytes: 1 << 20,
+        group_commit_max_delay: Duration::ZERO,
+        group_commit_max_bytes: 256 * 1024,
+    };
+    let clock = Arc::new(MonotonicClock::new());
+    let (log, _) = SegmentLog::open(disk.mount(), config, clock).await.unwrap();
+    let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
+    let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+    let shard = ShardRef::new(BucketId::new("b-ec").unwrap(), ShardId::new(0));
+    let members: Vec<NodeId> = (0..3)
+        .map(|n| format!("member-{n}").parse().unwrap())
+        .collect();
+    let config = ShardConfig {
+        bucket_id: shard.bucket.clone(),
+        shard: shard.shard,
+        epoch: Epoch::new(1),
+        primary: members[0].clone(),
+        members: members.clone(),
+        learners: Vec::new(),
+        min_write_replicas: 3,
+        replicas: 3,
+        proposal_id: ProposalId::new("p-1").unwrap(),
+    };
+    let primary = Shard::open_replica(&config, &members[0], log, Arc::new(index), pool)
+        .await
+        .unwrap();
+    primary.set_ack_timeout(AckTimeout::wait_through(Duration::from_millis(100)));
+    let leader = Arc::clone(primary.leader().unwrap());
+    for member in &members[1..] {
+        leader.synced(member, Seq::ZERO);
+    }
+    // The members' leases let the primary read entries.
+    leader.start_leases(Arc::new(MonotonicClock::new()), Duration::from_secs(600));
+    let stamp = leader.lease_stamp().unwrap();
+    for member in &members[1..] {
+        leader.granted(member, stamp);
+    }
+    while !primary.is_serving() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let acknowledging = primary.clone();
+    tokio::spawn(async move {
+        loop {
+            if acking.load(Ordering::SeqCst) {
+                let last = acknowledging.last_sequenced();
+                for member in &members[1..] {
+                    leader.acknowledged(member, last);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    primary
 }
 
 async fn write(shard: &Shard<SimMount>, key: &str, data: &[u8], tag: u64) -> EpochSeq {
@@ -281,6 +346,18 @@ impl Fixture {
     async fn coded(objects: usize, nodes: usize, policy: EcConfig) -> Self {
         let disk = SimDisk::new(11);
         let shard = open_shard(&disk).await;
+        Self::coded_on(disk, shard, objects, nodes, policy).await
+    }
+
+    /// [`Fixture::coded`] on `shard`, which keeps its log and index on
+    /// `disk`.
+    async fn coded_on(
+        disk: SimDisk,
+        shard: Shard<SimMount>,
+        objects: usize,
+        nodes: usize,
+        policy: EcConfig,
+    ) -> Self {
         let fixture = Self {
             _disk: disk,
             shard,
@@ -822,6 +899,56 @@ fn an_attempt_abandoned_by_the_fence_never_relocates() {
 }
 
 #[test]
+fn a_repair_whose_caller_is_dropped_still_settles_and_reports_it() {
+    runtime().block_on(async {
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        f.nodes.wipe(5);
+        let repairer = Arc::new(f.repairer(planner(6, EcConfig::default(), Vec::new()), SETTINGS));
+        let pass = tokio::spawn({
+            let repairer = Arc::clone(&repairer);
+            async move { repairer.pass().await }
+        });
+        let attempt = loop {
+            let publishing = f.attempts.in_progress().into_iter().find(|&attempt| {
+                matches!(
+                    f.attempts.state(attempt),
+                    Some(AttemptState::Publishing { .. })
+                )
+            });
+            if let Some(attempt) = publishing {
+                break attempt;
+            }
+            assert!(!pass.is_finished(), "the pass ended before it published");
+            tokio::task::yield_now().await;
+        };
+        // The pass is cancelled while the record commits: the attempt is
+        // settled all the same, and the observer hears that it committed.
+        pass.abort();
+        let committed = |events: &[RepairEvent]| {
+            events.iter().any(|event| {
+                event.attempt == attempt
+                    && matches!(
+                        event.step,
+                        RepairStep::Committed {
+                            relocated: true,
+                            ..
+                        }
+                    )
+            })
+        };
+        // The commit's writes run on blocking threads: wait in real time.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while (f.attempts.state(attempt).is_some() || !committed(&f.events.lock().unwrap()))
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(f.attempts.state(attempt), None);
+        assert!(committed(&f.events.lock().unwrap()), "{:?}", f.steps());
+    });
+}
+
+#[test]
 fn a_repair_of_a_superseded_version_is_rejected() {
     runtime().block_on(async {
         let f = Fixture::coded(1, 6, EcConfig::default()).await;
@@ -1218,5 +1345,166 @@ fn moves_are_fenced_like_repairs() {
         let report = pass.await.unwrap();
         assert_eq!(report.moved, 1, "{report:?}");
         g.check_whole().await;
+    });
+}
+
+#[test]
+fn moves_wait_for_a_relocation_that_may_still_commit() {
+    moves_wait_for_an_unconfirmed_relocation(false);
+}
+
+#[test]
+fn moves_wait_for_a_relocation_whose_pass_was_dropped() {
+    moves_wait_for_an_unconfirmed_relocation(true);
+}
+
+/// A second pass moves nothing while the first pass's relocation, which
+/// its members did not acknowledge, may still commit; with `dropped`, the
+/// first pass is cancelled while the relocation commits.
+fn moves_wait_for_an_unconfirmed_relocation(dropped: bool) {
+    runtime().block_on(async {
+        let acking = Arc::new(AtomicBool::new(true));
+        let disk = SimDisk::new(11);
+        let shard = open_replicated(&disk, Arc::clone(&acking)).await;
+        let f = Fixture::coded_on(disk, shard, 1, 4, two_plus_two()).await;
+        // Every stripe is on the same four nodes. The first stripe, the
+        // first a pass plans for, holds fragment 0 on `y`, 1 on `p`, 2 on
+        // `q`, and 3 on `x`. Racks of a 2+2 stripe hold at most 2 of it:
+        // rack a holds `y`, rack b `p` and the nodes moves go to, and rack
+        // c `q` and `x`.
+        let first = f.layouts().await["object-0"][0].clone();
+        let at: Vec<NodeId> = first.fragments().iter().map(|l| l.node.clone()).collect();
+        let (y, p, q, x) = (&at[0], &at[1], &at[2], &at[3]);
+        let candidate = |node: &NodeId, rack: &str, capacity: u64, state| Candidate {
+            node: node.clone(),
+            zone: None,
+            rack: Some(Label::new(rack.to_owned()).unwrap()),
+            capacity_bytes: capacity,
+            state,
+            shards: 0,
+            primaries: 0,
+        };
+        let listed = Arc::new(Mutex::new(vec![
+            candidate(y, "a", 1 << 40, NodeState::Live),
+            candidate(p, "b", 1 << 40, NodeState::Live),
+            candidate(q, "c", 1 << 40, NodeState::Live),
+            candidate(x, "c", 1 << 40, NodeState::Departing),
+            candidate(&node(4), "b", 1 << 40, NodeState::Live),
+        ]));
+        let racks: PlannerSource = Arc::new({
+            let listed = Arc::clone(&listed);
+            move || {
+                let topology = Topology::new(FailureDomain::Rack, listed.lock().unwrap().clone());
+                FragmentPlanner::new(
+                    topology,
+                    GeometryPolicy::from_config(&two_plus_two()).unwrap(),
+                )
+            }
+        });
+        let one = RepairSettings {
+            moves_per_pass: 1,
+            ..MOVING
+        };
+        let repairer = Arc::new(f.repairer(racks, one));
+
+        // The first pass drains fragment 3 of the first stripe from `x` to
+        // node 4, bringing rack b to 2, and its members do not acknowledge
+        // the move's record, which keeps its position.
+        acking.store(false, Ordering::SeqCst);
+        if dropped {
+            // The pass is cancelled once the record is sequenced: what
+            // becomes of it is still heard on the commit's task.
+            let pass = tokio::spawn({
+                let repairer = Arc::clone(&repairer);
+                async move { repairer.pass().await }
+            });
+            let publishing = |attempt| {
+                matches!(
+                    f.attempts.state(attempt),
+                    Some(AttemptState::Publishing { position: None })
+                )
+            };
+            let attempt = loop {
+                let found = f
+                    .attempts
+                    .in_progress()
+                    .into_iter()
+                    .find(|&a| publishing(a));
+                if let Some(attempt) = found
+                    && f.steps().contains(&RepairStep::Appended)
+                {
+                    break attempt;
+                }
+                assert!(!pass.is_finished(), "the pass ended before it published");
+                tokio::task::yield_now().await;
+            };
+            pass.abort();
+            // The commit fails as not acknowledged after 100 ms.
+            while publishing(attempt) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // The commit's task reports the outcome right after it records
+            // the position.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        } else {
+            let report = repairer.pass().await;
+            assert_eq!((report.moved, report.unmoved), (0, 1), "{report:?}");
+        }
+        assert!(matches!(
+            &f.steps()[0],
+            RepairStep::MoveStarted { pass: 1, index: 3, from, to, .. }
+                if from == x && *to == node(4)
+        ));
+        assert!(f.shard.applied().seq < f.shard.last_sequenced());
+
+        // `y` departs and node 5 joins rack b, with more room than node 4.
+        // The index does not show the first move yet: a second pass that
+        // moved would drain `y` to node 5, into rack b, which would hold 3
+        // of the stripe once both records apply. It moves nothing.
+        {
+            let mut listed = listed.lock().unwrap();
+            listed[0].state = NodeState::Departing;
+            listed.push(candidate(&node(5), "b", 1 << 41, NodeState::Live));
+        }
+        let report = repairer.pass().await;
+        assert_eq!(report.lost, 0, "{report:?}");
+        acking.store(true, Ordering::SeqCst);
+        while f.shard.applied().seq < f.shard.last_sequenced() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let rack_of: BTreeMap<NodeId, String> = listed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| (c.node.clone(), c.rack.as_ref().unwrap().to_string()))
+            .collect();
+        let within_caps = |layouts: &BTreeMap<String, Vec<CodedStripe>>| {
+            layouts.values().flatten().all(|stripe| {
+                let mut held: BTreeMap<&str, usize> = BTreeMap::new();
+                for location in stripe.fragments() {
+                    *held.entry(rack_of[&location.node].as_str()).or_default() += 1;
+                }
+                held.values()
+                    .all(|&n| n <= stripe.geometry().parity_fragments())
+            })
+        };
+        let layouts = f.layouts().await;
+        assert!(within_caps(&layouts), "{layouts:?}");
+        assert_eq!(layouts["object-0"][0].fragments()[3].node, node(4));
+        assert_eq!((report.moved, report.unmoved), (0, 0), "{report:?}");
+        assert!(
+            !f.steps()
+                .iter()
+                .any(|step| matches!(step, RepairStep::MoveStarted { pass: 2, .. }))
+        );
+
+        // Once the first move is applied, passes move again, from the
+        // layout it left: `y`'s fragment of the first stripe has nowhere to
+        // go, another stripe's has.
+        let report = repairer.pass().await;
+        assert_eq!(report.moved, 1, "{report:?}");
+        let layouts = f.layouts().await;
+        assert!(within_caps(&layouts), "{layouts:?}");
+        f.check_whole().await;
     });
 }
