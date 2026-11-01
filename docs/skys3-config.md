@@ -46,6 +46,7 @@ Only `[cluster]` and its `cluster_id` are required. Every other key has a defaul
 |---|---|---|---|
 | `cluster_id` | string | required | 1 to 24 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. The limit keeps every write identity within 96 bytes (§7.2). |
 | `failure_domain` | `"node"`, `"rack"`, or `"zone"` | `"node"` | The level at which shard members and fragments are kept apart (§6.7). |
+| `multi_node` | boolean | `false` | Whether the node runs as one of several nodes of the cluster (design §6.2, §6.7): it binds the `[transport]` listener, registers itself in `nodes/<node-id>.json`, sends the coordinator heartbeats, and receives pushed generations. It needs `backend = "etcd"` or `"s3"`, never `"file"`, which serves one node; the three `[transport]` certificate files; and an address other nodes reach it at (`[transport] advertise`, or a `listen` that is neither a wildcard address nor port 0). Until replication is wired into the binary (plan M8-05b), each node still serves every shard of its buckets alone. A gate that plan M8-09 removes once the cluster is complete in the binary. |
 
 ## `[node]`
 
@@ -56,6 +57,8 @@ This node's identity and its directories (§10).
 | `node_id` | string | generated | A node ID: 1 to 63 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. When unset, the node generates one when it creates its data directory and keeps it. A node whose data directory holds another ID, or another cluster's data, refuses to start. |
 | `data_dir` | path | `"/var/lib/skys3"` | Not empty. Holds the node's identity (`node.json`), its index (`index.redb`), and, by default, the file control store. One process uses it at a time. |
 | `disks` | array of paths | `["<data_dir>/log"]` | 1 to 64 distinct, non-empty directories, one per disk, each holding that disk's log segments. A node keeps the disks it was created with: each shard replica's records stay on one disk, so starting with a disk added or missing is refused. |
+| `zone` | string | none | A label: 1 to 63 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. The node's zone, which it registers (§6.7) and placement keeps shard members apart by under `failure_domain = "zone"`. A node without the label its level needs receives no shard members. |
+| `rack` | string | none | A label, as `zone`. The node's rack, for `failure_domain = "rack"`. Rack names are compared across the whole cluster. |
 
 ## `[gateway]`
 
@@ -66,6 +69,7 @@ The S3 and STS listener (§3, §11).
 | `listen` | socket address | `"127.0.0.1:9000"` | |
 | `tls_cert_file` | path | none | A PEM file with the certificate chain, leaf first. With `tls_key_file`, the gateway serves HTTPS (TLS 1.2 and 1.3, `rustls` with `aws-lc-rs`); without both, plain HTTP. Not empty, and set together with `tls_key_file`. |
 | `tls_key_file` | path | none | A PEM file with the private key (PKCS#8, PKCS#1, or SEC1). Not empty, and set together with `tls_cert_file`. |
+| `max_inflight_handshakes` | integer | `256` | From 1 to 65536. How many TLS handshakes the gateway runs at once (design §12). Further connections wait in the kernel's accept queue until one finishes, so a flood of connections that never finish a handshake holds at most this many tasks and TLS states, each for up to 30 seconds. Applies only with HTTPS. |
 
 ## `[control_store]`
 
@@ -73,7 +77,7 @@ Where the cluster's registers live (§6.1).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `backend` | `"etcd"`, `"s3"`, or `"file"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe, which a node runs before it uses the store. `"file"` keeps the registers in a local directory, for a single-node cluster; it refuses to serve a second node, and is never allowed with more than one node. Until replication is wired into the binary (plan M8-05b), each node serves every shard alone, so a node refuses to start on an etcd or S3 store whose `nodes/` names another node (design §6.2). Give each node a store or `prefix` of its own: nodes register from plan M8-04, so until then the check cannot see a second node. |
+| `backend` | `"etcd"`, `"s3"`, or `"file"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe, which a node runs before it uses the store. `"file"` keeps the registers in a local directory, for a single-node cluster; it refuses to serve a second node, and is never allowed with more than one node. With `[cluster] multi_node = false`, the default, a node serves every shard of its buckets alone, so it refuses to start on an etcd or S3 store whose `nodes/` names another node (design §6.2). Only nodes with `multi_node = true` register, so give each single node a store or `prefix` of its own. With `multi_node = true`, nodes share the store and register in it, and a node refuses to start while `nodes/<node-id>.json` registers its node ID for another data directory. |
 | `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for the other backends. The client URLs of the etcd members, `https://`, or `http://` on loopback only (`127.0.0.0/8`, `[::1]`, `localhost`): whoever can write the store can reassign shards (design §12). Port 2379 if none is given; a request that goes unanswered moves to the next. |
 | `etcd_tls_ca_file` | path | none | The PEM CA certificates that verify the `https://` endpoints' certificates; without it, the system's root certificates. Not empty. Allowed only with an `https://` endpoint. |
 | `etcd_tls_cert_file` | path | none | The PEM client certificate chain, leaf first, that etcd's `--client-cert-auth` checks. Set together with `etcd_tls_key_file`. Allowed only with an `https://` endpoint. |
@@ -94,16 +98,18 @@ Where the cluster's registers live (§6.1).
 
 ## `[transport]`
 
-The intra-cluster transport: TCP with mutual TLS between the nodes of the cluster (design §12). Certificates come from the operator's PKI. The node certificate names the node with the URI subject alternative name `spiffe://<cluster_id>/node/<node-id>`, and the node's ID is the one its certificate names. The files are read when the node starts.
+The intra-cluster transport: TCP with mutual TLS between the nodes of the cluster (design §12). Certificates come from the operator's PKI. The node certificate names the node with the URI subject alternative name `spiffe://<cluster_id>/node/<node-id>`, and the node's ID is the one its certificate names: a node whose certificate names another node, or another cluster, does not start. The files are read when the node starts. The node binds the listener only with `[cluster] multi_node = true`.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `listen` | socket address | `"0.0.0.0:7400"` | |
+| `advertise` | `host:port` | `listen` | A node address: a DNS name, an IPv4 address, or a bracketed IPv6 address, and a port from 1 to 65535. Where other nodes reach the listener, which the node registers in `nodes/<node-id>.json` (§6.7). Required with `[cluster] multi_node = true` when `listen` is a wildcard address (`0.0.0.0`, `[::]`) or port 0. |
+| `max_inflight_handshakes` | integer | `256` | From 1 to 65536. How many TLS handshakes the listener runs at once (design §12). Further connections wait in the kernel's accept queue until one finishes, so a flood of connections that never finish a handshake holds at most this many tasks and TLS states, each for up to 10 seconds. |
 | `tls_cert_file` | path | none | The node's certificate chain in PEM, leaf first. Not empty. |
 | `tls_key_file` | path | none | The leaf's private key in PEM (PKCS #8, PKCS #1, or SEC1). Not empty. |
 | `tls_ca_file` | path | none | The CA certificates every peer's chain must lead to, in PEM. Not empty. |
 
-The three files are set together or not at all. A node without them runs alone and does not open the transport.
+The three files are set together or not at all, and are required with `[cluster] multi_node = true`. Peering (`[peering.peers]`) presents the same certificate.
 
 ## `[replication]`
 
@@ -231,6 +237,7 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
 | `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
 | `peer_staging_ttl_seconds` | integer | `86400` | Positive. Also how long compaction keeps `EXTENT` records that nothing names (§10.3), so a client's request body must arrive within half of it, or it is refused with `400 RequestTimeout`. |
+| `peer_max_inflight_handshakes` | integer | `256` | From 1 to 65536. How many QUIC handshakes, `HELLO`s included, the peer endpoint runs at once (design §12). A connection that arrives while all of them run is refused at once, so a flood holds at most this many, each for up to `peer_connect_timeout_ms`; a refused source tries again later, or falls back to S3 REST. |
 
 ### `[peering.peers.<cluster-id>]`
 

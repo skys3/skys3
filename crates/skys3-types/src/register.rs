@@ -340,6 +340,12 @@ pub struct NodeRegistration {
     pub rack: Option<Label>,
     /// The node's disks.
     pub disks: Vec<DiskInfo>,
+    /// The instance ID of the data directory the node registered from
+    /// (§6.7): a node does not register over a registration of its node ID
+    /// from another data directory. Written only when set; a registration
+    /// without one, from a tool or an earlier build, is adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<Label>,
     /// Whether the coordinator is forgetting the node (§6.7): placement
     /// assigns it nothing, and the node clears the mark by registering
     /// again. Written only when set.

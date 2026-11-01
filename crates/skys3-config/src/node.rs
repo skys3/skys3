@@ -6,9 +6,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use skys3_types::NodeId;
+use skys3_types::{Label, NodeId};
 
 use crate::error::Checker;
+use crate::transport::{DEFAULT_MAX_INFLIGHT_HANDSHAKES, check_handshake_cap};
 
 /// `[node]`: the node's ID and its directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,12 @@ pub struct NodeConfig {
     /// `disks`: one directory per disk, each holding that disk's log
     /// segments. Defaults to `<data_dir>/log`.
     pub disks: Vec<PathBuf>,
+    /// `zone`: the node's zone label, which placement keeps shard members
+    /// apart by under `failure_domain = "zone"` (§6.7).
+    pub zone: Option<Label>,
+    /// `rack`: the node's rack label, which placement keeps shard members
+    /// apart by under `failure_domain = "rack"` (§6.7).
+    pub rack: Option<Label>,
 }
 
 impl NodeConfig {
@@ -36,6 +43,8 @@ pub(crate) struct RawNode {
     node_id: Option<String>,
     data_dir: PathBuf,
     disks: Option<Vec<PathBuf>>,
+    zone: Option<String>,
+    rack: Option<String>,
 }
 
 impl Default for RawNode {
@@ -44,14 +53,27 @@ impl Default for RawNode {
             node_id: None,
             data_dir: PathBuf::from("/var/lib/skys3"),
             disks: None,
+            zone: None,
+            rack: None,
         }
     }
 }
 
 impl RawNode {
-    /// Checks every key and resolves the section. An invalid node ID is
-    /// reported and left unset.
+    /// Checks every key and resolves the section. An invalid node ID or
+    /// label is reported and left unset.
     pub(crate) fn resolve(self, checker: &mut Checker) -> NodeConfig {
+        let mut label = |key: &str, value: Option<String>| {
+            value.and_then(|value| match Label::new(value) {
+                Ok(label) => Some(label),
+                Err(error) => {
+                    checker.report(key, error);
+                    None
+                }
+            })
+        };
+        let zone = label("node.zone", self.zone);
+        let rack = label("node.rack", self.rack);
         let node_id = self.node_id.and_then(|id| match NodeId::new(id) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -87,6 +109,8 @@ impl RawNode {
             node_id,
             data_dir: self.data_dir,
             disks,
+            zone,
+            rack,
         }
     }
 }
@@ -102,6 +126,10 @@ pub struct GatewayListenConfig {
     pub tls_cert_file: Option<PathBuf>,
     /// `tls_key_file`: a PEM file with the server's private key.
     pub tls_key_file: Option<PathBuf>,
+    /// `max_inflight_handshakes`: how many TLS handshakes the gateway runs
+    /// at once (§12). Further connections wait in the kernel's accept
+    /// queue until one finishes.
+    pub max_inflight_handshakes: u32,
 }
 
 impl Default for GatewayListenConfig {
@@ -110,6 +138,7 @@ impl Default for GatewayListenConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 9000)),
             tls_cert_file: None,
             tls_key_file: None,
+            max_inflight_handshakes: DEFAULT_MAX_INFLIGHT_HANDSHAKES,
         }
     }
 }
@@ -125,6 +154,11 @@ impl GatewayListenConfig {
     }
 
     pub(crate) fn check(&self, checker: &mut Checker) {
+        check_handshake_cap(
+            checker,
+            "gateway.max_inflight_handshakes",
+            self.max_inflight_handshakes,
+        );
         for (key, value, other) in [
             (
                 "gateway.tls_cert_file",

@@ -15,7 +15,7 @@ pub const START_ATTEMPTS: usize = 5;
 
 /// What the binary logs when an address is taken: the `Display` of
 /// `io::ErrorKind::AddrInUse` on Linux and macOS.
-const ADDRESS_IN_USE: &str = "Address already in use";
+pub const ADDRESS_IN_USE: &str = "Address already in use";
 
 /// How long a readiness probe may wait for an answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);

@@ -721,6 +721,7 @@ async fn register_node(setup: &common::Setup, node: usize, departing: bool) {
             disk_id: "nvme0".parse().unwrap(),
             capacity_bytes: 1 << 40,
         }],
+        instance_id: None,
         departing,
         proposal_id: format!("p-node-{node}").parse().unwrap(),
     };

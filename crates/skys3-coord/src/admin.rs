@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use skys3_io::Clock;
-use skys3_net::{Connection, Listener, MessageKind, Network};
+use skys3_net::{Connection, Frame, Listener, MessageKind, Network, Receiver, Sender};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
@@ -120,33 +120,50 @@ impl AdminEndpoint {
     /// kind this endpoint does not serve, or a heartbeat from a peer that
     /// is not a node. A handoff request it cannot serve is answered with a
     /// refusal.
-    pub async fn serve_connection<S>(&self, mut connection: Connection<S>) -> Result<(), PushError>
+    pub async fn serve_connection<S>(&self, connection: Connection<S>) -> Result<(), PushError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        loop {
-            let frame = match tokio::time::timeout(PUSH_IDLE_TIMEOUT, connection.recv()).await {
-                Err(_) => return Err(PushError::Idle),
-                Ok(frame) => frame?,
-            };
-            let Some(frame) = frame else {
-                return Ok(());
-            };
+        let (mut receiver, sender) = connection.into_split();
+        match next_frame(&mut receiver).await? {
+            Some(first) => self.serve_link((receiver, sender), first).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Serves a connection whose first frame, `first`, the caller already
+    /// received, until the peer closes it: for a node whose transport
+    /// carries other messages too, and that hands a connection here by the
+    /// class of its first frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`AdminEndpoint::serve_connection`].
+    pub async fn serve_link<S>(
+        &self,
+        (mut receiver, mut sender): (Receiver<S>, Sender<S>),
+        first: Frame,
+    ) -> Result<(), PushError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut next = Some(first);
+        while let Some(frame) = next {
             let request = frame.header.request_id;
             let answer = match (frame.header.kind, &self.heartbeats) {
                 (MessageKind::ControlChanged, _) => {
                     let generation = ControlChanged::from_frame(&frame)?;
                     if self.hints.hint(generation) {
-                        tracing::debug!(%generation, peer = %connection.peer(), "pushed a new generation");
+                        tracing::debug!(%generation, peer = %receiver.peer(), "pushed a new generation");
                     }
                     (request != 0).then(|| reply(request))
                 }
                 (MessageKind::NodeHeartbeat, Some(heartbeats)) => {
                     Heartbeat::from_frame(&frame)?;
-                    let node = connection
+                    let node = receiver
                         .peer()
                         .node_id()
-                        .ok_or_else(|| PushError::NotANode(connection.peer().clone()))?;
+                        .ok_or_else(|| PushError::NotANode(receiver.peer().clone()))?;
                     let ack = HeartbeatAck {
                         coordinator: heartbeats
                             .leadership
@@ -161,7 +178,7 @@ impl AdminEndpoint {
                     let ack = match &self.handoffs {
                         None => HandoffAck::refused("this node starts no handoffs"),
                         Some(sink) => {
-                            tracing::info!(peer = %connection.peer(), ?handoff, "asked to hand a shard off");
+                            tracing::info!(peer = %receiver.peer(), ?handoff, "asked to hand a shard off");
                             match sink.hand_off(handoff).await {
                                 Ok(()) => HandoffAck::started(),
                                 Err(reason) => HandoffAck::refused(reason),
@@ -173,8 +190,27 @@ impl AdminEndpoint {
                 (kind, _) => return Err(PushError::Unexpected(kind)),
             };
             if let Some(answer) = answer {
-                connection.send(&answer).await?;
+                sender.send(&answer).await?;
             }
+            next = next_frame(&mut receiver).await?;
         }
+        Ok(())
+    }
+}
+
+/// The next frame of an admin connection, or `None` once the peer closed
+/// it.
+///
+/// # Errors
+///
+/// [`PushError::Idle`] if none comes within [`PUSH_IDLE_TIMEOUT`], and the
+/// transport's errors.
+async fn next_frame<S>(receiver: &mut Receiver<S>) -> Result<Option<Frame>, PushError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(PUSH_IDLE_TIMEOUT, receiver.recv()).await {
+        Err(_) => Err(PushError::Idle),
+        Ok(frame) => Ok(frame?),
     }
 }

@@ -36,6 +36,10 @@ pub struct NodeProfile {
     pub rack: Option<Label>,
     /// The disks the node offers.
     pub disks: Vec<DiskInfo>,
+    /// The instance ID of the node's data directory, if it has one: a
+    /// registration of the node's ID from another instance is never
+    /// overwritten ([`RegistrationError::Claimed`]).
+    pub instance: Option<Label>,
 }
 
 impl NodeProfile {
@@ -49,6 +53,7 @@ impl NodeProfile {
             zone: self.zone.clone(),
             rack: self.rack.clone(),
             disks: self.disks.clone(),
+            instance_id: self.instance.clone(),
             departing: false,
             proposal_id: proposal,
         }
@@ -63,7 +68,16 @@ impl NodeProfile {
             && registration.zone == self.zone
             && registration.rack == self.rack
             && registration.disks == self.disks
+            && registration.instance_id == self.instance
             && !registration.departing
+    }
+
+    /// The other instance `registration` claims the node's ID for, if it
+    /// names one and this profile names a different one.
+    #[must_use]
+    pub fn claimed_by<'a>(&self, registration: &'a NodeRegistration) -> Option<&'a Label> {
+        let theirs = registration.instance_id.as_ref()?;
+        (self.instance.as_ref()? != theirs).then_some(theirs)
     }
 }
 
@@ -108,6 +122,20 @@ pub enum RegistrationError {
     /// process running with the same node ID.
     #[error("the registration of {0} kept changing under this node")]
     Contended(NodeId),
+    /// The register holds the node's ID for another data directory: a
+    /// second node runs, or ran, with this node's ID. It is never
+    /// overwritten; an operator deletes it once that node is gone for good.
+    #[error(
+        "nodes/{node}.json registers node {node} for another data directory (instance \
+         {instance}), not this one: a second node uses this node ID. If that node is gone for \
+         good, delete its registration; otherwise give this node an ID of its own"
+    )]
+    Claimed {
+        /// The node ID.
+        node: NodeId,
+        /// The instance the register names.
+        instance: Label,
+    },
     /// A registration write got no answer that settles it, or landed
     /// while its generation increment failed, and settling it failed too.
     /// The caller [`settle`]s `pending` before it registers again, so a
@@ -126,6 +154,9 @@ pub enum RegistrationError {
 /// creates the register if it is absent, rewrites it under `If-Match` if
 /// it describes the node differently, and leaves it alone otherwise. A
 /// write is announced by a generation increment in `cluster.json`.
+///
+/// A register that names another instance of the node's data directory
+/// ([`NodeProfile::claimed_by`]) is left alone, and refused.
 ///
 /// A write that loses its compare-and-swap, to a coordinator forgetting
 /// the node or to anything else, is planned again from a fresh read. One
@@ -148,6 +179,15 @@ pub async fn register<S: ControlStore>(
     for _ in 0..MAX_ROUNDS {
         let current = skys3_control::read_with_retries(store, &key, policy).await?;
         let document = profile.document(proposals.next_id());
+        if let Some(instance) = current
+            .as_ref()
+            .and_then(|current| profile.claimed_by(&current.value))
+        {
+            return Err(RegistrationError::Claimed {
+                node: profile.node.clone(),
+                instance: instance.clone(),
+            });
+        }
         let (change, registration) = match current {
             Some(current) if profile.describes(&current.value) => {
                 return Ok(Registered {
@@ -233,6 +273,7 @@ mod tests {
                 disk_id: Label::new("nvme0").unwrap(),
                 capacity_bytes: 1 << 40,
             }],
+            instance: None,
         }
     }
 
@@ -295,6 +336,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.value.address, node.address);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_registration_from_another_data_directory_is_never_overwritten() {
+        let inner = store().await;
+        let mut ids = ProposalIds::seeded(3);
+        let instance = |name: &str| Some(Label::new(name).unwrap());
+        // A registration without an instance, from a tool or an earlier
+        // build, is adopted.
+        let mut node = profile(3);
+        register(&inner, &cluster(), &node, &mut ids, &retry())
+            .await
+            .unwrap();
+        node.instance = instance("aaaa");
+        let adopted = register(&inner, &cluster(), &node, &mut ids, &retry())
+            .await
+            .unwrap();
+        assert_eq!(adopted.registration, Registration::Updated);
+        let stored = read(&inner, &TypedKey::node(&node.node))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.value.instance_id, instance("aaaa"));
+        assert_eq!(node.claimed_by(&stored.value), None);
+
+        // Another data directory with the same node ID, even at the same
+        // address, is refused, and the register keeps the first one.
+        let mut other = node.clone();
+        other.instance = instance("bbbb");
+        assert_eq!(
+            other.claimed_by(&stored.value),
+            Some(&Label::new("aaaa").unwrap())
+        );
+        let before = generation(&inner).await;
+        let error = register(&inner, &cluster(), &other, &mut ids, &retry())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RegistrationError::Claimed { node: id, instance: found }
+                if *id == node.node && found.as_str() == "aaaa"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("another data directory"),
+            "{error}"
+        );
+        assert_eq!(generation(&inner).await, before);
+        let kept = read(&inner, &TypedKey::node(&node.node))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.version, stored.version);
+
+        // A profile without an instance claims nothing.
+        let mut anonymous = node.clone();
+        anonymous.instance = None;
+        assert_eq!(anonymous.claimed_by(&stored.value), None);
     }
 
     #[tokio::test(start_paused = true)]

@@ -248,6 +248,7 @@ async fn store() -> MemoryControlStore {
                 disk_id: Label::new("nvme0").unwrap(),
                 capacity_bytes: TB,
             }],
+            instance: None,
         };
         register(&store, &cluster(), &profile, &mut ids, &retry())
             .await
@@ -466,6 +467,7 @@ fn registrations_feed_a_topology_without_a_registry() {
         zone: None,
         rack: None,
         disks: Vec::new(),
+        instance_id: None,
         departing: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };

@@ -11,7 +11,7 @@ use skys3_types::{BucketId, BucketName, ClusterId};
 
 use crate::error::{Checker, key_path};
 use crate::storage::{KIB, MIB, TIB};
-use crate::transport::TransportConfig;
+use crate::transport::{DEFAULT_MAX_INFLIGHT_HANDSHAKES, TransportConfig, check_handshake_cap};
 
 /// The congestion controller of peer connections (§7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -54,6 +54,10 @@ pub struct PeeringConfig {
     pub peer_staging_quota_bytes: u64,
     /// `peer_staging_ttl_seconds`: when uncommitted staging is discarded.
     pub peer_staging_ttl_seconds: u64,
+    /// `peer_max_inflight_handshakes`: how many handshakes the QUIC
+    /// endpoint runs at once (§12). A connection that arrives while all
+    /// of them run is refused, and its source tries again later.
+    pub peer_max_inflight_handshakes: u32,
     /// `[peering.peers.<cluster-id>]`: the peer clusters this node trusts,
     /// by cluster ID (§12).
     pub peers: BTreeMap<ClusterId, PeerConfig>,
@@ -116,6 +120,7 @@ impl Default for PeeringConfig {
             peer_max_inflight_bytes: 256 * MIB,
             peer_staging_quota_bytes: TIB,
             peer_staging_ttl_seconds: 86_400,
+            peer_max_inflight_handshakes: DEFAULT_MAX_INFLIGHT_HANDSHAKES,
             peers: BTreeMap::new(),
         }
     }
@@ -246,6 +251,11 @@ impl PeeringConfig {
         checker.nonzero(
             "peering.peer_staging_ttl_seconds",
             self.peer_staging_ttl_seconds,
+        );
+        check_handshake_cap(
+            checker,
+            "peering.peer_max_inflight_handshakes",
+            self.peer_max_inflight_handshakes,
         );
     }
 }

@@ -147,6 +147,16 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.identity(), &identity);
 
     assert_eq!(minimal.node().node_id, None);
+    assert!(!minimal.cluster().multi_node);
+    assert!(!example.cluster().multi_node);
+    assert_eq!(
+        minimal.transport().max_inflight_handshakes,
+        example.transport().max_inflight_handshakes
+    );
+    assert_eq!(
+        minimal.gateway().max_inflight_handshakes,
+        example.gateway().max_inflight_handshakes
+    );
     assert_eq!(
         minimal.node().disks,
         [std::path::Path::new("/var/lib/skys3/log")]
@@ -171,16 +181,20 @@ const EVERY_KEY: &str = r#"
 [cluster]
 cluster_id = "c1"
 failure_domain = "zone"
+multi_node = true
 
 [node]
 node_id = "node-7"
 data_dir = "/data/skys3"
 disks = ["/disk0", "/disk1"]
+zone = "eu-central-1a"
+rack = "r12"
 
 [gateway]
 listen = "[::]:8443"
 tls_cert_file = "/etc/skys3/cert.pem"
 tls_key_file = "/etc/skys3/key.pem"
+max_inflight_handshakes = 512
 
 [control_store]
 backend = "s3"
@@ -195,6 +209,8 @@ config_poll_interval_seconds = 20
 
 [transport]
 listen = "10.0.0.5:7401"
+advertise = "node-7.c1.example:7401"
+max_inflight_handshakes = 64
 tls_cert_file = "/etc/skys3/node.crt"
 tls_key_file = "/etc/skys3/node.key"
 tls_ca_file = "/etc/skys3/ca.crt"
@@ -306,6 +322,7 @@ peer_connections_per_shard = 16
 peer_max_inflight_bytes = 134217728
 peer_staging_quota_bytes = 10737418240
 peer_staging_ttl_seconds = 3600
+peer_max_inflight_handshakes = 32
 
 [peering.peers.c2]
 ca_file = "/etc/skys3/peers/c2.crt"
@@ -359,6 +376,14 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
     assert_eq!(config.transport().listen.port(), 7401);
+    assert!(config.cluster().multi_node);
+    assert_eq!(
+        config.transport().advertised().unwrap().to_string(),
+        "node-7.c1.example:7401"
+    );
+    assert_eq!(config.transport().max_inflight_handshakes, 64);
+    assert_eq!(config.gateway().max_inflight_handshakes, 512);
+    assert_eq!(config.peering().peer_max_inflight_handshakes, 32);
     let tls = config.transport().tls_files().expect("all three files");
     assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
@@ -367,6 +392,8 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
     assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));
     assert_eq!(node.disks.len(), 2);
+    assert_eq!(node.zone.as_ref().unwrap().as_str(), "eu-central-1a");
+    assert_eq!(node.rack.as_ref().unwrap().as_str(), "r12");
     assert_eq!(config.gateway().listen.port(), 8443);
     assert!(config.gateway().tls().is_some());
     assert!(config.identity().anonymous_policy.is_some());

@@ -61,6 +61,7 @@ async fn store_with(count: u8, rack: Option<fn(u8) -> u8>) -> MemoryControlStore
                 disk_id: Label::new("nvme0").unwrap(),
                 capacity_bytes: 1 << 40,
             }],
+            instance: None,
         };
         register(&store, &cluster(), &profile, &mut ids, &retry())
             .await

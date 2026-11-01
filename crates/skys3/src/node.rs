@@ -4,13 +4,13 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ControlStoreBackend, LogFormat};
-use skys3_control::{ChangeStream, ControlStore};
-use skys3_control::{ControlError, ProposalIds, RetryPolicy, read_cluster};
+use skys3_control::{ControlError, ProposalIds, RetryPolicy};
+use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -21,7 +21,9 @@ use skys3_gateway::{
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
-use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health};
+use skys3_obs::{
+    AdminConfig, AdminError, AdminListener, AdminToken, HandshakeLimit, HandshakeMetrics, Health,
+};
 use skys3_remote::aws::{AwsS3, default_credentials, profile_credentials};
 use skys3_shard::lifecycle::{self, LifecycleMetrics};
 use skys3_shard::{
@@ -32,19 +34,19 @@ use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
 };
-use skys3_types::Generation;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, Label, NodeId};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
+use crate::cluster::ClusterServices;
+use crate::cluster::peering::NodePeering;
 use crate::control::backend::{self, Backend, ConnectError, Opener};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::metrics::{ControlMetrics, NodeMetrics};
-use crate::peering::NodePeering;
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -181,6 +183,11 @@ pub enum StartError {
     /// STS could not be set up.
     #[error("STS: {0}")]
     Sts(String),
+    /// The cluster services of `[cluster] multi_node = true` cannot start:
+    /// a certificate that does not name this node, or a registration of
+    /// this node's ID from another data directory.
+    #[error("the cluster: {0}")]
+    Cluster(String),
     /// A shard could not be opened.
     #[error("shard {shard}: {reason}")]
     Shard {
@@ -215,12 +222,17 @@ pub enum NodeError {
     /// A background task ended unexpectedly.
     #[error("a background task failed: {0}")]
     Task(String),
+    /// With `[cluster] multi_node = true`, the node's registration turned
+    /// out to belong to another data directory after it had started; it
+    /// stops rather than serve under another node's ID (§6.7).
+    #[error("the cluster: {0}")]
+    Cluster(String),
 }
 
 /// Pools the node runs its blocking work on.
 #[derive(Debug, Clone)]
-struct Pools {
-    index: BlockingPool,
+pub(crate) struct Pools {
+    pub(crate) index: BlockingPool,
     hashing: BlockingPool,
     control: BlockingPool,
     disks: Vec<BlockingPool>,
@@ -243,46 +255,31 @@ fn pool(name: &str, threads: usize) -> Result<BlockingPool, StartError> {
 }
 
 /// What the background tasks share.
-struct Shared {
-    config: Config,
-    retry: RetryPolicy,
-    wall: Arc<dyn WallClock>,
-    index: Arc<Index>,
-    pools: Pools,
-    store: Store,
+pub(crate) struct Shared {
+    pub(crate) config: Config,
+    pub(crate) retry: RetryPolicy,
+    pub(crate) wall: Arc<dyn WallClock>,
+    pub(crate) index: Arc<Index>,
+    pub(crate) pools: Pools,
+    pub(crate) store: Store,
     /// Opens the control store again while the node has none.
-    opener: Opener,
-    shards: NodeShards,
-    gateway: NodeGateway,
-    identity: Arc<IdentityCopy>,
-    sts: Option<Arc<Sts>>,
-    control: Arc<Mutex<ControlState>>,
-    control_metrics: ControlMetrics,
-    flush: Arc<NodeFlush>,
-    snapshots: NodeSnapshots,
+    pub(crate) opener: Opener,
+    pub(crate) shards: NodeShards,
+    pub(crate) gateway: NodeGateway,
+    pub(crate) identity: Arc<IdentityCopy>,
+    pub(crate) sts: Option<Arc<Sts>>,
+    pub(crate) control: Arc<Mutex<ControlState>>,
+    pub(crate) control_metrics: ControlMetrics,
+    pub(crate) flush: Arc<NodeFlush>,
+    pub(crate) snapshots: NodeSnapshots,
+    /// The generations other nodes push, which wake the sync of the
+    /// node's copy; none arrive without `[cluster] multi_node = true`.
+    pub(crate) hints: ControlHints,
 }
 
 impl Shared {
-    /// Syncs the identity copy from the store, with its age running from
-    /// `started`, and allowlists its providers for STS.
-    async fn sync_identity(&self, started: Duration) -> Result<(), ControlError> {
-        match &self.sts {
-            Some(sts) => {
-                sts.sync_identity_as_of(&self.store, &self.retry, started)
-                    .await?;
-            }
-            None => {
-                self.identity
-                    .sync_as_of(&self.store, &self.retry, started)
-                    .await?;
-            }
-        }
-        self.control_metrics.identity_synced(started);
-        Ok(())
-    }
-
     /// Opens the shards of every bucket the gateway knows.
-    async fn open_bucket_shards(&self) -> Result<(), StartError> {
+    pub(crate) async fn open_bucket_shards(&self) -> Result<(), StartError> {
         for bucket in self.gateway.buckets() {
             for shard in ShardRef::all(&bucket) {
                 self.shards
@@ -295,115 +292,6 @@ impl Shared {
             }
         }
         Ok(())
-    }
-
-    /// Reads a fresh copy from the store and keeps it in the index.
-    async fn refresh_copy(&self) -> Result<ControlCopy, StartError> {
-        let cluster = &self.config.cluster().cluster_id;
-        let store = self.store.store().ok_or_else(no_store)?;
-        let (pool, started) = (&self.pools.index, self.wall.now());
-        control::refresh(&store, cluster, &self.retry, &self.index, pool, started).await
-    }
-
-    /// The generation of the node's copy.
-    fn generation(&self) -> Option<Generation> {
-        self.control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .generation
-    }
-
-    /// Whether the copy should be synced although no generation moved, so
-    /// that the identity copy, whose age STS measures from its last sync,
-    /// never goes stale while the store answers (§6.2).
-    fn sync_due(&self) -> bool {
-        let synced_at = self
-            .control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .synced_at;
-        let max_staleness = self.config.identity().identity_max_staleness();
-        control::sync_due(synced_at, self.wall.now(), max_staleness)
-    }
-
-    /// Reads a fresh copy from the store, keeps it, and serves from the
-    /// store from now on: buckets, identity, and the shards of new
-    /// buckets.
-    async fn sync(&self) -> Result<(), StartError> {
-        let copy = self.refresh_copy().await?;
-        let started = copy.synced_at;
-        self.control_metrics.store_answered(self.wall.now());
-        self.store.go_live();
-        self.control_metrics.set_live(true);
-        self.gateway.reload_buckets().await?;
-        self.sync_identity(started).await?;
-        self.open_bucket_shards().await?;
-        *self.control.lock().unwrap_or_else(PoisonError::into_inner) = ControlState {
-            live: true,
-            generation: Some(copy.generation),
-            synced_at: Some(copy.synced_at),
-        };
-        Ok(())
-    }
-
-    /// Keeps the node's copy current (§6.2): it waits for the store's
-    /// change stream to report a new generation, or at most
-    /// `config_poll_interval`, then syncs if the generation in
-    /// `cluster.json` moved, reading only the registers that changed, or
-    /// if half of `identity_max_staleness` passed since the last sync.
-    /// While the node runs from its copy, it tries a sync every interval.
-    /// A store that refuses every request until it is reopened (a file
-    /// store after a failed write) is detached, and opened again.
-    async fn follow_control_store(self: Arc<Self>) {
-        let interval = self.config.control_store().config_poll_interval();
-        let cluster = self.config.cluster().cluster_id.clone();
-        loop {
-            let known = self.generation();
-            if self.store.is_live() {
-                let after = known.unwrap_or(Generation::ZERO);
-                match self.store.changes(after).await {
-                    Ok(mut changes) => {
-                        if let Ok(Err(error)) = timeout(interval, changes.next()).await {
-                            tracing::warn!(%error, "the control store's change stream failed");
-                            tokio::time::sleep(interval).await;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot follow the control store");
-                        tokio::time::sleep(interval).await;
-                    }
-                }
-            } else {
-                tokio::time::sleep(interval).await;
-            }
-            if self.store.store().is_some_and(|store| store.failed()) {
-                self.detach().await;
-            }
-            let store = match self.store.store() {
-                Some(store) => store,
-                None => match self.reopen().await {
-                    Some(store) => store,
-                    None => continue,
-                },
-            };
-            let moved = match read_cluster(&store, &cluster, &self.retry).await {
-                Ok(current) => {
-                    self.control_metrics.store_answered(self.wall.now());
-                    Some(current.value.generation) != known
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "cannot read the control store's generation");
-                    continue;
-                }
-            };
-            if (moved || !self.store.is_live() || self.sync_due())
-                && let Err(error) = self.sync().await
-            {
-                tracing::warn!(%error, "cannot sync the control-state copy");
-                // The stream would report the same generation at once.
-                tokio::time::sleep(interval).await;
-            }
-        }
     }
 
     /// Keeps a flusher on every `write_back` bucket shard open on the node
@@ -435,52 +323,6 @@ impl Shared {
                     .filter(|bucket| bucket.mode != BucketMode::Local)
                     .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
             );
-        }
-    }
-
-    /// Drops a store that refuses every request until it is reopened, and
-    /// serves the node's latest copy until [`Shared::reopen`] opens it
-    /// again and a sync succeeds (§6.2).
-    async fn detach(&self) {
-        match control::kept_copy(&self.index, &self.pools.index).await {
-            Ok(Some(copy)) => {
-                tracing::error!(
-                    generation = %copy.generation,
-                    "the control store failed; serving the local copy until it is reopened"
-                );
-                self.store.detach(copy);
-                self.control_metrics.set_live(false);
-                self.control
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .live = false;
-            }
-            // A running node always keeps a copy: it opened from one or
-            // saved one.
-            Ok(None) => tracing::error!("the control store failed, and the node has no copy"),
-            Err(error) => {
-                tracing::error!(%error, "the control store failed; cannot read the local copy");
-            }
-        }
-    }
-
-    /// Opens the control store for a node that runs from its copy without
-    /// one, and gives it to the node store.
-    async fn reopen(&self) -> Option<Backend> {
-        match self.opener.open(true).await {
-            Ok(opened) => {
-                tracing::info!("opened the control store");
-                self.store.attach(opened.store.clone());
-                Some(opened.store)
-            }
-            Err(OpenStoreError::Unavailable(error)) => {
-                tracing::warn!(%error, "cannot open the control store; serving the local copy");
-                None
-            }
-            Err(error) => {
-                tracing::error!(%error, "refusing the control store; serving the local copy");
-                None
-            }
         }
     }
 
@@ -706,7 +548,7 @@ async fn open_control(
 }
 
 /// The error a node without a control store gives for what needs one.
-fn no_store() -> ControlError {
+pub(crate) fn no_store() -> ControlError {
     ControlError::Unavailable("the control store has not been opened".to_owned())
 }
 
@@ -739,10 +581,12 @@ fn sts_endpoint(
 }
 
 /// Binds the gateway's listener, with TLS when `[gateway]` names a
-/// certificate.
+/// certificate, and at most `max_inflight_handshakes` handshakes at once,
+/// exported in `handshakes` (§12).
 async fn bind_gateway(
     config: &Config,
     gateway: NodeGateway,
+    handshakes: &HandshakeMetrics,
 ) -> Result<GatewayListener<NodeAuth>, StartError> {
     let settings = config.gateway();
     let listener = GatewayListener::bind(settings.listen, gateway)
@@ -752,7 +596,11 @@ async fn bind_gateway(
             settings.listen
         )))?;
     if let Some((cert, key)) = settings.tls() {
-        return Ok(listener.with_tls(crate::tls::server_config(cert, key)?));
+        let limit = HandshakeLimit::new(settings.max_inflight_handshakes)
+            .with_metrics(handshakes, "gateway");
+        return Ok(listener
+            .with_tls(crate::tls::server_config(cert, key)?)
+            .with_handshake_limit(limit));
     }
     if !settings.listen.ip().is_loopback() {
         tracing::warn!(
@@ -820,10 +668,12 @@ pub struct Node {
     checkpoints: JoinHandle<IndexError>,
     checkpointer: Arc<Checkpointer<RealDisk>>,
     background: JoinSet<()>,
+    /// What the heartbeater reports, with `[cluster] multi_node = true`.
+    registration: Option<watch::Receiver<HeartbeatStatus>>,
     shared: Arc<Shared>,
     /// The QUIC endpoint of native replication, if the node peers.
     peer_endpoint: Option<skys3_peer::PeerEndpoint>,
-    _data_dir: DataDir,
+    data_dir: DataDir,
 }
 
 impl std::fmt::Debug for Node {
@@ -884,6 +734,9 @@ impl Node {
         let data_dir = opened.data_dir.insert(data_dir);
         let node_id = data_dir.node_id().clone();
         tracing::info!(%node_id, %cluster, "starting");
+        // A certificate that does not name this node stops the start before
+        // anything is recovered.
+        let node_credentials = crate::cluster::credentials(&config, &node_id)?;
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
 
         let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
@@ -909,7 +762,7 @@ impl Node {
                         ConnectError::Tls(error) => StartError::Tls(error),
                         other => StartError::ControlStore(other.to_string()),
                     })?;
-                Opener::shared(store, node_id.clone())
+                Opener::shared(store, node_id.clone(), config.cluster().multi_node)
             }
         };
         let OpenedControl {
@@ -1046,7 +899,7 @@ impl Node {
             .with_wall_clock(Arc::clone(&wall));
         // Native replication with peer clusters (§7.8), if any is
         // configured.
-        let peering = NodePeering::open(&config, Arc::clone(&wall))?;
+        let peering = NodePeering::open(&config, Arc::clone(&wall), &metrics.handshakes)?;
         let flush = {
             let settings = FlushSettings {
                 extent_bytes: config.storage().extent_bytes,
@@ -1115,6 +968,7 @@ impl Node {
             control_metrics: metrics.control.clone(),
             flush: Arc::clone(&flush),
             snapshots,
+            hints: ControlHints::new(),
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -1123,7 +977,23 @@ impl Node {
         }
 
         // Listeners.
-        let listener = bind_gateway(&shared.config, shared.gateway.clone()).await?;
+        let cluster_services = match (&node_credentials, shared.opener.shared_store()) {
+            (Some(credentials), Some(store)) => Some(
+                ClusterServices::start(
+                    &shared.config,
+                    credentials,
+                    data_dir,
+                    store.clone(),
+                    shared.hints.clone(),
+                    &metrics.handshakes,
+                    &pools.index,
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let listener =
+            bind_gateway(&shared.config, shared.gateway.clone(), &metrics.handshakes).await?;
         let gateway_addr = listener
             .local_addr()
             .map_err(io_error("reading the gateway's address"))?;
@@ -1147,6 +1017,7 @@ impl Node {
             control,
             health: health.clone(),
             flush,
+            cluster: cluster_services.as_ref().map(ClusterServices::view),
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -1170,6 +1041,7 @@ impl Node {
             tokio::spawn(async move { checkpointer.run(interval).await })
         };
         let mut background = JoinSet::new();
+        let registration = cluster_services.as_ref().map(ClusterServices::status);
         if let Some(store) = shared.opener.shared_store().cloned() {
             // The S3 control bucket's versioning (§12), read once.
             let control_metrics = shared.control_metrics.clone();
@@ -1178,6 +1050,9 @@ impl Node {
             });
         }
         background.spawn(Arc::clone(&shared).follow_control_store());
+        if let Some(services) = cluster_services {
+            services.spawn(&mut background);
+        }
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));
@@ -1223,9 +1098,10 @@ impl Node {
             checkpoints,
             checkpointer: storage.checkpointer,
             background,
+            registration,
             shared,
             peer_endpoint,
-            _data_dir: opened.data_dir.take().expect("the data directory is open"),
+            data_dir: opened.data_dir.take().expect("the data directory is open"),
         })
     }
 
@@ -1247,19 +1123,28 @@ impl Node {
         self.admin_addr
     }
 
-    /// Serves until `stop` completes or a checkpoint fails, then shuts
-    /// down.
+    /// Serves until `stop` completes, a checkpoint fails, or, with
+    /// `[cluster] multi_node = true`, the node's registration turns out to
+    /// belong to another data directory, then shuts down.
     ///
     /// # Errors
     ///
-    /// [`NodeError`] if a checkpoint failed, while serving or at shutdown.
+    /// [`NodeError`] if a checkpoint failed, while serving or at shutdown,
+    /// or [`NodeError::Cluster`] for a registration another data directory
+    /// holds.
     pub async fn run_until(mut self, stop: impl Future<Output = ()>) -> Result<(), NodeError> {
+        let claimed = crate::cluster::claimed(
+            self.registration.take(),
+            self.node_id.clone(),
+            self.data_dir.instance_id().to_owned(),
+        );
         let failed = tokio::select! {
             () = stop => None,
             ended = &mut self.checkpoints => Some(match ended {
                 Ok(error) => NodeError::Checkpoint(error),
                 Err(error) => NodeError::Task(error.to_string()),
             }),
+            reason = claimed => Some(NodeError::Cluster(reason)),
         };
         let shutdown = self.shutdown().await;
         match failed {
@@ -1290,7 +1175,7 @@ impl Node {
             mut background,
             shared,
             peer_endpoint,
-            _data_dir: data_dir,
+            data_dir,
             ..
         } = self;
         tracing::info!("shutting down");

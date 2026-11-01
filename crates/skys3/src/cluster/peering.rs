@@ -29,9 +29,11 @@ use skys3_gateway::{
 };
 use skys3_io::WallClock;
 use skys3_net::Credentials;
+use skys3_obs::{HandshakeLimit, HandshakeMetrics, HandshakeOutcome};
 use skys3_peer::{
-    ConnectionPool, DESCRIPTOR_LIFETIME, DescriptorSigner, Destination, EndpointSettings,
-    PeerDescriptor, PeerEndpoint, PeerTls, PeerTrust, Staging, StagingLimits, StagingService,
+    ConnectError, ConnectionPool, DESCRIPTOR_LIFETIME, DescriptorSigner, Destination,
+    EndpointSettings, PeerConnection, PeerDescriptor, PeerEndpoint, PeerTls, PeerTrust, Staging,
+    StagingLimits, StagingService,
 };
 use skys3_types::{BucketName, ClusterId};
 
@@ -47,6 +49,7 @@ pub(crate) struct NodePeering {
     pool: ConnectionPool,
     tls: PeerTls,
     descriptors: Option<Arc<NodeDescriptors>>,
+    handshakes: HandshakeLimit,
 }
 
 impl std::fmt::Debug for NodePeering {
@@ -59,7 +62,9 @@ impl std::fmt::Debug for NodePeering {
 
 impl NodePeering {
     /// Binds the node's peer endpoint, if `config` names any peer. Reads
-    /// the certificate files with blocking I/O, once, at startup.
+    /// the certificate files with blocking I/O, once, at startup. Its
+    /// handshakes are capped at `peer_max_inflight_handshakes` and
+    /// exported in `handshakes` (design §12).
     ///
     /// # Errors
     ///
@@ -68,6 +73,7 @@ impl NodePeering {
     pub(crate) fn open(
         config: &Config,
         wall: Arc<dyn WallClock>,
+        handshakes: &HandshakeMetrics,
     ) -> Result<Option<Self>, StartError> {
         let peering = config.peering();
         if peering.peers.is_empty() {
@@ -115,6 +121,8 @@ impl NodePeering {
             pool,
             tls,
             descriptors,
+            handshakes: HandshakeLimit::new(peering.peer_max_inflight_handshakes)
+                .with_metrics(handshakes, "peer"),
         }))
     }
 
@@ -144,7 +152,8 @@ impl NodePeering {
     }
 
     /// Accepts peer connections until the endpoint closes, and serves
-    /// their streams: staging on, and commits into, `shards`.
+    /// their streams: staging on, and commits into, `shards`, with at most
+    /// `peer_max_inflight_handshakes` handshakes at once ([`accept`]).
     pub(crate) async fn serve<S: Shards>(
         self,
         config: &Config,
@@ -162,16 +171,11 @@ impl NodePeering {
             PeerExtents::new(shards.clone(), Arc::clone(&buckets)),
         )
         .with_commits(PeerCommits::new(shards, buckets, gateway));
-        while let Some(incoming) = self.endpoint.accept().await {
+        accept(&self.endpoint, &self.handshakes, move |connection| {
             let service = service.clone();
-            tokio::spawn(async move {
-                let from = incoming.remote_address();
-                match incoming.establish().await {
-                    Ok(connection) => service.serve_connection(connection).await,
-                    Err(error) => tracing::info!(%from, %error, "a peer connection failed"),
-                }
-            });
-        }
+            async move { service.serve_connection(connection).await }
+        })
+        .await;
     }
 
     /// Adapts the connection pool's limits every second, for as long as
@@ -191,6 +195,43 @@ impl NodePeering {
     /// returns.
     pub(crate) fn closer(&self) -> PeerEndpoint {
         self.endpoint.clone()
+    }
+}
+
+/// Accepts connections on `endpoint` until it closes, each handshake on a
+/// task of its own that then serves the connection with `serve`. A
+/// connection that arrives while `limit` handshakes run is refused at
+/// once, before QUIC keeps any state for it, so a flood holds at most the
+/// limit of handshakes, each for at most `peer_connect_timeout_ms` (design
+/// §12); a refused source tries again later.
+async fn accept<F, S>(endpoint: &PeerEndpoint, limit: &HandshakeLimit, serve: F)
+where
+    F: Fn(PeerConnection) -> S + Clone + Send + 'static,
+    S: Future<Output = ()> + Send + 'static,
+{
+    while let Some(incoming) = endpoint.accept().await {
+        let from = incoming.remote_address();
+        let Some(permit) = limit.try_acquire() else {
+            tracing::debug!(%from, "refused a peer connection: too many handshakes run");
+            incoming.refuse();
+            continue;
+        };
+        let serve = serve.clone();
+        tokio::spawn(async move {
+            match incoming.establish().await {
+                Ok(connection) => {
+                    permit.finish(HandshakeOutcome::Completed);
+                    serve(connection).await;
+                }
+                Err(error) => {
+                    permit.finish(match error {
+                        ConnectError::Timeout(_) => HandshakeOutcome::TimedOut,
+                        _ => HandshakeOutcome::Failed,
+                    });
+                    tracing::info!(%from, %error, "a peer connection failed");
+                }
+            }
+        });
     }
 }
 
@@ -378,7 +419,12 @@ mod tests {
             .parse()
             .unwrap();
         let wall = Arc::new(ManualWallClock::new(Duration::ZERO));
-        assert!(NodePeering::open(&config, wall).unwrap().is_none());
+        let handshakes = HandshakeMetrics::default();
+        assert!(
+            NodePeering::open(&config, wall, &handshakes)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -388,19 +434,21 @@ mod tests {
         issue(dir.path(), "dst");
         let now = Duration::from_secs(1_800_000_000);
         let wall = ManualWallClock::new(now);
+        let handshakes = HandshakeMetrics::default();
         let dst = NodePeering::open(
             &config(
                 dir.path(),
                 "dst",
                 "src",
-                "quic_advertise = [\"localhost:1\"]",
+                "quic_advertise = [\"localhost:1\"]\npeer_max_inflight_handshakes = 1",
             ),
             Arc::new(wall.clone()),
+            &handshakes,
         )
         .unwrap()
         .unwrap();
         let src_config = config(dir.path(), "src", "dst", "");
-        let src = NodePeering::open(&src_config, Arc::new(wall.clone()))
+        let src = NodePeering::open(&src_config, Arc::new(wall.clone()), &handshakes)
             .unwrap()
             .unwrap();
         assert!(src.descriptors().is_none(), "{src:?}");
@@ -429,20 +477,41 @@ mod tests {
         assert!(verifier.verify(&second, wall.now(), expected).is_ok());
         assert!(format!("{descriptors:?}").contains("localhost:1"));
 
-        // The destination accepts connections; the source's handshake
-        // reaches it at its address, and finds nothing at an address that
-        // does not resolve.
+        // The destination accepts connections, one handshake at a time.
+        // While its only slot is taken, the source is refused at once.
         let endpoint = dst.closer();
         let address = endpoint.local_addr().unwrap();
+        let limit = dst.handshakes.clone();
+        let held = limit.try_acquire().unwrap();
+        let (served, mut connections) = tokio::sync::mpsc::unbounded_channel();
         let accepting = tokio::spawn(async move {
-            let mut connections = Vec::new();
-            while let Some(incoming) = endpoint.accept().await {
-                if let Ok(connection) = incoming.establish().await {
-                    connections.push(connection);
+            accept(&endpoint, &limit, move |connection| {
+                let served = served.clone();
+                async move {
+                    let _ = served.send(connection);
                 }
-            }
+            })
+            .await;
         });
         let cluster = ClusterId::new("dst").unwrap();
+        let refused = tokio::time::timeout(
+            WAIT,
+            handshake(
+                &src.endpoint,
+                &src.pool,
+                cluster.clone(),
+                &[address.to_string()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(refused.is_err());
+        assert_eq!(handshakes.ended("peer", HandshakeOutcome::Refused), 1);
+
+        // Once it is free, the source's handshake reaches the destination
+        // at its address, and finds nothing at an address that does not
+        // resolve.
+        drop(held);
         let reached = tokio::time::timeout(
             WAIT,
             handshake(
@@ -462,6 +531,9 @@ mod tests {
                 .unwrap();
         let error = unresolved.err().unwrap();
         assert!(error.to_string().contains("resolves"), "{error}");
+        assert!(connections.recv().await.is_some());
+        assert_eq!(handshakes.ended("peer", HandshakeOutcome::Completed), 1);
+        assert_eq!(handshakes.in_flight("peer"), 0);
         let adapt = tokio::spawn(src.adapt_pool());
         adapt.abort();
         src.closer().close();

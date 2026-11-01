@@ -500,6 +500,14 @@ impl Incoming {
         self.incoming.remote_address()
     }
 
+    /// Refuses the connection at once, with QUIC's `CONNECTION_REFUSED`,
+    /// before any handshake state is kept: what a destination does with a
+    /// connection that arrives while it runs as many handshakes as it
+    /// allows (design §12). The source tries again later.
+    pub fn refuse(self) {
+        self.incoming.refuse();
+    }
+
     /// Completes the handshake, which verifies the source's certificate
     /// against the trust bundle of the cluster it names, and the `HELLO`s,
     /// all within the connect timeout.

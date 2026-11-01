@@ -28,12 +28,12 @@
 
 pub mod admin;
 mod admission;
+mod cluster;
 pub mod control;
 pub mod datadir;
 pub mod identity;
 mod metrics;
 mod node;
-mod peering;
 pub mod rebuild;
 pub mod remote;
 pub mod sessions;

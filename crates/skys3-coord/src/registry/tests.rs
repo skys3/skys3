@@ -45,6 +45,7 @@ fn profile(n: u8) -> NodeProfile {
             disk_id: Label::new("nvme0").unwrap(),
             capacity_bytes: 1 << 40,
         }],
+        instance: None,
     }
 }
 

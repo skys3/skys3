@@ -1,5 +1,6 @@
 //! The node's own metrics (`docs/skys3-metrics.md` section 3.1): its
-//! disks, and how current its copy of control state is (§6.2, §6.10).
+//! disks, how current its copy of control state is (§6.2, §6.10), and the
+//! TLS handshakes of its listeners (§12).
 //!
 //! The components a node runs register their own metrics in the same
 //! registry. The tests check the metrics reference against every metric
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Unit;
-use skys3_obs::MetricsRegistry;
+use skys3_obs::{HandshakeMetrics, MetricsRegistry};
 use skys3_remote::aws::BucketVersioning;
 
 /// A gauge of seconds, such as a Unix time.
@@ -22,6 +23,9 @@ pub(crate) struct NodeMetrics {
     pub(crate) registry: MetricsRegistry,
     pub(crate) disks_out_of_service: Gauge,
     pub(crate) control: ControlMetrics,
+    /// The handshakes of the gateway, the transport, and the peer
+    /// endpoint.
+    pub(crate) handshakes: HandshakeMetrics,
 }
 
 impl NodeMetrics {
@@ -40,10 +44,12 @@ impl NodeMetrics {
         control
             .identity_max_staleness
             .set(identity_max_staleness.as_secs_f64());
+        let handshakes = HandshakeMetrics::register(&registry);
         Self {
             registry,
             disks_out_of_service,
             control,
+            handshakes,
         }
     }
 }

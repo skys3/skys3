@@ -4,7 +4,7 @@
 //!
 //! | Path | Answer |
 //! |---|---|
-//! | `GET /v1/health` | The node and cluster IDs, readiness, whether the control store answers or the node serves its local copy, and each disk's state. |
+//! | `GET /v1/health` | The node and cluster IDs, readiness, whether the control store answers or the node serves its local copy, each disk's state, and the node's cluster services (M8-04, below). |
 //! | `GET /v1/buckets` | The status of every bucket. |
 //! | `GET /v1/buckets/<name>` | The status of one bucket, or 404. |
 //! | `GET /v1/buckets/<name>/conflicts` | The keys of the bucket that this node's flushers hold in conflict (§7.2). |
@@ -69,6 +69,25 @@
 //!   Flushing retries refused keys with its usual backoff, so it resumes
 //!   by itself once the target takes the writes again.
 //!
+//! **Cluster services** (plan M8-04). `health` has a `cluster` object:
+//! `multi_node`, as `[cluster] multi_node` says, and with it true,
+//!
+//! - `transport`: `listen`, the bound address; `advertise`, the address
+//!   the node registered; and `handshakes_in_flight` and
+//!   `max_inflight_handshakes`, the listener's handshakes running now and
+//!   its cap (design §12);
+//! - `registration`: `registered`, whether the node has registered since
+//!   it started; `registrations`, how often, an unchanged registration
+//!   included; `error`, why the latest attempt failed, until one
+//!   succeeds; and `claimed_by`, the instance ID of the data directory
+//!   whose registration holds the node's ID, which stops the node
+//!   (design §6.7);
+//! - `heartbeats`: `answered`, the heartbeats the lease holder answered,
+//!   `delivered`, those a coordinator acknowledged, and `coordinator`, the
+//!   node that acknowledged the latest one (design §6.7);
+//! - `pushed_generation`: the newest generation another node pushed, or
+//!   `null` before any (design §6.2).
+//!
 //! Once the node runs the coordinator, `health` gains a `placement` object
 //! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
 //! shards' members (M3-04).
@@ -127,6 +146,7 @@ use http::{Method, Response, StatusCode, header};
 use http_body_util::Full;
 use serde_json::{Value, json};
 use skys3_config::{ConflictPolicy, TargetTransport};
+use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_flush::{
     BucketStatus, Difference, FlushService, ProbeStatus, ReconcileStatus, Transport, Unresolved,
 };
@@ -134,9 +154,10 @@ use skys3_gateway::{LocalShards, ShardRef};
 use skys3_index::ImportCheckpoint;
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::SegmentLog;
-use skys3_obs::{AdminApi, ApiFuture, Health};
+use skys3_obs::{AdminApi, ApiFuture, HandshakeLimit, Health};
 use skys3_remote::ObjectStore;
-use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, NodeId};
+use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, Label, NodeAddress, NodeId};
+use tokio::sync::watch;
 
 use crate::datadir::DiskDir;
 
@@ -151,6 +172,52 @@ pub struct ControlState {
     /// When the sync that read the copy started, as time since the Unix
     /// epoch.
     pub synced_at: Option<Duration>,
+}
+
+/// What the cluster services of a node with `[cluster] multi_node = true`
+/// report, for `/v1/health`.
+#[derive(Debug, Clone)]
+pub struct ClusterView {
+    /// The address the transport listener is bound to.
+    pub listen: std::net::SocketAddr,
+    /// The address the node registers for other nodes.
+    pub advertise: NodeAddress,
+    /// The heartbeater's progress.
+    pub heartbeats: watch::Receiver<HeartbeatStatus>,
+    /// The generations other nodes pushed.
+    pub hints: ControlHints,
+    /// The transport listener's handshakes.
+    pub handshakes: HandshakeLimit,
+}
+
+impl ClusterView {
+    /// The `cluster` object of `/v1/health`.
+    #[must_use]
+    pub fn report(&self) -> Value {
+        let status = self.heartbeats.borrow().clone();
+        let pushed = self.hints.latest();
+        json!({
+            "multi_node": true,
+            "transport": {
+                "listen": self.listen.to_string(),
+                "advertise": self.advertise.to_string(),
+                "handshakes_in_flight": self.handshakes.in_flight(),
+                "max_inflight_handshakes": self.handshakes.cap(),
+            },
+            "registration": {
+                "registered": status.registrations > 0,
+                "registrations": status.registrations,
+                "error": status.registration_error,
+                "claimed_by": status.claimed_by.as_ref().map(Label::as_str),
+            },
+            "heartbeats": {
+                "answered": status.answered,
+                "delivered": status.delivered,
+                "coordinator": status.coordinator.as_ref().map(NodeId::as_str),
+            },
+            "pushed_generation": (pushed > Generation::ZERO).then(|| pushed.get()),
+        })
+    }
 }
 
 /// The source of the gateway's bucket list.
@@ -216,6 +283,8 @@ pub struct NodeAdmin<D: Disk> {
     pub health: Health,
     /// The node's flushers.
     pub flush: Arc<dyn Flushers>,
+    /// The node's cluster services, with `[cluster] multi_node = true`.
+    pub cluster: Option<ClusterView>,
 }
 
 impl<D: Disk> fmt::Debug for NodeAdmin<D> {
@@ -273,6 +342,10 @@ impl<D: Disk> NodeAdmin<D> {
             },
             "disks": disks,
             "shards_open": self.shards.set().shards().await.len(),
+            "cluster": self
+                .cluster
+                .as_ref()
+                .map_or_else(|| json!({ "multi_node": false }), ClusterView::report),
         })
     }
 

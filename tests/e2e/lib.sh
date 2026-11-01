@@ -17,6 +17,9 @@
 #                  its admin listener (host:port), and a static credential
 #                  that may do anything
 #   ISSUER_URL     the static OIDC issuer
+#   E2E_ETCD_URL   with E2E_CONTROL=etcd, etcd's client URL (mutual TLS
+#                  with the PKI's etcd-client certificate), which the
+#                  cluster scenario's nodes share
 
 # The AWS CLI image used when the host has no `aws`: the SDK matrix's
 # (tests/sdk/cli/Dockerfile).

@@ -10,6 +10,8 @@
 //! - [`admin`] serves `/metrics`, `/healthz`, `/readyz`, and the node's
 //!   [`AdminApi`] under `/v1/`, and decides how callers authenticate
 //!   (design section 12).
+//! - [`handshakes`] caps the TLS handshakes each of the node's listeners
+//!   runs at once, and exports them (design section 12).
 //!
 //! # Example
 //!
@@ -37,6 +39,7 @@
 pub mod admin;
 #[doc(hidden)]
 pub mod fuzzing;
+pub mod handshakes;
 pub mod health;
 pub mod logging;
 pub mod metrics;
@@ -45,6 +48,7 @@ pub use admin::{
     AdminApi, AdminConfig, AdminError, AdminListener, AdminResponse, AdminToken, AdminTokenError,
     ApiFuture,
 };
+pub use handshakes::{HandshakeLimit, HandshakeMetrics, HandshakeOutcome, HandshakePermit};
 pub use health::{Health, Readiness};
 pub use logging::{LogConfig, LogFormat, TracingInitError, init_tracing};
 pub use metrics::{MetricsRegistry, Registered};

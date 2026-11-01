@@ -721,3 +721,25 @@ async fn a_seeded_endpoint_over_any_socket_serves_peers() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_refused_connection_fails_at_once() {
+    let peers = peers();
+    let to = destination(EU, &peers.destination);
+    let refusing = async {
+        let incoming = peers.destination.accept().await.unwrap();
+        incoming.refuse();
+    };
+    let started = std::time::Instant::now();
+    let (refused, ()) = async { tokio::join!(peers.source.connect(&to), refusing) }
+        .bounded()
+        .await;
+    assert!(
+        matches!(refused, Err(ConnectError::Connection(_))),
+        "{refused:?}"
+    );
+    // Long before the five-second connect timeout.
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    // The endpoint still serves the next connection.
+    drop(connected(&peers).await);
+}
