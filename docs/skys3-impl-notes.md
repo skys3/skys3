@@ -6064,6 +6064,22 @@ of this file. A task with nothing unexpected keeps "None."
   for a write-through bucket of its own does not wait for its own remote.
   Write-through waits have no metric of their own; a timeout is logged as
   a warning.
+- **A silent primary held the wait (review follow-up).** A first fix
+  for a primary that takes a flush ask and never answers wrapped the
+  whole routed `Shards::flushed` call in a timeout of one round (5 s and
+  a 1 s grace). That cancelled the call while it still waited out the
+  forward's 30 s request timeout on the old primary, before it could ask
+  the other members or read the register, and the shard map learns only
+  inside routed calls: every round asked the silent node again, and a
+  write that a new primary had flushed was answered `503`. The bound
+  moved into the forward: `RoutedShards::ask` gives a forwarded
+  `Request::Flushed` its wait and a 1 s grace (`FLUSH_ANSWER_GRACE`),
+  at most the request timeout, so a silent member is `Lost` and the read
+  moves on; `reach_remote` keeps an outer timeout only at the write's
+  own deadline. `a_write_through_wait_moves_on_from_a_silent_primary`
+  (routing tests, loopback TCP) maps the shard to the silent node 3
+  while the register names node 1: the wait reaches node 1 in about 6 s
+  of a 10 s timeout, and without the fix ends in `503 SlowDown` at 10 s.
 
 ## M5 Local erasure coding
 
