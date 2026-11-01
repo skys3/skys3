@@ -6106,6 +6106,22 @@ of this file. A task with nothing unexpected keeps "None."
   that holds it, so after a primary change a `hold` key is held again and
   must be resolved again. The namespace import's stall (M2-17) is worked
   around in the simulation, not fixed.
+- **Fixed: a wait while the `FLUSHED` is on its way.** A flusher that
+  flushed a version from before it subscribed, as after a primary
+  change, untracked the key as soon as it started the lazy `FLUSHED`,
+  which rides the next group commit up to a second later. A wait that
+  arrived meanwhile found the key untracked and the entry still dirty,
+  so it was left unanswered; the ask ended `Pending` only after its full
+  5 seconds, and a write with a short `write_through_timeout_seconds`
+  got `503` for a version the remote held. The flusher now also answers
+  `Flushed` for an untracked key at the very version a flush of its own
+  put at the remote while that `FLUSHED` is not yet applied (its
+  `recording`). This is the answer a tracked key's waits already get when
+  the flush lands, before the record: the remote holds the version even
+  if the record then fails to commit, which only stops the flusher.
+  Tested in `conflicts.rs`
+  (`a_wait_while_the_flushed_is_on_its_way_is_answered_at_once`) and the
+  flusher state's unit tests.
 
 ### M4-08 Write-through buckets
 
@@ -6188,6 +6204,22 @@ of this file. A task with nothing unexpected keeps "None."
   for a write-through bucket of its own does not wait for its own remote.
   Write-through waits have no metric of their own; a timeout is logged as
   a warning.
+- **A silent primary held the wait (review follow-up).** A first fix
+  for a primary that takes a flush ask and never answers wrapped the
+  whole routed `Shards::flushed` call in a timeout of one round (5 s and
+  a 1 s grace). That cancelled the call while it still waited out the
+  forward's 30 s request timeout on the old primary, before it could ask
+  the other members or read the register, and the shard map learns only
+  inside routed calls: every round asked the silent node again, and a
+  write that a new primary had flushed was answered `503`. The bound
+  moved into the forward: `RoutedShards::ask` gives a forwarded
+  `Request::Flushed` its wait and a 1 s grace (`FLUSH_ANSWER_GRACE`),
+  at most the request timeout, so a silent member is `Lost` and the read
+  moves on; `reach_remote` keeps an outer timeout only at the write's
+  own deadline. `a_write_through_wait_moves_on_from_a_silent_primary`
+  (routing tests, loopback TCP) maps the shard to the silent node 3
+  while the register names node 1: the wait reaches node 1 in about 6 s
+  of a 10 s timeout, and without the fix ends in `503 SlowDown` at 10 s.
 
 ### M4-09 Backup targets for local buckets
 
@@ -6555,6 +6587,27 @@ of this file. A task with nothing unexpected keeps "None."
   origin keeps its stub until a later version replaces it; nothing
   removes stubs of keys the origin no longer has. There are no metrics
   of revalidations or forwarded listings.
+- **Fixed: an origin without `Last-Modified` defeated the cache.** Once
+  revalidation compared `Last-Modified`, an origin whose HEAD sends none
+  never matched: the reader stamps such an answer with its wall clock,
+  so every HEAD looked like a new version. Under `revalidate` every GET
+  committed an `ADOPT` and refilled the object, and concurrent GETs of a
+  hot key could supersede each other's `ADOPT`s until `503`; under `ttl`
+  the same on every expiry. `RemoteObject::last_modified_ms` now keeps
+  what the HEAD sent, `OriginVersion` holds that `Option`, and `serves`
+  skips the comparison without one. The fill's `ADOPT` keeps its clock
+  fallback, which `serves` now ignores. Tested in `tests/origin.rs`
+  (`an_origin_that_sends_no_last_modified_is_still_served_from_the_cache`,
+  under both modes).
+- **Fixed: a metadata change within the second was missed.**
+  `Last-Modified` has one-second resolution, so a copy onto itself with
+  new metadata in the second of the cached version kept its ETag and
+  `Last-Modified`, and the old `Content-Type` was served. `OriginVersion`
+  now holds the HEAD's metadata too, which `serves` compares exactly,
+  since an `ADOPT` stores it unchanged. Validations kept under a TTL
+  hold it as well (S3 allows 2 KB of user metadata per object). Tested in
+  `tests/origin.rs`
+  (`a_metadata_only_change_within_the_same_second_is_seen_by_the_next_read`).
 
 ## M5 Local erasure coding
 
@@ -6867,6 +6920,20 @@ of this file. A task with nothing unexpected keeps "None."
   `attempts::publish`, which the repairer uses too; the merge into M5-08
   applies the same fix there, with a oneshot telling the caller when the
   record is sequenced so it can still emit its `Appended` event.
+- **A commit task that panics (found in review).** The detached publish
+  task settled the attempt on every outcome of the inner commit task but
+  a `JoinError`, where it returned an error and left the attempt
+  publishing with no position. Nothing settles such an attempt, so
+  orphan reclamation's fence would hold its fragments for the encoder's
+  life: a leak, not a loss. Once the commit task is gone nothing more is
+  appended for it, so that arm now finishes the attempt (and emits
+  `Abandoned`) when nothing was appended, and otherwise records it as
+  sequenced at the shard's last sequenced position, at or after the
+  record, so it settles once the shard applies past it. Waiting for the
+  commit task moved into `Publishing::settle`, which takes the task's
+  handle; that is the seam the unit test
+  `a_commit_task_that_panics_still_settles_its_attempt` uses to hand it
+  a task that panics, before and after its record is sequenced.
 
 ### M5-05 Orphan fragment reclamation
 
