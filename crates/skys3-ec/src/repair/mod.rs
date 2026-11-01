@@ -730,23 +730,37 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             moves: moves.clone(),
         });
         let appended = || emit(RepairStep::Appended);
-        let committed = match publish(&self.shard, &self.attempts, attempt, body, appended).await {
+        // The outcome is reported on the commit's task, even if this future
+        // is dropped.
+        let (observer, owned, stripe) = (self.observer.clone(), key.to_owned(), damaged.stripe);
+        let settled = move |publication: &Publication| {
+            let step = match publication {
+                Publication::Committed(committed) => RepairStep::Committed {
+                    position: committed.position,
+                    relocated: committed.outcome == Outcome::Applied(Effect::Relocated),
+                },
+                Publication::Abandoned | Publication::NotAppended(_) => RepairStep::Abandoned,
+                Publication::Unconfirmed(_) => return,
+            };
+            emit_to(observer.as_ref(), &owned, stripe, attempt, step);
+        };
+        let committed = match publish(
+            &self.shard,
+            &self.attempts,
+            attempt,
+            body,
+            appended,
+            settled,
+        )
+        .await
+        {
             Publication::Committed(committed) => committed,
-            Publication::Abandoned => {
-                emit(RepairStep::Abandoned);
-                return Err(RepairError::Abandoned(attempt));
-            }
-            Publication::NotAppended(error) => {
-                emit(RepairStep::Abandoned);
+            Publication::Abandoned => return Err(RepairError::Abandoned(attempt)),
+            Publication::NotAppended(error) | Publication::Unconfirmed(error) => {
                 return Err(RepairError::Publish(error));
             }
-            Publication::Unconfirmed(error) => return Err(RepairError::Publish(error)),
         };
         let relocated = committed.outcome == Outcome::Applied(Effect::Relocated);
-        emit(RepairStep::Committed {
-            position: committed.position,
-            relocated,
-        });
         if relocated {
             let now = Instant::now();
             let mut state = self.state();
@@ -983,14 +997,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     }
 
     fn emit(&self, key: &str, stripe: u32, attempt: AttemptId, step: RepairStep) {
-        if let Some(observer) = &self.observer {
-            observer(&RepairEvent {
-                key: key.to_owned(),
-                stripe,
-                attempt,
-                step,
-            });
-        }
+        emit_to(self.observer.as_ref(), key, stripe, attempt, step);
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -1005,6 +1012,25 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     #[cfg(not(feature = "test-util"))]
     fn has_bug(&self, _bug: RepairBug) -> bool {
         false
+    }
+}
+
+/// Reports `step` of the repair of `key`'s `stripe` by `attempt` to
+/// `observer`, if any.
+fn emit_to(
+    observer: Option<&RepairObserver>,
+    key: &str,
+    stripe: u32,
+    attempt: AttemptId,
+    step: RepairStep,
+) {
+    if let Some(observer) = observer {
+        observer(&RepairEvent {
+            key: key.to_owned(),
+            stripe,
+            attempt,
+            step,
+        });
     }
 }
 

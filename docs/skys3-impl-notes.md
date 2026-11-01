@@ -7356,6 +7356,40 @@ of this file. A task with nothing unexpected keeps "None."
   shard, so memory grows with the shard's fragments. Unrecoverable
   stripes are logged and counted in the pass report, with no metric of
   their own.
+- **Settling every publishing attempt (review follow-up on M5-04).**
+  M5-04's fix for a commit task that panics went to its `Publishing`
+  struct, which this branch had replaced with `attempts::publish`, shared
+  with the repairer, so the merge kept the shared code and the fix moved
+  into its `settle`, the seam the unit tests use. Three gaps there kept
+  an attempt publishing for good, and orphan reclamation's fence on its
+  fragments with it: a leak, not a loss. A `JoinError` from the inner
+  commit task returned without settling; it now finishes the attempt (and
+  reports `Abandoned`) when nothing was appended. When something was
+  appended, that arm and any error other than `NotAcknowledged` with a
+  position, such as the shard's pipeline stopping, used to record the
+  attempt as sequenced with no position, which nothing settles. They now
+  record `sequenced_through`, the shard's last sequenced `seq` in the
+  epoch it sequences in. That is at or after the record: `commit_in`
+  sequences it, in the attempt's epoch, before it returns, and the `seq`
+  is read before the epoch, so a change of epoch in between only puts
+  the bound in a later epoch. The attempt then settles once the shard
+  applies past the bound. Third, the `Committed` and `Abandoned` events
+  were emitted by the caller, so a dropped scan or pass reported nothing.
+  `publish` now takes a `settled` callback that the commit's task calls
+  after the bookkeeping, so the encoder and the repairer report outcomes
+  from there. `Appended` is still reported by the caller. The task waits
+  until the caller has reported it, or is gone, before reporting the
+  outcome: the caller drops a sender it was handed with the news.
+  Without that wait the encoder's steps test sees `Committed` before
+  `Appended`. Tested in `encoder::attempts`
+  (`a_commit_task_that_panics_still_settles_its_attempt`, before and
+  after an append, and
+  `a_commit_that_fails_after_an_append_settles_once_applied_past_it`), and
+  for dropped callers in `tests/encoder.rs`
+  (`a_publish_whose_caller_is_dropped_still_settles_its_attempt` now
+  also waits for `Committed`) and `tests/repair.rs`
+  (`a_repair_whose_caller_is_dropped_still_settles_and_reports_it`). The
+  repairer's own metrics of a relocation are still kept by the caller.
 
 ### M5-10 Lifecycle expiration and multipart cleanup
 
