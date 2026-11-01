@@ -531,9 +531,16 @@ async fn startup_refuses_what_it_cannot_run() {
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
     drop(closed);
-    let text = config_text(dir.path(), "127.0.0.1:0", "127.0.0.1:0", "").replace(
-        "backend = \"file\"",
+    let shared = dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let text = support::cluster::node_config(
+        &shared,
+        &support::cluster::Pki::new(&shared),
         &format!("backend = \"etcd\"\netcd_endpoints = [\"http://127.0.0.1:{port}\"]"),
+        "n1",
+        "n1",
+        support::process::free_port(),
+        256,
     );
     let error = Node::start(text.parse().unwrap()).await.unwrap_err();
     assert!(matches!(error, StartError::Control(_)), "{error}");

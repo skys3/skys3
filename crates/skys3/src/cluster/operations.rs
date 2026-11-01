@@ -1,5 +1,5 @@
 //! The cluster routes of the admin API (design §6.7, §12; plan M8-06),
-//! served by every node with `[cluster] multi_node = true`:
+//! served by every node of a cluster:
 //!
 //! - `GET /v1/cluster`: who holds `coordinator.lease`, every registered
 //!   node with its labels, its drain and departure marks, the shards that
@@ -72,9 +72,8 @@ pub(crate) struct ClusterOperations {
     handoffs: Handoffs<TokioNetwork, RealDisk>,
     /// Asks other nodes' primaries for handoffs, as the coordinator.
     client: HandoffClient<TokioNetwork>,
-    /// With `[ec] enabled`, the node's fragment stores, whose holdings it
-    /// reports.
-    coding: Option<CodingServices>,
+    /// The node's fragment stores, whose holdings it reports.
+    coding: CodingServices,
 }
 
 impl std::fmt::Debug for ClusterOperations {
@@ -207,13 +206,14 @@ pub(crate) fn placement_json(report: &PolicyReport) -> Value {
 
 impl ClusterOperations {
     /// The cluster routes of node `node` of `cluster`, over `store` (the
-    /// control store's own client), starting handoffs through `handoffs`
-    /// and reaching other primaries through `transport`.
+    /// control store's own client), starting handoffs through `handoffs`,
+    /// reaching other primaries through `transport`, and reporting what
+    /// `coding`'s fragment stores hold.
     pub(crate) fn new(
         (node, cluster): (NodeId, ClusterId),
         store: Backend,
         coordinator: CoordinatorView,
-        handoffs: Handoffs<TokioNetwork, RealDisk>,
+        (handoffs, coding): (Handoffs<TokioNetwork, RealDisk>, CodingServices),
         transport: Transport<TokioNetwork>,
     ) -> Self {
         Self {
@@ -224,24 +224,14 @@ impl ClusterOperations {
             coordinator,
             handoffs,
             client: HandoffClient::new(transport, HANDOFF_TIMEOUT),
-            coding: None,
+            coding,
         }
     }
 
-    /// Reports what `coding`'s fragment stores hold, on a node with `[ec]
-    /// enabled`.
-    pub(crate) fn with_coding(mut self, coding: Option<CodingServices>) -> Self {
-        self.coding = coding;
-        self
-    }
-
-    /// What this node's fragment stores hold, or `null` without `[ec]
-    /// enabled`.
+    /// What this node's fragment stores hold.
     fn fragments(&self) -> Value {
-        self.coding.as_ref().map_or(Value::Null, |coding| {
-            let held = coding.held();
-            json!({ "held": held.fragments, "unreleased": held.unreleased })
-        })
+        let held = self.coding.held();
+        json!({ "held": held.fragments, "unreleased": held.unreleased })
     }
 
     /// The coordinator's latest placement judgement, while this node is
@@ -315,7 +305,9 @@ impl ClusterOperations {
                 "holder": lease.as_ref().map(|lease| lease.value.holder.as_str()),
                 "lease_version": lease.as_ref().map(|lease| lease.version.as_str()),
                 "this_node": self.coordinator.is_coordinator(),
-                "candidate": self.coordinator.candidate,
+                // Every node of a cluster may be elected since plan M8-09;
+                // kept, as answers only ever gain fields (§12).
+                "candidate": true,
             },
             "nodes": nodes,
             "shards": scan.shards().count(),

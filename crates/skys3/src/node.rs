@@ -218,7 +218,7 @@ pub enum StartError {
         #[source]
         source: skys3_log::RecoveryError,
     },
-    /// A disk's fragment store could not be recovered (`[ec] enabled`).
+    /// A disk's fragment store could not be recovered (a node of a cluster).
     #[error("cannot recover the fragment store of disk {disk}: {source}")]
     Fragments {
         /// The disk.
@@ -253,7 +253,7 @@ pub enum StartError {
     /// STS could not be set up.
     #[error("STS: {0}")]
     Sts(String),
-    /// The cluster services of `[cluster] multi_node = true` cannot start:
+    /// The cluster services of a node of a cluster cannot start:
     /// a certificate that does not name this node, or a registration of
     /// this node's ID from another data directory.
     #[error("the cluster: {0}")]
@@ -292,7 +292,7 @@ pub enum NodeError {
     /// A background task ended unexpectedly.
     #[error("a background task failed: {0}")]
     Task(String),
-    /// With `[cluster] multi_node = true`, the node's registration turned
+    /// On a node of a cluster, the node's registration turned
     /// out to belong to another data directory after it had started; it
     /// stops rather than serve under another node's ID (§6.7).
     #[error("the cluster: {0}")]
@@ -343,14 +343,14 @@ pub(crate) struct Shared {
     pub(crate) flush: Arc<NodeFlush>,
     pub(crate) snapshots: NodeSnapshots,
     /// The generations other nodes push, which wake the sync of the
-    /// node's copy; none arrive without `[cluster] multi_node = true`.
+    /// node's copy; none arrive on a single node.
     pub(crate) hints: ControlHints,
-    /// With `[cluster] multi_node = true`, the shards replicated across the
+    /// On a node of a cluster, the shards replicated across the
     /// nodes their registers name, which the gateway reaches by routing
     /// (plan M8-05b); `None` for a single node, whose shards are all its
     /// own ([`Shared::shards`]).
     pub(crate) cluster: Option<Arc<ClusterShards>>,
-    /// With `[ec] enabled = true`, erasure coding on the node's replicas of
+    /// On a node of a cluster, erasure coding on the node's replicas of
     /// `local` buckets' shards (plan M8-07a).
     pub(crate) coding: Option<Arc<NodeCoding>>,
     /// The fills [`Shared::cluster`]'s transport serves to other nodes'
@@ -571,11 +571,11 @@ struct OpenedControl {
 }
 
 /// Opens the control store with `opener` (the startup probe of an S3
-/// store, and the single-node guard), bootstraps `cluster.json` if this
-/// node never synced, and syncs the copy kept in the index. If the store
-/// cannot be opened or does not answer, or looks reset, a node with a copy
-/// runs from it (§6.2); a store that belongs to another node, registers
-/// one, or fails the probe is refused.
+/// store), bootstraps `cluster.json` if this node never synced, and syncs
+/// the copy kept in the index. If the store cannot be opened or does not
+/// answer, or looks reset, a node with a copy runs from it (§6.2); a file
+/// store that belongs to another node, or a store that fails the probe, is
+/// refused.
 async fn open_control(
     config: &Config,
     opener: &Opener,
@@ -721,8 +721,7 @@ struct Opened {
 /// 2. Recover each disk's log (torn tails cut, damage refused), open the
 ///    index, and replay every record after its shard's checkpoint.
 /// 3. Open the control store `[control_store]` names, probing an S3 store
-///    first and refusing an etcd or S3 store that registers another node
-///    ([`crate::control::backend`]); bootstrap `cluster.json`; and sync the
+///    first ([`crate::control::backend`]); bootstrap `cluster.json`; and sync the
 ///    local copy of bucket bindings and identity configuration. If the
 ///    store does not answer, run from the copy kept in the index
 ///    ([`crate::control`]).
@@ -759,7 +758,7 @@ pub struct Node {
     checkpoints: JoinHandle<IndexError>,
     checkpointer: Arc<Checkpointer<RealDisk>>,
     background: JoinSet<()>,
-    /// What the heartbeater reports, with `[cluster] multi_node = true`.
+    /// What the heartbeater reports, on a node of a cluster.
     registration: Option<watch::Receiver<HeartbeatStatus>>,
     shared: Arc<Shared>,
     /// The QUIC endpoint of native replication, if the node peers.
@@ -857,7 +856,7 @@ impl Node {
                         ConnectError::Tls(error) => StartError::Tls(error),
                         other => StartError::ControlStore(other.to_string()),
                     })?;
-                Opener::shared(store, node_id.clone(), config.cluster().multi_node)
+                Opener::shared(store)
             }
         };
         let OpenedControl {
@@ -874,7 +873,7 @@ impl Node {
             generation: Some(copy.generation),
             synced_at: Some(copy.synced_at),
         }));
-        // With multi_node, the shards replicated across the nodes their
+        // On a node of a cluster, the shards replicated across the nodes their
         // registers name, and the gateway's routing to their primaries;
         // shard registers change through the store's own client, never the
         // copy (plan M8-05b).
@@ -892,10 +891,11 @@ impl Node {
             )),
             _ => None,
         };
-        // With [ec] enabled, the fragment stores, recovered now, and what
-        // codes and reads coded objects (plan M8-07a).
+        // On a node of a cluster, the fragment stores, recovered now, and
+        // what codes and reads coded objects (plan M8-07a); whether an
+        // object is coded is the [ec] policy's, by the eligible nodes.
         let coding = match &cluster_shards {
-            Some(cluster) if config.ec().enabled => Some(Arc::new(
+            Some(cluster) => Some(Arc::new(
                 NodeCoding::open(
                     &config,
                     &node_id,
@@ -906,7 +906,7 @@ impl Node {
                 )
                 .await?,
             )),
-            _ => None,
+            None => None,
         };
 
         // Identity, sessions, and the gateway.
@@ -1131,8 +1131,12 @@ impl Node {
         shared.sync_identity(copy.synced_at).await?;
         let mut background = JoinSet::new();
         let mut operations = None;
-        let (cluster_view, registration) = match (shared.opener.shared_store(), &shared.cluster) {
-            (Some(store), Some(cluster)) => {
+        let (cluster_view, registration) = match (
+            shared.opener.shared_store(),
+            &shared.cluster,
+            &shared.coding,
+        ) {
+            (Some(store), Some(cluster), Some(coding)) => {
                 // The transport serves, and the node is registered, before
                 // its replicas open: other nodes' primaries link to them
                 // as they do.
@@ -1143,7 +1147,7 @@ impl Node {
                     shared.hints.clone(),
                     (&metrics.handshakes, &metrics.registry),
                     &pools.index,
-                    (cluster, shared.coding.as_ref().map(|c| c.services())),
+                    (cluster, coding.services()),
                 )
                 .await?;
                 let (view, status) = (services.view(), services.status());
@@ -1326,7 +1330,7 @@ impl Node {
     }
 
     /// Serves until `stop` completes, a checkpoint fails, or, with
-    /// `[cluster] multi_node = true`, the node's registration turns out to
+    /// on a node of a cluster, the node's registration turns out to
     /// belong to another data directory, then shuts down.
     ///
     /// # Errors
@@ -1523,14 +1527,14 @@ async fn close_index(index: Arc<Index>) {
     }
 }
 
-/// Checks that the data directory serves as `[cluster] multi_node` says
-/// (plan M8-05b), and records the setting if the directory holds no
-/// bucket's shards yet. A single node serves each shard alone in epoch 1,
-/// and a node of several opens the replicas the shard registers name: a
-/// replica opened one way cannot be served the other, so a data directory
-/// that holds a bucket's shards keeps the mode it served them in. Moving a
-/// single node's buckets into a cluster goes through the buckets' targets
-/// or an S3 copy (runbook "Moving a single node into a cluster").
+/// Checks that the data directory serves as the control store says (plan
+/// M8-05b; [`Config::multi_node`]), and records the mode if the directory
+/// holds no bucket's shards yet. A single node serves each shard alone in
+/// epoch 1, and a node of a cluster opens the replicas the shard registers
+/// name: a replica opened one way cannot be served the other, so a data
+/// directory that holds a bucket's shards keeps the mode it served them in.
+/// Moving a single node's buckets into a cluster goes through the buckets'
+/// targets or an S3 copy (runbook "Moving a single node into a cluster").
 ///
 /// # Errors
 ///
@@ -1543,7 +1547,7 @@ async fn check_mode(
     index: &Arc<Index>,
     pool: &BlockingPool,
 ) -> Result<(), StartError> {
-    let multi_node = config.cluster().multi_node;
+    let multi_node = config.multi_node();
     if data_dir.multi_node() == multi_node {
         return Ok(());
     }
@@ -1575,7 +1579,7 @@ async fn check_mode_unopened(
     data_dir: &DataDir,
     pool: &BlockingPool,
 ) -> Result<(), StartError> {
-    if data_dir.multi_node() == config.cluster().multi_node {
+    if data_dir.multi_node() == config.multi_node() {
         return Ok(());
     }
     let path = data_dir.path().join(INDEX_FILE);
@@ -1615,7 +1619,7 @@ fn refuse_held(
     data_dir: &DataDir,
     held: BTreeSet<BucketId>,
 ) -> Result<(), StartError> {
-    let multi_node = config.cluster().multi_node;
+    let multi_node = config.multi_node();
     // Every node keeps STS sessions in a system bucket of its own.
     let held: Vec<String> = held
         .into_iter()
@@ -1623,20 +1627,27 @@ fn refuse_held(
         .map(|bucket| bucket.as_str().to_owned())
         .collect();
     if !held.is_empty() {
-        let (was, is) = if multi_node {
-            ("a single node", "one node of several")
+        let (was, is, store) = if multi_node {
+            (
+                "a single node",
+                "one of a cluster's nodes",
+                "an etcd or S3 control store",
+            )
         } else {
-            ("one node of several", "a single node")
+            (
+                "one of a cluster's nodes",
+                "a single node",
+                "the file control store",
+            )
         };
         return Err(DataDirError::Mismatch(format!(
-            "{} holds the shards of {} bucket(s) ({}) that it served as {was}; a node with \
-             [cluster] multi_node = {multi_node} serves as {is} and cannot take them over: start \
-             it with a new data directory, or keep multi_node = {} (runbook \"Moving a single \
-             node into a cluster\")",
+            "{} holds the shards of {} bucket(s) ({}) that it served as {was}; a node over {store} \
+             serves as {is} and cannot take them over: start it with a new data directory, or \
+             with the control store it served them with (runbook \"Moving a single node into a \
+             cluster\")",
             data_dir.path().display(),
             held.len(),
             held.join(", "),
-            !multi_node,
         ))
         .into());
     }

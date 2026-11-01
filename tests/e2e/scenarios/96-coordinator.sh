@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # The coordinator, handoffs, and the member lifecycle (plan M8-06, design
-# section 6.7): nodes cc1 to cc4 of cluster cc, each with `[cluster]
-# multi_node = true` and `coordinator = true`, share the etcd control
-# store over mutual TLS (under the prefix `cc/`). A local bucket with 4
-# shards of 3 members each takes writes and reads throughout, through
-# every node that serves, each request retried as an SDK retries it (3
-# attempts). The scenario checks:
+# section 6.7): nodes cc1 to cc4 of cluster cc, every one of which may be
+# elected coordinator, share the etcd control store over mutual TLS
+# (under the prefix `cc/`). A local bucket with 4 shards of 3 members
+# each takes writes and reads throughout, through every node that serves,
+# each request retried as an SDK retries it (3 attempts). The scenario
+# checks:
 #
 # - that one node is elected coordinator, and every node names it;
 # - that a handoff moves a primary, asked through the coordinator's admin
@@ -52,8 +52,6 @@ configure() {
     cat >"$dir/skys3.toml" <<EOF
 [cluster]
 cluster_id = "cc"
-multi_node = true
-coordinator = true
 
 [node]
 node_id = "$node"

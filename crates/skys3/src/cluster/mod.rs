@@ -14,20 +14,20 @@
 //! - [`replication`]: the shards replicated across the nodes their
 //!   registers name, and the gateway's routing of every request to its
 //!   shard's primary (design §5, §6.3–§6.6, §9.2).
-//! - [`coordinator`]: with `[cluster] coordinator = true`, the elector and
-//!   the coordinator, which places, replaces, rebalances, and drains
-//!   (design §6.7).
+//! - [`coordinator`]: the elector and the coordinator, which places,
+//!   replaces, rebalances, and drains (design §6.7).
 //! - [`operations`]: the cluster routes of the admin API: the cluster's
 //!   state, handoffs, and drains (plan M8-06).
-//! - [`coding`]: with `[ec] enabled = true`, erasure coding: the fragment
-//!   stores and their server, the encoders, coded reads, fragment release,
-//!   orphan reclamation, repair, and fragment moves (design §8, plans
-//!   M8-07a and M8-07b).
+//! - [`coding`]: erasure coding: the fragment stores and their server, the
+//!   encoders, coded reads, fragment release, orphan reclamation, repair,
+//!   and fragment moves (design §8, plans M8-07a and M8-07b).
 //!
-//! All but the first two run only with `[cluster] multi_node = true`
-//! ([`ClusterServices`], [`replication::ClusterShards`]); without it, the
-//! node behaves as a single node, serves every shard alone, and never
-//! binds the transport.
+//! All but the first two run on every node of a cluster, a node over an
+//! etcd or S3 control store ([`Config::multi_node`], [`ClusterServices`],
+//! [`replication::ClusterShards`]). A node over the file store is a single
+//! node: it serves every shard alone and never binds the transport. Until
+//! plan M8-09, `[cluster] multi_node`, `[cluster] coordinator`, and `[ec]
+//! enabled` gated them, each off by default.
 
 pub(crate) mod coding;
 pub(crate) mod control;
@@ -61,9 +61,9 @@ use operations::ClusterOperations;
 use registration::NodeHeartbeater;
 use replication::ClusterShards;
 
-/// Loads the node's `[transport]` credentials for `[cluster] multi_node =
-/// true`, and checks that the certificate names this node: a node's ID is
-/// the one its certificate names (design §12). `None` for a single node.
+/// Loads the `[transport]` credentials of a node of a cluster, and checks
+/// that the certificate names this node: a node's ID is the one its
+/// certificate names (design §12). `None` for a single node.
 ///
 /// # Errors
 ///
@@ -73,7 +73,7 @@ pub(crate) fn credentials(
     config: &Config,
     node: &NodeId,
 ) -> Result<Option<Credentials>, StartError> {
-    if !config.cluster().multi_node {
+    if !config.multi_node() {
         return Ok(None);
     }
     let cluster = &config.cluster().cluster_id;
@@ -96,14 +96,14 @@ pub(crate) fn credentials(
     }
 }
 
-/// The cluster services of a node with `[cluster] multi_node = true`, bound
-/// and registered, ready to run ([`ClusterServices::spawn`]).
+/// The cluster services of a node of a cluster, bound and registered,
+/// ready to run ([`ClusterServices::spawn`]).
 pub(crate) struct ClusterServices {
     listener: Listener<TokioNetwork>,
     limit: HandshakeLimit,
     services: transport::Services,
     heartbeater: NodeHeartbeater,
-    coordinator: Option<NodeCoordinator>,
+    coordinator: NodeCoordinator,
     view: ClusterView,
     operations: Arc<ClusterOperations>,
 }
@@ -115,10 +115,9 @@ impl ClusterServices {
     /// registers even while it runs from its copy). Pushed generations go
     /// to `hints`, the links and forwarded requests of other nodes to
     /// `shards`, and the listener's handshakes are exported in
-    /// `handshakes`. With `[cluster] coordinator = true`, the elector and
-    /// the coordinator are ready to run too, with their metrics in
-    /// `metrics`. With `[ec] enabled = true`, the transport serves
-    /// `coding` too.
+    /// `handshakes`. The elector and the coordinator are ready to run too,
+    /// with their metrics in `metrics`, and the transport serves `coding`'s
+    /// fragments and orphan queries.
     ///
     /// # Errors
     ///
@@ -132,7 +131,7 @@ impl ClusterServices {
         hints: ControlHints,
         (handshakes, metrics): (&HandshakeMetrics, &MetricsRegistry),
         pool: &BlockingPool,
-        (shards, coding): (&ClusterShards, Option<CodingServices>),
+        (shards, coding): (&ClusterShards, CodingServices),
     ) -> Result<Self, StartError> {
         let settings = config.transport();
         let advertise = settings.advertised().ok_or_else(|| {
@@ -169,23 +168,18 @@ impl ClusterServices {
             forwarded: shards.server().clone(),
             coding: coding.clone(),
         };
-        let operations = Arc::new(
-            ClusterOperations::new(
-                (node, config.cluster().cluster_id.clone()),
-                store.clone(),
-                coordinating.clone(),
-                shards.handoffs(),
-                transport.clone(),
-            )
-            .with_coding(coding),
-        );
+        let operations = Arc::new(ClusterOperations::new(
+            (node, config.cluster().cluster_id.clone()),
+            store.clone(),
+            coordinating.clone(),
+            (shards.handoffs(), coding),
+            transport.clone(),
+        ));
         let profile = registration::profile(config, data_dir, advertise.clone(), pool).await?;
-        let mut heartbeater = registration::heartbeater(config, store, transport, profile, clock);
-        if coordinating.candidate {
-            // Its own heartbeats reach its registry directly while it is
-            // coordinator.
-            heartbeater = heartbeater.with_local(coordinating.registry, coordinating.leadership);
-        }
+        // Its own heartbeats reach its registry directly while it is
+        // coordinator.
+        let mut heartbeater = registration::heartbeater(config, store, transport, profile, clock)
+            .with_local(coordinating.registry, coordinating.leadership);
         registration::register_at_start(&mut heartbeater).await?;
         tracing::info!(%listen, %advertise, "the transport listens");
         let view = ClusterView {
@@ -222,8 +216,7 @@ impl ClusterServices {
     }
 
     /// Serves the transport, sends heartbeats, and contends for the
-    /// coordinator lease if the node may, for as long as the node's
-    /// background tasks run.
+    /// coordinator lease, for as long as the node's background tasks run.
     pub(crate) fn spawn(self, background: &mut JoinSet<()>) {
         let Self {
             listener,
@@ -235,9 +228,7 @@ impl ClusterServices {
         } = self;
         background.spawn(transport::serve(listener, limit, services));
         background.spawn(heartbeater.run());
-        if let Some(coordinator) = coordinator {
-            coordinator.spawn(background);
-        }
+        coordinator.spawn(background);
     }
 }
 

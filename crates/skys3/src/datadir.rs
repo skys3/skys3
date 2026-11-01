@@ -117,9 +117,9 @@ struct NodeFile {
     instance_id: String,
     disks: Vec<RecordedDisk>,
     /// Whether the node's replicas follow shard registers, as one node of
-    /// several (`[cluster] multi_node`), rather than serving every shard
-    /// alone. Absent, and false, in files of single nodes and of builds
-    /// before plan M8-05b.
+    /// a cluster (an etcd or S3 control store), rather than serving every
+    /// shard alone. Absent, and false, in files of single nodes and of
+    /// builds before plan M8-05b.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     multi_node: bool,
 }
@@ -233,7 +233,7 @@ impl DataDir {
     }
 
     /// Whether the node serves as one node of several, its replicas
-    /// following shard registers (`[cluster] multi_node`), as `node.json`
+    /// following shard registers (an etcd or S3 control store), as `node.json`
     /// said when the directory was opened. A new node starts as a single
     /// one.
     #[must_use]

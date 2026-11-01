@@ -47,34 +47,37 @@ the 4 items earlier tasks reported and did not fix, each verified against
 the current code. No finding is high: the node binary runs a single node
 with the file control store, and the paths of the medium findings are
 either configuration an operator chooses or not wired into the binary.
+Since M8-09 the binary runs the cluster by default, every node over an
+etcd or S3 control store; section 10 re-reviews the rows that were not
+applicable then, and records which findings are closed.
 
 ## 2. Internal paths
 
 "Mutual" means both ends prove an identity before any message is acted
 on. Every intra-cluster path runs over `skys3-net`'s `Transport`
-(TCP + TLS 1.3, mutual, SPIFFE identities). Since M8-04 the node binary
-binds it with `[cluster] multi_node = true` and serves admin messages on
-it (`skys3/src/cluster/transport.rs`); since M8-05b also replication,
-leases, backfill, and the gateway's forwarded requests and holder reads
-(`skys3/src/cluster/replication.rs`); since M8-06 the coordinator, on
-the nodes with `[cluster] coordinator = true`, and every node's handoff
-sink (`skys3/src/cluster/coordinator.rs`, `hints.rs`); since M8-07a,
-on the nodes with `[ec] enabled = true`, fragment writes, reads, holds,
-releases, and orphan queries (`skys3/src/cluster/coding.rs`). A node
-without `[ec] enabled` closes a connection whose first frame is of
-erasure coding.
+(TCP + TLS 1.3, mutual, SPIFFE identities). Every node of a cluster,
+that is every node over an etcd or S3 control store, binds it (M8-09
+removed the flags that gated each part, section 10): since M8-04 it serves
+admin messages on it (`skys3/src/cluster/transport.rs`); since M8-05b also
+replication, leases, backfill, and the gateway's forwarded requests and
+holder reads (`skys3/src/cluster/replication.rs`); since M8-06 the
+coordinator, for which every node contends, and every node's handoff
+sink (`skys3/src/cluster/coordinator.rs`, `hints.rs`); since M8-07a
+fragment writes, reads, holds, releases, and orphan queries
+(`skys3/src/cluster/coding/`). A single node, over the file store, binds
+no transport.
 
 | Path | In the binary | Mutually authenticated | How identities are checked | Verdict |
 |---|---|---|---|---|
-| Node to node: replication, leases, backfill (`skys3-shard` `replication`) | Yes, with `[cluster] multi_node = true` since M8-05b: links, backfills, and step-downs from the primaries of the shards whose registers name the node | Yes: mTLS, both chains against `[transport] tls_ca_file` (`skys3-net/src/pki.rs:277` `PeerVerifier::verify`) | SPIFFE ID `spiffe://<cluster>/node/<id>`, exactly one URI SAN, this cluster's trust domain (`identity.rs:158`); a client checks the node it meant (`transport.rs:154`); class per role on every frame (`transport.rs:374`, `message.rs:144`); a member follows only the primary its configuration names (`replication/member.rs:197`), a learner only its primary (`replication/backfill.rs:407`) | Holds (the library's tests below; in the binary `skys3/tests/cluster.rs` `three_nodes_replicate_route_take_over_and_readmit`, e2e scenario `replication`) |
-| Gateway routing wire (`Forward` to a shard primary, `skys3-gateway/src/routing`) | Yes, with `multi_node` since M8-05b: every node's gateway forwards to the others, and serves holder reads (`Register`, `Fetch`) of what its replicas hold | Yes, same transport | `Request` class: nodes only, admin certificates refused; the client checks the primary's node ID; a replica serves a client request only as its shard's serving primary, and redirects otherwise; a fill request (`Fill`, M8-05b) makes the primary read one evicted version from its bucket's target, as a client GET through it would, under the same checks | Holds (as above) |
-| Coordinator and admin messages (`skys3-coord/src/admin.rs`) | Yes, with `[cluster] multi_node = true` since M8-04: pushed generations and heartbeats; since M8-06 heartbeats are answered by the coordinator's registry on the lease holder, and handoff commands are served by every node's replicas (`skys3/src/cluster/hints.rs`) | Yes, same transport | Heartbeats take the node ID from the certificate (`admin.rs`); change hints come from any node or `admin` certificate; a handoff command is obeyed only from the node `coordinator.lease` names, read at most once a second, or from an `admin` certificate, and any other sender is refused and logged (`skys3-coord/src/authority.rs` `CoordinatorOrAdmin`, fixed in M8-06, T6); a pushed generation only wakes the node's sync once per generation, which then reads `cluster.json` (`skys3/src/cluster/control.rs` `follow_control_store`); the node's certificate must name its `node_id` at startup (`skys3/src/cluster/mod.rs` `credentials`) | Holds (`skys3/tests/cluster.rs` `three_nodes_register_heartbeat_and_take_pushes`, `the_transport_refuses_strangers_and_caps_its_handshakes`; `skys3-coord` `handoff/tests.rs` `only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff`, `authority.rs` `the_lease_holder_and_admin_certificates_may_ask_and_no_other_node`; `skys3/tests/coordinator.rs` `a_coordinator_is_elected_hands_off_and_is_succeeded`; e2e scenarios `cluster` and `coordinator`); T6 fixed in M8-06 |
-| Fragment reads, holds, releases, transfers, orphan checks (`skys3-ec` `read/wire.rs`, `release/wire.rs`, `orphans/wire.rs`, `transfer`) | Yes, with `[ec] enabled = true` since M8-07a: the transport hands a connection whose first frame is `FragmentWrite`, `FragmentRead`, `FragmentHold`, `FragmentRelease`, or `OrphanQuery` to the fragment server or the replicas' orphan judges, and closes one that opens with an answer (`skys3/src/cluster/coding.rs` `CodingServices::serve`); without the flag it closes them all | Yes, same transport | `Replication` class (`FragmentData`, `FragmentNoted`): nodes only, so an `admin` certificate can neither write nor read fragments; the reader's node ID from the certificate (`read/wire.rs:620`, `orphans/wire.rs:382`), which also names whose holds a `FragmentHold` changes; releases only from node certificates (`release/wire.rs:429`), and only of fragments whose header names the released shard, key, version, stripe, and index (`release/wire.rs:362`). Any node certificate of the cluster may write a fragment, within the frame limits and the 256 MiB fragment bound (`transfer.rs` `receive`); one that no committed layout names is an orphan, which the node releases once the shard's primary says so, `fragment_orphan_after_seconds` after it arrived (assumption 31: nodes are not malicious) | Holds (`skys3/tests/coding.rs` `objects_are_coded_read_degraded_released_and_orphans_reclaimed`: an `admin` certificate's write fails, a stray node's fragment is reclaimed as an orphan; e2e scenario `erasure-coding`) |
+| Node to node: replication, leases, backfill (`skys3-shard` `replication`) | Yes, on every node of a cluster since M8-05b (by default since M8-09): links, backfills, and step-downs from the primaries of the shards whose registers name the node | Yes: mTLS, both chains against `[transport] tls_ca_file` (`skys3-net/src/pki.rs:277` `PeerVerifier::verify`) | SPIFFE ID `spiffe://<cluster>/node/<id>`, exactly one URI SAN, this cluster's trust domain (`identity.rs:158`); a client checks the node it meant (`transport.rs:154`); class per role on every frame (`transport.rs:374`, `message.rs:144`); a member follows only the primary its configuration names (`replication/member.rs:197`), a learner only its primary (`replication/backfill.rs:407`) | Holds (the library's tests below; in the binary `skys3/tests/cluster.rs` `three_nodes_replicate_route_take_over_and_readmit`, e2e scenario `replication`) |
+| Gateway routing wire (`Forward` to a shard primary, `skys3-gateway/src/routing`) | Yes, on every node of a cluster since M8-05b (by default since M8-09): every node's gateway forwards to the others, and serves holder reads (`Register`, `Fetch`) of what its replicas hold | Yes, same transport | `Request` class: nodes only, admin certificates refused; the client checks the primary's node ID; a replica serves a client request only as its shard's serving primary, and redirects otherwise; a fill request (`Fill`, M8-05b) makes the primary read one evicted version from its bucket's target, as a client GET through it would, under the same checks | Holds (as above) |
+| Coordinator and admin messages (`skys3-coord/src/admin.rs`) | Yes, on every node of a cluster since M8-04 (by default since M8-09): pushed generations and heartbeats; since M8-06 heartbeats are answered by the coordinator's registry on the lease holder, for which every node contends, and handoff commands are served by every node's replicas (`skys3/src/cluster/hints.rs`) | Yes, same transport | Heartbeats take the node ID from the certificate (`admin.rs`); change hints come from any node or `admin` certificate; a handoff command is obeyed only from the node `coordinator.lease` names, read at most once a second, or from an `admin` certificate, and any other sender is refused and logged (`skys3-coord/src/authority.rs` `CoordinatorOrAdmin`, fixed in M8-06, T6); a pushed generation only wakes the node's sync once per generation, which then reads `cluster.json` (`skys3/src/cluster/control.rs` `follow_control_store`); the node's certificate must name its `node_id` at startup (`skys3/src/cluster/mod.rs` `credentials`) | Holds (`skys3/tests/cluster.rs` `three_nodes_register_heartbeat_and_take_pushes`, `the_transport_refuses_strangers_and_caps_its_handshakes`; `skys3-coord` `handoff/tests.rs` `only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff`, `authority.rs` `the_lease_holder_and_admin_certificates_may_ask_and_no_other_node`; `skys3/tests/coordinator.rs` `a_coordinator_is_elected_hands_off_and_is_succeeded`; e2e scenarios `cluster` and `coordinator`); T6 fixed in M8-06 |
+| Fragment reads, holds, releases, transfers, orphan checks (`skys3-ec` `read/wire.rs`, `release/wire.rs`, `orphans/wire.rs`, `transfer`) | Yes, on every node of a cluster since M8-07a (by default since M8-09): the transport hands a connection whose first frame is `FragmentWrite`, `FragmentRead`, `FragmentHold`, `FragmentRelease`, or `OrphanQuery` to the fragment server or the replicas' orphan judges, and closes one that opens with an answer (`skys3/src/cluster/coding/mod.rs` `CodingServices::serve`) | Yes, same transport | `Replication` class (`FragmentData`, `FragmentNoted`): nodes only, so an `admin` certificate can neither write nor read fragments; the reader's node ID from the certificate (`read/wire.rs:620`, `orphans/wire.rs:382`), which also names whose holds a `FragmentHold` changes; releases only from node certificates (`release/wire.rs:429`), and only of fragments whose header names the released shard, key, version, stripe, and index (`release/wire.rs:362`). Any node certificate of the cluster may write a fragment, within the frame limits and the 256 MiB fragment bound (`transfer.rs` `receive`); one that no committed layout names is an orphan, which the node releases once the shard's primary says so, `fragment_orphan_after_seconds` after it arrived (assumption 31: nodes are not malicious) | Holds (`skys3/tests/coding.rs` `objects_are_coded_read_degraded_released_and_orphans_reclaimed`: an `admin` certificate's write fails, a stray node's fragment is reclaimed as an orphan; e2e scenario `erasure-coding`) |
 | Peer QUIC transport (`skys3-peer`) | Yes, when `[peering.peers]` is set (`skys3/src/cluster/peering.rs`), at most `[peering] peer_max_inflight_handshakes` handshakes at once (T7) | Yes: mTLS, the peer's chain against that peer's own `ca_file` (`skys3-peer/src/tls.rs:210`) | Leaf's trust domain must be a configured peer and lead to its bundle; holder must be a `node`; a source checks the destination cluster from the server name (`tls.rs:296`); `HELLO`'s cluster must equal the certificate's (`endpoint.rs:466`); every `BEGIN`, `COMMIT`, `BATCH` item, and `ABORT` authorized against the peer's bucket pairs (`trust.rs:198`) | Holds |
 | Peer S3 REST fallback (`s3_access_key_ids`, `x-skys3-apply-by`; `skys3-gateway/src/peer_s3.rs`) | Yes | No: the source signs with SigV4 (a shared secret); the destination is authenticated only by the target endpoint's TLS (WebPKI), or not at all over `http://` | The access key maps to one peer (`peer_s3.rs:118`, config refuses a key listed twice); a write identity must name that peer and one of its pairs (`peer_s3.rs:129`); `x-skys3-*` headers must be signed (`sigv4/mod.rs:356`); the apply-by time is read only from the peer's keys and required where `COMMIT`s land (`peer_s3.rs:199`); the descriptor is verified against the peer's bundle before any address is used (`skys3-peer/src/descriptor.rs:409`) | Holds as designed; finding T2 (no destination authentication over `http://`) |
 | Control store, file (`skys3-control/src/file.rs`) | Yes | Not a network path: a local directory under an exclusive lock | Directory permissions | Holds; T4 and K1 fixed in M8-03 (values bounded; a failed store is detached and reopened, `skys3/src/node.rs` `Shared::detach`) |
-| Control store, S3 (`skys3-control/src/s3.rs`) | Yes, since M8-03 (`skys3/src/control/backend.rs`), after the startup probe: one node per store, or the registered nodes of a cluster with `multi_node` (M8-04) | One-way: the store by its endpoint's TLS (`http://` only on loopback, refused at configuration loading and again in `backend::connect`, fixed in M8-03, see T2); SkyS3 by its SigV4 credential, from `[control_store] profile` or the default chain | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Holds; T4 and T8 fixed in M8-03 (ranged reads bounded by `MAX_REGISTER_BYTES`; versioning read at startup, `skys3_control_store_versioning`) |
-| Control store, etcd (`skys3-control/src/etcd`) | Yes, since M8-03: one node per store, or the registered nodes of a cluster with `multi_node` (M8-04) | `https://`, verified against `etcd_tls_ca_file` or the system roots, with the client certificate of `etcd_tls_cert_file` and `etcd_tls_key_file` (`skys3/src/tls.rs` `client_config`); `http://` only on loopback, refused at configuration loading (`skys3-config/src/cluster.rs` `etcd_backend`) | etcd's `--client-cert-auth` against the client certificate | Holds; T3 fixed in M8-03 (`tests/control_stores.rs` `a_node_runs_on_etcd_over_mutual_tls`, `tests/validation.rs` `etcd_backend_rules`) |
+| Control store, S3 (`skys3-control/src/s3.rs`) | Yes, since M8-03 (`skys3/src/control/backend.rs`), after the startup probe: the registered nodes of a cluster, one or many (M8-04; since M8-09 every node over the store is one) | One-way: the store by its endpoint's TLS (`http://` only on loopback, refused at configuration loading and again in `backend::connect`, fixed in M8-03, see T2); SkyS3 by its SigV4 credential, from `[control_store] profile` or the default chain | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Holds; T4 and T8 fixed in M8-03 (ranged reads bounded by `MAX_REGISTER_BYTES`; versioning read at startup, `skys3_control_store_versioning`) |
+| Control store, etcd (`skys3-control/src/etcd`) | Yes, since M8-03: the registered nodes of a cluster, one or many (M8-04; since M8-09 every node over the store is one) | `https://`, verified against `etcd_tls_ca_file` or the system roots, with the client certificate of `etcd_tls_cert_file` and `etcd_tls_key_file` (`skys3/src/tls.rs` `client_config`); `http://` only on loopback, refused at configuration loading (`skys3-config/src/cluster.rs` `etcd_backend`) | etcd's `--client-cert-auth` against the client certificate | Holds; T3 fixed in M8-03 (`tests/control_stores.rs` `a_node_runs_on_etcd_over_mutual_tls`, `tests/validation.rs` `etcd_backend_rules`) |
 | Admin HTTP listener: metrics, health, admin API (`skys3-obs/src/admin.rs`) | Yes | No: plain HTTP, bearer token, loopback by default | Token of at least 32 bytes in constant time (`admin.rs:168`, fixed here); a non-loopback `listen` without a token is refused (`admin.rs:111`); `/healthz` and `/readyz` are open by design; a request body (M8-06's handoff target) is read only after the token is checked, at most 64 KiB within 10 s (`MAX_API_BODY`, `API_BODY_TIMEOUT`); a handoff asked here is started only by the shard's primary or sent by the coordinator, so the transport's T6 check stands, and a drain is a CAS on the node's registration (M8-06) | Holds as designed; finding T1 (no TLS, no `admin` certificates), which since M8-06 also covers handoffs and drains |
 | Gateway (S3 and STS clients) | Yes | No, by design: clients sign with SigV4; the gateway serves HTTPS when configured (`skys3/src/tls.rs:35`) and warns on plain HTTP off loopback (`node.rs:724`) | SigV4 signatures in constant time (`sigv4/canonical.rs:260`); with HTTPS, at most `[gateway] max_inflight_handshakes` handshakes at once (T7, `skys3-gateway/src/listener.rs`) | Holds |
 
@@ -89,7 +92,7 @@ One row per claim of §12, and per item of the plan entry.
 | 3 | XML bodies read up to 4 MiB, at most 32 elements deep, no DTD, before `s3s` parses them | `limits.rs:248` `check_xml`; `s3s_config` sets `xml_max_body_size` | `limits.rs` `declared_xml_bodies_are_bounded`, `xml_depth_and_doctypes_are_checked`, proptests; fuzz `gateway_request` | Holds |
 | 4 | `aws-chunked`: chunk line at most 128 bytes, trailers at most 4 KiB and 8 declared, data streamed, total equal to `x-amz-decoded-content-length` at most 5 GiB | `sigv4/chunked.rs:40`–`47`, `sigv4/body.rs:158` `decoded_length` | `chunked.rs` `malformed_bodies_are_refused`, `body.rs` `chunked_heads_are_checked`; fuzz `gateway_aws_chunked` | Holds |
 | 5 | Canonical request bytes kept intact for SigV4; `x-amz-*` and `x-skys3-*` headers must be signed | `sigv4/mod.rs:356` `check_signed_headers`; unsigned requests carrying `x-skys3-*` refused (`mod.rs:222`) | `tests/sigv4.rs`, `tests/sigv4_http.rs`; fuzz `gateway_sigv4_canonical` | Holds |
-| 6 | Internal traffic uses mutual TLS with node identities from the operator's PKI | `skys3-net/src/pki.rs:216`, `:237`, `:277` | `skys3-net/tests/transport.rs` `a_client_without_a_certificate_is_refused`, `a_client_from_another_ca_is_refused`; in the binary, `skys3/tests/cluster.rs` `the_transport_refuses_strangers_and_caps_its_handshakes` and the e2e scenario `cluster` (another CA, another cluster's SPIFFE ID under a shared CA) | Holds: in the binary with `[cluster] multi_node = true` since M8-04, and in the library |
+| 6 | Internal traffic uses mutual TLS with node identities from the operator's PKI | `skys3-net/src/pki.rs:216`, `:237`, `:277` | `skys3-net/tests/transport.rs` `a_client_without_a_certificate_is_refused`, `a_client_from_another_ca_is_refused`; in the binary, `skys3/tests/cluster.rs` `the_transport_refuses_strangers_and_caps_its_handshakes` and the e2e scenario `cluster` (another CA, another cluster's SPIFFE ID under a shared CA) | Holds: in the binary on every node of a cluster (with `[cluster] multi_node = true` from M8-04, by default since M8-09), and in the library |
 | 7 | TLS 1.3 only, `aws-lc-rs`, no session resumption, so every connection verifies a full chain | `pki.rs:216`–`250`: TLS 1.3 only, no session storage, no tickets, no early data (explicit since this PR) | `transport.rs` `a_node_issues_no_session_tickets` (new; fails with the ticket settings removed) | Holds (test added) |
 | 8 | Certificates, key, and CA read from `[transport]` files at startup; rotation needs a restart; no revocation lists | `pki.rs` `Credentials::load` (key buffer zeroed); `skys3/src/cluster/peering.rs`; `skys3/src/cluster/mod.rs` `credentials` | `transport.rs` `credentials_load_from_pem_files` | Holds |
 | 9 | Exactly one SPIFFE URI SAN, `spiffe://<cluster_id>/<role>/<name>`; trust domain is the cluster ID | `skys3-net/src/identity.rs:158` `from_uri_names` | `transport.rs` `identities_of_other_clusters_or_without_a_spiffe_id_are_refused`; fuzz `net_spiffe_id` | Holds |
@@ -260,7 +263,7 @@ fix. Each is written for an issue of its own.
 
 ### T3. The etcd control store accepts `http://` and has no certificate keys
 
-- **Severity:** medium (not reachable from the binary yet).
+- **Severity:** medium (not reachable from the binary at M7-08; every etcd store since M8-03).
 - **Path:** control store, etcd backend.
 - **Scenario:** once the binary runs etcd (plan M2), an operator lists
   `http://etcd-1:2379` because no configuration key loads a client
@@ -272,6 +275,8 @@ fix. Each is written for an issue of its own.
 - **Fixed in M8-03 (#104)** as proposed: configuration loading refuses
   `http://` etcd endpoints off loopback; without `etcd_tls_ca_file`,
   `https://` endpoints are verified against the system's roots.
+- **Closed in M8-09:** in force on every etcd store, which every node of a
+  cluster uses with no flag (section 10).
 
 ### T4. Control-store register values have no size bound on the S3 and file backends
 
@@ -329,6 +334,9 @@ fix. Each is written for an issue of its own.
   HTTP API instead, where the primary starts the handoff or the
   coordinator sends it, so the API adds no sender the check would have to
   admit.
+- **Closed in M8-09:** in force on every node of a cluster, each of which
+  may be elected, so some node always holds the lease the check reads
+  (section 10).
 
 ### T7. Pre-authentication handshakes are not capped
 
@@ -351,6 +359,8 @@ fix. Each is written for an issue of its own.
   The e2e scenario `cluster` floods a node whose cap is 4 with 1,000
   connections: the gauge never passes 4 and the node's resident memory
   grows by less than 32 MiB.
+- **Closed in M8-09:** in force on every listener, the transport's on
+  every node of a cluster (section 10).
 
 ### T8. SkyS3 does not check the control bucket's versioning
 
@@ -422,3 +432,80 @@ fix. Each is written for an issue of its own.
 - **Proposed fix:** `skys3_s3_requests_total{operation, code}` and an
   authentication-failure counter by error code, added to the metrics
   reference with an alert on a high `403` rate.
+
+## 10. Re-review at M8-09: the cluster by default
+
+M8-09 removed the flags that gated the cluster (`[cluster] multi_node`,
+`[cluster] coordinator`, `[ec] enabled`): every node over an etcd or S3
+control store is a node of the cluster, may be elected coordinator, and
+runs erasure coding, and a file that still sets a flag does not load
+(design §12, *Removed gates*). The rows this review first marked *Not
+applicable yet* were re-read against the binary at the M8-09 head. None
+of them depends on a flag any more, and none could be left off: the only
+way out of the cluster paths is the file store, where the node binds no
+transport.
+
+| Row (M7-08 verdict) | In the binary since | Re-review | Evidence |
+|---|---|---|---|
+| Node to node: replication, leases, backfill | M8-05b, by default since M8-09 | Holds. The transport verifies both chains, the SPIFFE ID, and each frame's class whatever the configuration; nothing in `skys3/src/cluster/` skips a check for a node that may or may not coordinate | `skys3/tests/cluster.rs` `three_nodes_replicate_route_take_over_and_readmit`; e2e scenario `replication` |
+| Gateway routing wire | M8-05b, by default since M8-09 | Holds | As above; e2e scenarios `replication`, `coordinator`, `erasure-coding` (reads through every node) |
+| Coordinator and admin messages | M8-04 and M8-06, by default since M8-09 | Holds. `hints::endpoint` builds `CoordinatorOrAdmin` on every node of a cluster, with no flag around it; before M8-09 a cluster without `coordinator = true` ran T6's check too, but had no coordinator to send a `Handoff` | `skys3/tests/coordinator.rs` `a_coordinator_is_elected_hands_off_and_is_succeeded` (a node that does not hold the lease is refused, `does not hold the coordinator lease`; an `admin` tool is admitted); `skys3/tests/cluster.rs` `three_nodes_register_heartbeat_and_take_pushes` (the elected holder answers heartbeats as coordinator, the others do not); e2e scenarios `cluster` and `coordinator` |
+| Fragment reads, holds, releases, transfers, orphan checks | M8-07a, by default since M8-09 | Holds. Every node of a cluster serves them, so the *closes them all* branch of a node without the flag is gone, and with it the `503` a node without it answered for coded objects | `skys3/tests/coding.rs` `objects_are_coded_read_degraded_released_and_orphans_reclaimed` (an `admin` certificate's write fails); e2e scenario `erasure-coding` |
+| Control store, S3 | M8-03 | Holds | `tests/validation.rs` `s3_backend_rules`; `skys3/src/control/backend.rs` `plain_http_off_loopback_is_never_connected`; e2e S3 leg |
+| Control store, etcd | M8-03 | Holds | `tests/validation.rs` `etcd_backend_rules`, `etcd_tls_rules`; `skys3/tests/control_stores.rs` `a_node_runs_on_etcd_over_mutual_tls`; e2e etcd leg (every node over mutual TLS) |
+| Claim 6: internal traffic uses mutual TLS | M8-04, by default since M8-09 | Holds | `skys3/tests/cluster.rs` `the_transport_refuses_strangers_and_caps_its_handshakes`; e2e scenario `cluster` (another CA, another cluster's SPIFFE ID) |
+| Claim 13: shard-level roles against the authenticated node ID | M8-05b and M8-06 | Holds | As for the first and third rows |
+
+A new check came with the removal: a node over an etcd or S3 store now
+needs the `[transport]` certificates and a reachable address at
+configuration loading (`skys3-config` `TransportConfig::check_cluster_node`;
+`tests/validation.rs`
+`a_node_over_a_shared_store_is_a_node_of_a_cluster_with_certificates_and_an_address`),
+where before M8-09 such a node without `multi_node` ran as a single node
+without them. A removed flag is refused whatever its value
+(`the_removed_gates_are_refused_with_their_reason`; e2e scenario
+`cluster`), so no old configuration silently changes what a node runs.
+
+**T3, T6, and T7 are closed.** Each fix was made by an earlier task and is
+now in force in every configuration that reaches its path, with no flag
+that could turn it off:
+
+- **T3 (#104).** Configuration loading refuses an `http://` etcd endpoint
+  off loopback, and loads `etcd_tls_ca_file`, `etcd_tls_cert_file`, and
+  `etcd_tls_key_file`; `backend::connect` checks again
+  (`ControlStoreConfig::check_transport`). Shown by `etcd_backend_rules`,
+  `etcd_tls_rules`, `plain_http_off_loopback_is_never_connected`, and
+  `a_node_runs_on_etcd_over_mutual_tls`, and by the e2e etcd leg, whose
+  every node runs over mutual TLS.
+- **T6 (#107).** A `Handoff` over the transport is obeyed only from the
+  node `coordinator.lease` names or an `admin` certificate, on every node
+  of a cluster. Shown in the binary by
+  `a_coordinator_is_elected_hands_off_and_is_succeeded`, and in the
+  library by `only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff`
+  and `the_lease_holder_and_admin_certificates_may_ask_and_no_other_node`.
+- **T7 (#108).** Every TLS listener runs at most its cap of handshakes:
+  the transport on every node of a cluster, the gateway with HTTPS, the
+  peer endpoint with `[peering.peers]`. Shown by
+  `the_transport_refuses_strangers_and_caps_its_handshakes`,
+  `connections_beyond_the_cap_wait_for_a_handshake_to_end`, the peering
+  tests, and the e2e scenario `cluster`, whose flood of 1,000 connections
+  against a cap of 4 kept the gauge at 4 or below and the node's resident
+  memory within 1 MiB of its start in the M8-09 run.
+
+**The other findings (#102 to #113).**
+
+| Finding | Issue | State at M8-09 | Evidence |
+|---|---|---|---|
+| T1, the admin listener serves plain HTTP | #102 | Open: no `[admin]` TLS keys exist | `skys3-config/src/admin.rs` |
+| T2, targets and the peer fallback accept `http://` | #103 | Open for targets, origins, and the peer fallback; the control-store part fixed in M8-03 | `skys3-config` refuses only control endpoints (`ControlStoreConfig::check_transport`) |
+| T4, register values unbounded | #105 | Fixed in M8-03 | conformance `values_are_bounded`, `registers_over_the_bound_are_neither_written_nor_read` |
+| T5, unranged remote reads buffered whole | #106 | Open: snapshot restore asks for the whole object (`skys3-flush/src/snapshot/restore.rs` `GetObject::new(key)`) | none |
+| T8, control-bucket versioning unchecked | #109 | Fixed in M8-03 | `bucket_versioning_is_read`; `skys3_control_store_versioning` |
+| K1, the file store not reopened after a failed write | #110 | Fixed in M8-03 | `tests/control_stores.rs` `a_failed_file_store_is_opened_again` |
+| K2, bucket changes answer `500` when the store fails | #111 | Open: `ControlError::Io` still maps to `500 InternalError` | `skys3-gateway/src/buckets.rs` `control_error`, its test `errors_map_to_s3_codes` |
+| K3, rollback detection by generation alone | #112 | Open: only a lower generation is refused | `skys3/src/control/mod.rs` `ControlCopy::fetch_since` |
+| K4, no gateway request metrics | #113 | Open: the gateway registers cache and peer-refusal metrics only | `skys3-gateway/src/hot_cache.rs`, `peer_s3.rs` |
+
+None of the open findings is made worse by the removal: each is on a path
+that a single node ran before M8-09 too (the admin listener, targets,
+snapshots, bucket operations, the control copy, the gateway).

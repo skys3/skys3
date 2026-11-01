@@ -96,21 +96,23 @@ is an operator command yet.
 **The log.** The node logs to standard error, at the level `[logging]
 filter` sets. The runbooks quote the messages to search for.
 
-**What the node binary runs today.** A node without `[cluster] multi_node`
-serves its buckets alone, over a control store of its own: the file store,
-etcd, or an S3 bucket (`[control_store] backend`), and refuses to start on
-a store that registers another node (design section 6.2). Nodes with
-`multi_node` share one store, register, and replicate their buckets'
-shards across each other, failing over a lost primary on their own (since
-M8-05b). Nodes with `[cluster] coordinator = true` also elect a
+**What the node binary runs.** A node over the file control store
+(`[control_store] backend = "file"`) is a single node: it serves its
+buckets alone, and the store refuses a second node (design section 6.2).
+Nodes over one etcd or S3 store are the nodes of a cluster, one or many:
+they register, and replicate their buckets' shards across each other,
+failing over a lost primary on their own (since M8-05b). They elect a
 coordinator, which replaces lost members, re-admits returning nodes,
-rebalances, and hands primaries off (since M8-06); the flag is off by
-default, and without it no node coordinates. Nodes with `[ec] enabled =
-true` erasure-code the large objects of `local` buckets, read them from
-their fragments, and release and reclaim fragments (since M8-07a), and
-rebuild lost fragments and move fragments off drained nodes (since
-M8-07b); the flag is off by default. The peer transport (design section
-7.8) runs in the binary on a node with `[peering.peers]` tables.
+rebalances, and hands primaries off (since M8-06). They erasure-code the
+large objects of `local` buckets once `[ec] min_eligible_nodes` nodes
+are eligible (5 by default), read them from their fragments, and release
+and reclaim fragments (since M8-07a), and rebuild lost fragments and move
+fragments off drained nodes (since M8-07b). The flags that gated these,
+`[cluster] multi_node`, `[cluster] coordinator`, and `[ec] enabled`, were
+removed in M8-09: a configuration that still sets one does not start, and
+its log names the key with `was removed:` and what replaces it. Delete the
+line. The peer transport (design section 7.8) runs in the binary on a
+node with `[peering.peers]` tables.
 
 ## 2. Index
 
@@ -659,11 +661,11 @@ addresses succeeds from the same node.
 
 Each shard has `replicas` members; every member acknowledges every commit
 (design section 5). Failover and replacement are automatic. The node binary
-runs replication with `[cluster] multi_node = true` since M8-05b, and
-exports its metrics. It runs the coordinator since M8-06 on the nodes with
-`[cluster] coordinator = true`; the steps that rely on the coordinator
+runs replication on every node of a cluster since M8-05b, and exports
+its metrics. It runs the coordinator since M8-06, which every node of a
+cluster may be elected; the steps that rely on the coordinator
 (replacement, `placement`, the coordinator's metrics, handoffs, and
-drains) need at least one such node. `GET /v1/cluster` on any node shows
+drains) need it to hold the lease. `GET /v1/cluster` on any node shows
 the lease holder, the nodes with their marks and what each holds, and, on
 the coordinator, each node's state and the `placement` report.
 
@@ -706,9 +708,8 @@ acknowledgement set, and serves reads.
 learner, the learner backfills (under-replicated data first), and the
 primary promotes it. If the cluster has no eligible node, add one
 ([Provisioning](#provisioning)) or bring the lost node back: a returning
-node rejoins as a learner. Without a node configured with `[cluster]
-coordinator = true`, nothing adds the learner: turn the flag on for at
-least one node and restart it ([Coordinator](#coordinator)).
+node rejoins as a learner. Without a coordinator, nothing adds the
+learner ([Coordinator](#coordinator)).
 
 **Verification.** `skys3_under_replicated_bytes` and
 `skys3_oldest_under_replicated_age_seconds` return to 0 on every node.
@@ -785,18 +786,17 @@ release the lease: another node takes it once the lease expires, about
 
 **Diagnosis.** `GET /v1/cluster` on any node: `coordinator.holder` names
 the node the lease names, `this_node` whether the answering node
-coordinates, and `candidate` whether it may (`[cluster] coordinator`).
+coordinates, and `candidate`, true on every node since M8-09: every
+node of the cluster may be elected.
 0 for longer than `coordinator_lease_seconds` means no node takes the
-lease: check that some node is a `candidate` and runs, and that the
-control store answers (every node's
+lease: check that the nodes run, and that the control store answers (every node's
 `skys3_control_store_last_success_timestamp_seconds`). More than 1 for long
 means a node believes it holds a lease it lost: its clock or process was
 paused; find it by the series of `skys3_coordinator` by `instance`, and read
 its log.
 
-**Remediation.** Restore the control store. If no candidate runs, start
-one, or set `[cluster] coordinator = true` on another node and restart
-it. Restart a node that keeps reporting itself coordinator after another
+**Remediation.** Restore the control store. If no node runs, start
+one. Restart a node that keeps reporting itself coordinator after another
 has taken over.
 
 **Verification.** `sum(skys3_coordinator)` is 1, and `GET /v1/cluster` on
@@ -913,7 +913,7 @@ held every committed one.
 Retiring one: its shards are re-homed before it is forgotten.
 
 **Procedure.** To add a node, give it a configuration with the cluster's
-`cluster_id` and control store, `[cluster] multi_node = true`, its labels
+`cluster_id` and control store, its labels
 (`[node] zone` and `rack`), and a node certificate from the cluster's PKI
 that names its `node_id` (`[transport]`, with `advertise` if `listen` is a
 wildcard address), and start it. It registers itself; every membership
@@ -922,10 +922,9 @@ decision after that is automatic (design section 6.7). `GET /v1/health`
 shards rebalancing moves to it. To retire a node, drain it first
 ([Draining a node](#draining-a-node)), then stop it once it holds
 nothing; a node stopped without a drain is marked `departing` after
-`node_forget_after_hours`, its shards re-homed, and forgotten. Rebalancing
-needs a coordinator: without a node configured with `[cluster]
-coordinator = true`, an added node receives only the shards of buckets
-created after it registers.
+`node_forget_after_hours`, its shards re-homed, and forgotten. Adding
+nodes may also turn erasure coding on, once `[ec] min_eligible_nodes`
+nodes are eligible ([Turning erasure coding on](#turning-erasure-coding-on)).
 
 **Verification.** For an added node, its share of shards; for a retired
 one, `SkyS3UnderReplicated` resolves and no shard register names it.
@@ -982,7 +981,7 @@ removal_interval_seconds` across the cluster, and hands off the shards the
 node leads. Shards never have fewer than `replicas` members on the way,
 if the cluster has another eligible node in each needed domain. The
 node's gateway keeps serving throughout, forwarding each request to its
-shard's primary. With `[ec] enabled`, each shard primary also moves the
+shard's primary. Each shard primary also moves the
 node's fragments to other eligible nodes, one read and one write a
 fragment, up to 16 a shard per repair pass (every tenth of
 `fragment_repair_after_seconds`, at most 30 seconds), paced by
@@ -999,7 +998,7 @@ whole and readable throughout.
    announced the mark; `404` means the node is not registered. The mark
    is kept in the node's registration, also across its restarts.
 3. Wait until `GET /v1/cluster` shows the node with `primaries`,
-   `members`, and `learners` all 0, and, with `[ec] enabled`, until the
+   `members`, and `learners` all 0, and until the
    drained node's own `GET /v1/cluster` shows `fragments.unreleased` 0:
    no layout names a fragment it holds (`fragments.held` may stay above 0
    for `fragment_release_delay_seconds` while released fragments wait).
@@ -1053,10 +1052,15 @@ names it.
 
 ### Moving a single node into a cluster
 
-**Symptoms.** A node started with `[cluster] multi_node = true` on the data
-directory of a single node does not start, and logs `the node cannot
+**Symptoms.** A node started over an etcd or S3 control store on the
+data directory of a single node does not start, and logs `the node cannot
 start` with `holds the shards of N bucket(s) (...) that it served as a
-single node`; the reverse names `one node of a cluster`.
+single node; a node over an etcd or S3 control store serves as one of a
+cluster's nodes and cannot take them over`; the reverse, a cluster node's
+directory over the file store, names `one of a cluster's nodes`. Before
+M8-09 a single node could run over etcd or S3 without `[cluster]
+multi_node`; such a node, once its configuration has a `[transport]`
+table, now stops this way: move its buckets into a cluster as below.
 
 **Impact.** None until the node starts: its data directory is untouched.
 A single node serves each shard alone and writes no shard registers, so a
@@ -1066,7 +1070,7 @@ in; a directory that holds none takes the configured mode.
 
 **Procedure.** Move the buckets, not the directory:
 
-1. Start the cluster's nodes, each with `multi_node = true`, a new data
+1. Start the cluster's nodes, each over the cluster's etcd or S3 store with a new data
    directory, and a node ID that no other data directory registered (a
    single node never registers, so its own ID is free unless a cluster
    node used it; otherwise follow [Node ID in use](#node-id-in-use)), and
@@ -1134,7 +1138,7 @@ its copies of every shard it held, and on a node alone, every dirty write.
 
 ### Node ID in use
 
-**Symptoms.** A node with `[cluster] multi_node = true` does not start, and
+**Symptoms.** A node of a cluster does not start, and
 logs `the node cannot start` with `nodes/<node-id>.json registers node
 <node-id> for another data directory (instance ...), not this one`. Or a
 running node stops, and logs `the node stopped with an error` with
@@ -1338,7 +1342,7 @@ time: each restart would then rebuild every fragment the node holds.
 
 ### Fragment holder lost
 
-**Symptoms.** `SkyS3NodeDown` for a node with `[ec] enabled` whose
+**Symptoms.** `SkyS3NodeDown` for a node of a cluster whose
 `skys3_fragment_stored_bytes` was above 0. The gateways of the other nodes
 count parity reads in `skys3_fragment_reads_total{fragment="parity"}`, and
 failed fragment reads in `{outcome="failed"}`: their reads of coded objects
@@ -1389,14 +1393,17 @@ once the node is back or its fragments are rebuilt,
 and not yet repaired: with `parity_fragments = 1`, any stripe that had
 fragments on both cannot be read. Do not wipe the data directory of a
 node coming back before `skys3_unrepaired_fragments` is 0 on every node:
-until its fragments are rebuilt, its stores hold their only copy. Do not
-turn `[ec] enabled` off to work around a loss: a node without it reads no
-fragments ([Turning erasure coding on](#turning-erasure-coding-on)).
+until its fragments are rebuilt, its stores hold their only copy.
 
 ### Turning erasure coding on
 
 **Symptoms.** None: turning erasure coding on is planned work, for a
-cluster whose `local` buckets hold large objects.
+cluster whose `local` buckets hold large objects. Every node of a cluster
+runs erasure coding (since M8-09 no flag gates it), and the cluster's size
+decides when objects are coded: a shard primary codes nothing while fewer
+than `[ec] min_eligible_nodes` nodes are eligible, 5 by default. A cluster
+that grows to that many nodes starts coding on its own; a smaller one
+keeps every object replicated until the operator lowers the threshold.
 
 **Impact.** The shard primaries of `local` buckets code every object of at
 least `ec_min_object_bytes` once it is `ec_after_seconds` old: they read
@@ -1410,19 +1417,22 @@ holder's fragments are rebuilt from `k` fragment reads each
 
 **Procedure.**
 
-1. Check that the cluster has at least `min_eligible_nodes` eligible
-   nodes: registered, not departing or draining, offering capacity, and
-   carrying the labels `[cluster] failure_domain` needs (`GET /v1/cluster`).
-   With fewer, nothing is coded.
-2. Set `[ec] enabled = true`, with the same `[ec]` keys, in every node's
-   configuration; `skys3 --config <file> --check-config` refuses it
-   without `[cluster] multi_node = true`. Each node keeps its fragments in
+1. Count the eligible nodes: registered, not departing or draining,
+   offering capacity, and carrying the labels `[cluster] failure_domain`
+   needs (`GET /v1/cluster`). With at least `min_eligible_nodes`, coding
+   is already on: go to step 4.
+2. To code in a smaller cluster, lower `[ec] min_eligible_nodes` to at
+   most the eligible nodes, and above `parity_fragments` (`skys3 --config
+   <file> --check-config` refuses less), with the same `[ec]` keys in every
+   node's configuration. The narrowest stripe then has
+   `min_eligible_nodes - parity_fragments` data fragments, so a lower
+   threshold codes with more overhead. Each node keeps its fragments in
    one store per `[node] disks` directory, beside its log segments.
 3. Restart the nodes one at a time, each once the one before reports
-   `ready` in `GET /v1/health`. Until every node runs with the flag, the
-   others close its fragment connections: an encoder places a stripe
-   again without a node that refused its write, and a node that has not
-   restarted yet answers `503` for objects already coded.
+   `ready` in `GET /v1/health`, the shard primaries last. A primary codes
+   once it runs with the lower threshold; every node, restarted or not,
+   already stores, serves, and reads fragments, so coded objects read
+   through every node throughout.
 4. Watch `skys3_encoded_objects_total` rise on the primaries and
    `skys3_fragment_stored_bytes` on the holders.
 
@@ -1433,14 +1443,14 @@ the members' log segments shrink as compaction drops the replicas, within
 a GET of a coded object returns it through every node, and
 `skys3_fragment_reads_total{fragment="parity"}` stays at 0 while every
 node is up. A steady rise of `skys3_encodings_abandoned_total` means
-nodes refuse or do not answer fragment writes: a node without the flag,
-or one that is down while still registered.
+nodes refuse or do not answer fragment writes: one that is down while
+still registered, or whose disks are full.
 
-**Do not.** Do not set the flag on some nodes only, and do not turn it
-off once objects are coded: a node without it reads no fragments, and
-answers `503` for every coded object. Do not turn it on in a cluster with
-only `min_eligible_nodes` eligible nodes if a lost node cannot be replaced
-quickly: with no spare node, repair waits for one (design section 8.3).
+**Do not.** Do not give the nodes different `[ec]` keys beyond the rolling
+restart: each primary codes by its own. Do not lower `min_eligible_nodes`
+to the eligible node count if a lost node cannot be replaced quickly: with
+no spare node, repair waits for one (design section 8.3). Raising it again
+stops new coding but does not decode what is coded.
 
 ## 6. Control store
 
@@ -1684,18 +1694,18 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Held conflicts](#held-conflicts) | `runbooks::drill_out_of_band_writes` (in process); `conflicts::conflicts_are_listed_and_resolved_under_each_policy`; `simulation::conflicts::hold_keeps_conflicts_until_an_operator_resolves_them` | `skys3_conflicted_keys` and `skys3_flush_conflicts_total` count the held keys; the conflicts list shows each with `remote_identity` null for a writer outside SkyS3; `overwrite` puts the local version at the remote and counts it; `hold` after the other writer's object is removed flushes; a key not held answers `404`. | Nothing. |
 | [Discarded conflicts](#discarded-conflicts) | `runbooks::drill_out_of_band_writes` (in process) | A `discard_local` resolution adopts the remote's version and counts it in `skys3_flush_conflicts_discarded_total`, the series the alert reads. | The log lines the runbook quotes were not checked: the in-process drill has no log. |
 | [Reconciliation differences](#reconciliation-differences) | `runbooks::drill_reconciliation_report` (in process); `reconcile::keys_written_and_flushed_during_scans_are_never_reported` | Another writer's new, replaced, and deleted objects appear in the report as `remote_only`, `etag_mismatch`, and `index_only`, with the writer `outside`, and in `skys3_reconcile_differences` by kind; once SkyS3's versions are written back and the other object removed, the next scan reports nothing. Scans during a workload of writes, deletes, and flushes report nothing. | The log lines were not checked: the in-process drill has no log. No command re-imports a `remote_only` key or re-flushes a clean one (section 8). |
-| [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary. |
-| [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/cluster/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
+| [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. On the binary, the end-to-end scenario peering (tests/e2e/scenarios/60-peering.sh) flushes between two clusters over QUIC, and the nightly suite's bucket `peered` replicates from a five-node cluster to a three-node one while every fault of its schedule strikes the source, with no acknowledged write lost. | The nightly suite does not cut the peer link itself: its faults strike the source cluster and its etcd. |
+| [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Drilled on the binary by the end-to-end scenario peering (tests/e2e/scenarios/60-peering.sh): with UDP to the destination's QUIC port dropped, the flushers fall back to S3 REST (`skys3_flush_transport{transport="s3"}` 1) and keep flushing, and are back on QUIC within 60 s once UDP passes; every object reaches the peer intact. The simulation shortens the quarantine and the re-probe backoff, and neither evaluates the alert's rule; forged descriptors are refused in the simulation and in process only. |
 | [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over`; on the binary, `cluster::three_nodes_replicate_route_take_over_and_readmit` and the end-to-end scenario replication (tests/e2e/scenarios/95-replication.sh) | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. On the binary, the coordinator adds a lost member back as a learner while it is down, and its primary backfills and promotes it once it returns (`coordinator::a_lost_member_is_replaced_and_a_deleted_bucket_dropped_everywhere`). | The alert's rule was not evaluated. Until M8-06 the drill on the binary wrote the learner into the register by hand. |
-| [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. | Not drilled on the binary, as above. |
-| [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. On the binary, `GET /v1/cluster` and `GET /v1/health` of the coordinator report `placement`. | A lost rack was not drilled on the binary. |
-| [Coordinator](#coordinator) | `simulation::coordinator::coordinator_failover_delays_only_placement_work`; `simulation::heal::a_coordinator_lost_in_the_middle_of_a_change_is_succeeded`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` and the end-to-end scenario coordinator (tests/e2e/scenarios/96-coordinator.sh) | Another node takes the lease; only placement work waits; a change cut short is completed by the successor. On the binary, after `kill -9` of the coordinator, reads and writes go on, another node is elected, and placement resumes under it. | A cleanly stopped coordinator does not release the lease, so its successor waits a whole lease too (section 8). |
+| [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. On the binary, the nightly suite's `partition` fault (iptables, of a shard's primary from the other nodes or from everything) shows the other nodes naming another primary and no acknowledged write lost ([The nightly kill, partition, and peering suite](#the-nightly-kill-partition-and-peering-suite)). | Nothing. |
+| [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. On the binary, `GET /v1/cluster` and `GET /v1/health` of the coordinator report `placement`. | A lost rack is drilled on the binary only by the nightly suite's `rack-loss` fault (a rack killed or cut off, and healed within 300 s); the `placement` report during it is not checked there. |
+| [Coordinator](#coordinator) | `simulation::coordinator::coordinator_failover_delays_only_placement_work`; `simulation::heal::a_coordinator_lost_in_the_middle_of_a_change_is_succeeded`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` and the end-to-end scenario coordinator (tests/e2e/scenarios/96-coordinator.sh) | Another node takes the lease; only placement work waits; a change cut short is completed by the successor. On the binary, after `kill -9` of the coordinator, reads and writes go on, another node is elected, and placement resumes under it; the nightly suite kills the coordinator just after it was asked for a handoff (`coordinator-handoff`), and while it moves shards onto a joining node. Since M8-09 every node of a cluster may be elected, so no step needs a node configured to coordinate. | A cleanly stopped coordinator does not release the lease, so its successor waits a whole lease too (section 8). |
 | [Shard lost](#shard-lost) | `simulation::drills::restore_drills_match_the_history`; `simulation::snapshots::the_lost_key_report_matches_the_history_with_backups` | The lost-key report and the restore drill match the history: the keys only the members held, the window after the snapshot, and coded objects re-indexed from their fragments. | The report and the drill have no command, so an operator cannot run them yet, and nothing gives the shard members again; the runbook first said the shard would serve again, and that a listing of its snapshots gave the start of the window (section 8). |
 | [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one`; on the binary, the end-to-end scenario coordinator | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. On the binary, a fourth node joins and rebalancing gives it its share of a bucket's shards. | Until M8-06 no command retired a node sooner than `node_forget_after_hours`; a drain does now. |
 | [Handing off a primary](#handing-off-a-primary) | `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded`; `skys3_coord::handoff::tests::only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff`; on the binary, the end-to-end scenario coordinator | A handoff asked of the coordinator, which chooses the member, or of the primary, told it, moves the primary with no failed request beyond SDK retries; another node answers `409` naming both; the old primary is re-admitted. Over the transport, only the lease holder and an `admin` certificate are obeyed. | Nothing. |
 | [Draining a node](#draining-a-node) | `skys3_coord::drain::tests::a_drain_is_marked_announced_kept_by_the_node_and_cleared_by_an_operator`; `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded`; `coding::a_drained_holder_is_emptied_and_a_lost_one_repaired`; on the binary, the end-to-end scenarios coordinator and erasure-coding | The mark is written by a CAS, announced, kept when the node registers again, and cleared by `DELETE`. On the binary, the drained coordinator is emptied of its members and primaries while reads and writes go on, then killed. A drained fragment holder's fragment moves to the node outside its stripe: the drained node reports `fragments.unreleased` 0 about 13 s after the drain, most of it the primary's release interval, and the primary counts the move. | Step 3 named only shards: nothing reported a drained node's fragments (M8-07b added `fragments`). |
 | [Replacing a node](#replacing-a-node) | `coordinator::a_lost_member_is_replaced_and_a_deleted_bucket_dropped_everywhere`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one`; on the binary, the end-to-end scenarios replication and coordinator | A lost member is replaced by a learner, backfilled, and promoted; a new node receives shards. | A node lost for good and then forgotten was not drilled on the binary: `node_forget_after_hours` is an hour at least. |
-| [Moving a single node into a cluster](#moving-a-single-node-into-a-cluster) | `cluster::a_single_nodes_data_directory_does_not_join_a_cluster` | A single node's directory that holds a bucket is refused with `multi_node`, and a cluster node's directory without it; the log names the buckets and the mode. | The moves of steps 2 and 3 were not drilled. |
+| [Moving a single node into a cluster](#moving-a-single-node-into-a-cluster) | `cluster::a_single_nodes_data_directory_does_not_join_a_cluster`; on the binary, the end-to-end scenario cluster (tests/e2e/scenarios/90-cluster.sh) | A single node's directory that holds a bucket is refused over an etcd or S3 store, and a cluster node's directory over the file store; the log names the buckets, the mode, and this runbook. On the binary, the refused directory is left as it was, and step 3's two `aws s3 sync`s move a local bucket's objects into a three-node cluster, where every node lists and reads them. | Step 2's move of a `write_back` bucket through its target was not drilled. Before M8-09 the symptom named `multi_node`; a single node that ran over etcd or S3 meets it on its first start with M8-09. |
 | [Node down](#node-down) | `runbooks::drill_node_down`; `simulation::takeover::a_crashed_primary_fails_over_within_ten_seconds` | After `SIGKILL`, scrapes and `/healthz` fail; a restart recovers every acknowledged write and reports `ready` with every disk in service. A crashed primary's shards fail over within 10 seconds, also on the binary (`cluster::three_nodes_replicate_route_take_over_and_readmit`, the end-to-end scenario `replication`). | Nothing. |
 | [Node ID in use](#node-id-in-use) | `cluster::three_nodes_register_heartbeat_and_take_pushes`; `cluster::a_claim_found_after_starting_from_the_copy_stops_the_node` | A second data directory started with a registered node's ID does not start, a node that started from its copy stops once it finds the claim, each logs the reason, and leaves the registration alone; so does the binary over etcd in the end-to-end scenario `cluster` (`tests/e2e/scenarios/90-cluster.sh`). | The deletion of the registration was not drilled: no command deletes a register, so the operator uses the store's own tools. |
 | [Cluster power loss](#cluster-power-loss) | `runbooks::drill_node_down`; `simulation::restart::a_whole_cluster_restart_while_the_control_store_is_unreachable` | A node that restarts while its control store cannot be opened serves from its copy (`live` false), then opens the store by itself and logs it. In a cluster, unchanged shards serve again and changed ones stay fenced. | Nothing. |
@@ -1704,9 +1714,9 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Clock drift](#clock-drift) | `simulation::leases::drift_beyond_rho_risks_stale_reads_but_writes_stay_safe` | Drift beyond `ρ` risks stale reads, and writes stay safe, as the runbook's impact says. | The diagnosis and remediation are the host's time service's; nothing in SkyS3 to drill. |
 | [Fragment repair](#fragment-repair) | `simulation::repair::a_lost_holder_is_repaired_while_reads_go_on`; `simulation::fragment_moves::a_drained_node_is_emptied_while_reads_and_losses_go_on`; `coding::a_drained_holder_is_emptied_and_a_lost_one_repaired`; on the binary, the end-to-end scenario erasure-coding | A lost holder's fragments are rebuilt elsewhere while degraded reads go on. On the binary, with `fragment_repair_after_seconds = 10`, a holder killed for good was counted lost (`skys3_unrepaired_fragments` 1) after 11 s and its fragment rebuilt on the survivors after 13 s; the gauges then return to 0 and reads decode nothing. | `SkyS3FragmentsUnrepaired` is drilled only by its promtool case: no drill leaves a loss unrepaired for an hour. |
 | [Fragment holder lost](#fragment-holder-lost) | `coding::objects_are_coded_read_degraded_released_and_orphans_reclaimed`; `coding::a_drained_holder_is_emptied_and_a_lost_one_repaired`; on the binary, the end-to-end scenario erasure-coding (tests/e2e/scenarios/97-erasure-coding.sh) | With each holder of a 2+1 stripe that does not lead the shard stopped in turn (`kill -9` on the binary), GETs through another node return the same SHA-256, decoded with the parity fragment where the stopped node held a data fragment, and `skys3_fragment_reads_total{fragment="parity"}` rises. A holder lost for good has its fragment rebuilt on the survivors, which then read the object from data fragments alone. | Before M8-07b nothing rebuilt a lost holder's fragments. |
-| [Turning erasure coding on](#turning-erasure-coding-on) | `coding::objects_are_coded_read_degraded_released_and_orphans_reclaimed`; on the binary, the end-to-end scenario erasure-coding | On 4 nodes with `[ec] enabled`, a large object is coded within seconds: `skys3_encoded_objects_total` 1, three nodes with `skys3_fragment_stored_bytes`, the members' log segments emptied of its bytes, and healthy GETs through every node with no parity read; an `admin` certificate cannot write a fragment, and a stray node's fragment is reclaimed as an orphan. | The members first kept their replicas for an hour: compaction held a coded version's extents for `peer_staging_ttl_seconds` like extents no entry names, fixed in M8-07a. The rolling restart of step 3 was not drilled: the drills start every node with the flag. |
+| [Turning erasure coding on](#turning-erasure-coding-on) | `coding::objects_are_coded_read_degraded_released_and_orphans_reclaimed`; on the binary, the end-to-end scenario erasure-coding (tests/e2e/scenarios/97-erasure-coding.sh) | On the binary, 4 nodes under the default `min_eligible_nodes` of 5 code nothing; with 3 in every configuration, a rolling restart, each node once the one before is ready and the primary last, keeps the object readable throughout (about 20 s for the four), and the object is coded within 2 s of it: `skys3_encoded_objects_total` 1, three nodes with `skys3_fragment_stored_bytes`, the members' log segments emptied of its bytes, and healthy GETs through every node with no parity read; an `admin` certificate cannot write a fragment, and a stray node's fragment is reclaimed as an orphan. | The members first kept their replicas for an hour: compaction held a coded version's extents for `peer_staging_ttl_seconds` like extents no entry names, fixed in M8-07a. Step 3 was not drilled until M8-09, which removed the flag the drills started every node with. |
 | [Control store unreachable](#control-store-unreachable) | `runbooks::drill_control_store_outage`; `simulation::removal::without_the_control_store_writes_fail_until_it_returns` | With the store's volume gone under a running node, the first CreateBucket fails a write of the file store and answers `500`; the node then drops the store, `skys3_control_store_live` goes to 0, `skys3_control_store_last_success_timestamp_seconds` stops, the log says `the control store failed; serving the local copy`, the data path goes on, and CreateBucket answers `503`. When the volume returns, the node opens the store again without a restart, and CreateBucket succeeds. In a cluster, a member that fails while the store is down stalls its shards' writes until the store returns. | The first CreateBucket answers `500 InternalError`, not `503` (section 8). Until M8-03 the file store also stayed refused after its volume returned, until the node restarted. |
-| [Control store latency](#control-store-latency) | `simulation::workload::slow_and_lossy_control_store_with_partitions` | Client requests go on under control-store round trips of 100 ms and more. | The round trip is not measured (section 8). |
+| [Control store latency](#control-store-latency) | `simulation::workload::slow_and_lossy_control_store_with_partitions` | Client requests go on under control-store round trips of 100 ms and more. On the binary, the nightly suite's `netem` fault delays and drops the packets of etcd members, and the cluster heals within 300 s with no acknowledged write lost. | The round trip is not measured (section 8). The nightly suite needs the netem qdisc for delay; without it, it drops packets only. |
 | [Identity staleness](#identity-staleness) | `runbooks::drill_control_store_outage`; `sts::a_stale_identity_copy_stops_new_sessions_only` | `skys3_identity_synced_timestamp_seconds` stops during the outage and advances after a restart with the store answering; a stale copy refuses new sessions and keeps issued ones. | The drill cannot age a copy past `identity_max_staleness` (an hour at least) on the binary; the STS test does it on a simulated clock. |
 | [Control store loss](#control-store-loss) | `runbooks::drill_control_store_loss`; `simulation::rebuild::a_lost_control_store_is_rebuilt_and_membership_changes_resume` | A node without its registers serves from its copy and logs `the control store looks reset`; an export refuses a running node; the export, the dry run, and the rebuild write the store at the next generation, and buckets and objects are all there. In a cluster, membership changes resume on the rebuilt store. | Nothing. |
 | [etcd majority loss](#etcd-majority-loss) | None | Not drilled: CI's etcd job and the end-to-end suite run a single member, so a majority cannot be lost and recovered. The SkyS3 side is the [Control store unreachable](#control-store-unreachable) and [Control store loss](#control-store-loss) drills. | Section 8. |

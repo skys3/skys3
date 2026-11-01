@@ -101,7 +101,7 @@
 //!     [cluster]
 //!     cluster_id = "dev"
 //!     [control_store]
-//!     etcd_endpoints = ["https://etcd-1.example.internal:2379"]
+//!     backend = "file"
 //! "#
 //! .parse()?;
 //! let config = GatewayConfig::new(&config);

@@ -76,7 +76,8 @@
 //!   by itself once the target takes the writes again.
 //!
 //! **Cluster services** (plan M8-04). `health` has a `cluster` object:
-//! `multi_node`, as `[cluster] multi_node` says, and with it true,
+//! `multi_node`, whether the node is one of a cluster's nodes (its control
+//! store is etcd or S3), and with it true,
 //!
 //! - `transport`: `listen`, the bound address; `advertise`, the address
 //!   the node registered; and `handshakes_in_flight` and
@@ -104,13 +105,13 @@
 //! It is absent on other nodes, and `null` until the first placement round
 //! of the node's tenure.
 //!
-//! **Cluster** (§6.7, plan M8-06). With `[cluster] multi_node = true`:
+//! **Cluster** (§6.7, plan M8-06). On a node of a cluster:
 //!
 //! - `GET /v1/cluster` answers the `node_id`; the cluster's `generation`;
 //!   `coordinator`: `holder`, the node `coordinator.lease` names (`null`
 //!   without one), `lease_version`, the version the lease holds, which
-//!   each renewal changes, `this_node`, whether this node serves a tenure
-//!   now, and `candidate`, whether it may (`[cluster] coordinator`);
+//!   each renewal changes, and `this_node`, whether this node serves a
+//!   tenure now;
 //!   `nodes`, each registered node with its `node_id`, `address`, `zone`,
 //!   `rack`, `capacity_bytes`, `draining` and `departing` marks, the
 //!   shards whose registers name it as `primaries`, `members`, and
@@ -119,8 +120,8 @@
 //!   heard from it (its last heartbeat, or the coordinator's tenure or the
 //!   registration if later), `null` on other nodes; `shards`, the number
 //!   of shard registers; `placement`, as in `health`, `null` on other
-//!   nodes; and `fragments`, what this node's fragment stores hold, `null`
-//!   without `[ec] enabled`: `held`, the fragments, released ones
+//!   nodes; and `fragments`, what this node's fragment stores hold:
+//!   `held`, the fragments, released ones
 //!   included, and `unreleased`, those no shard primary has released
 //!   (plan M8-07b). A drained node holds no fragment a layout names once
 //!   `unreleased` is 0.
@@ -166,8 +167,8 @@
 //! handed the shard off, and `applied`, the position (`<epoch>.<seq>`) of
 //! the last record it applied, which the members of a shard reach alike
 //! once its writes stop (plan M8-08 checks that replicas converge so). A
-//! single node reports each shard of its own replica, as primary. With
-//! `[cluster] multi_node = true` the answer also
+//! single node reports each shard of its own replica, as primary. On a
+//! node of a cluster the answer also
 //! has `peers`, the transport address of each registered node, and
 //! `routing`, the gateway's counts since the node started: `forwarded`
 //! (calls sent to another node), `redirects` (redirect hints that updated
@@ -259,7 +260,7 @@ pub struct ControlState {
     pub synced_at: Option<Duration>,
 }
 
-/// What the cluster services of a node with `[cluster] multi_node = true`
+/// What the cluster services of a node of a cluster
 /// report, for `/v1/health`.
 #[derive(Debug, Clone)]
 pub struct ClusterView {
@@ -356,7 +357,7 @@ pub type ReportFuture<'a> = Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
 /// The future of a [`ClusterApi`] route: the answer's status and body.
 pub type ClusterFuture<'a> = Pin<Box<dyn Future<Output = (StatusCode, Value)> + Send + 'a>>;
 
-/// The cluster routes of a node with `[cluster] multi_node = true` (plan
+/// The cluster routes of a node of a cluster (plan
 /// M8-06; see the [module](self) docs).
 pub trait ClusterApi: Send + Sync + 'static {
     /// `GET /v1/cluster`.
@@ -436,8 +437,8 @@ impl<'a> ClusterRoute<'a> {
     }
 }
 
-/// What `GET /v1/shards` reports on a node with `[cluster] multi_node =
-/// true`, whose shards live on several nodes (plan M8-05b).
+/// What `GET /v1/shards` reports on a node of a cluster,
+/// whose shards live on several nodes (plan M8-05b).
 pub trait ShardsReport: Send + Sync + 'static {
     /// The answer for the shards of `buckets`.
     fn report<'a>(&'a self, buckets: &'a [BucketDocument]) -> ReportFuture<'a>;
@@ -533,13 +534,13 @@ pub struct NodeAdmin<D: Disk> {
     pub health: Health,
     /// The node's flushers.
     pub flush: Arc<dyn Flushers>,
-    /// The node's cluster services, with `[cluster] multi_node = true`.
+    /// The node's cluster services, on a node of a cluster.
     pub cluster: Option<ClusterView>,
-    /// The shards replicated across nodes, with `[cluster] multi_node =
-    /// true`; `None` for a single node, whose shards are in
+    /// The shards replicated across nodes, on a node of a cluster;
+    /// `None` for a single node, whose shards are in
     /// [`NodeAdmin::shards`].
     pub replicated: Option<Arc<dyn ShardsReport>>,
-    /// The cluster routes, with `[cluster] multi_node = true`.
+    /// The cluster routes, on a node of a cluster.
     pub operations: Option<Arc<dyn ClusterApi>>,
 }
 
@@ -781,7 +782,7 @@ impl<D: Disk> NodeAdmin<D> {
         let Some(operations) = &self.operations else {
             return error(
                 StatusCode::NOT_FOUND,
-                "this node is not one of several ([cluster] multi_node = false)",
+                "this node is a single node, over the file control store, not one of a cluster's nodes",
             );
         };
         let (status, body) = match route {

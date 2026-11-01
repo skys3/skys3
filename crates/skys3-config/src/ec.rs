@@ -13,17 +13,13 @@ use crate::storage::MIB;
 /// multiple of 64, must fit it in the narrowest geometry.
 pub const MAX_FRAGMENT_BYTES: u64 = 256 * MIB;
 
-/// `[ec]`.
+/// `[ec]`: the policy every node of a cluster codes with (§8). A single
+/// node, over the file control store, codes nothing; a cluster codes the
+/// objects of `local` buckets while at least `min_eligible_nodes` nodes are
+/// eligible.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EcConfig {
-    /// `enabled`: whether the node runs erasure coding (plan M8-07a): its
-    /// fragment stores, the fragment server on the transport, an encoder
-    /// for each shard of a `local` bucket it leads, coded reads in its
-    /// gateway, orphan reclamation, and repair and fragment moves on the
-    /// shards it leads (plan M8-07b). Needs `[cluster] multi_node`. A gate
-    /// that plan M8-09 removes.
-    pub enabled: bool,
     /// `parity_fragments`: `m`, the parity fragments per stripe (§8.3).
     pub parity_fragments: u32,
     /// `max_data_fragments`: the widest `k` the coordinator picks (§8.3).
@@ -48,7 +44,6 @@ pub struct EcConfig {
 impl Default for EcConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             parity_fragments: 2,
             max_data_fragments: 8,
             min_eligible_nodes: 5,

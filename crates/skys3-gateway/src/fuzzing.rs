@@ -566,7 +566,7 @@ fn decode_body(
 /// A gateway with bucket [`BUCKET`] over a fresh control store and
 /// `shards`, whose bucket IDs come from `seed`.
 async fn gateway(shards: MemoryShards, seed: u64) -> Gateway<TrustAll> {
-    let config: Config = "[cluster]\ncluster_id = \"fuzz\"\n[control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n[buckets.defaults]\nshards_per_bucket = 1"
+    let config: Config = "[cluster]\ncluster_id = \"fuzz\"\n[control_store]\nbackend = \"file\"\n[buckets.defaults]\nshards_per_bucket = 1"
         .parse()
         .expect("the configuration is valid");
     let config = GatewayConfig::new(&config);

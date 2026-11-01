@@ -442,7 +442,7 @@ fn origins_are_read_with_their_buckets_profiles() {
         let node = Node::open(25).await;
         let store = SimS3::new(25, SimS3Config::default());
         let config: skys3_config::Config = "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nmode = \"read_only\"\norigin_profile = \"reader\"\n"
             .parse()
             .unwrap();

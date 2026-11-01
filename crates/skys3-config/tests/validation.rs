@@ -11,7 +11,7 @@ const BASE: &str = r#"
 cluster_id = "skys3-prod-a"
 
 [control_store]
-etcd_endpoints = ["https://etcd-1.example.internal:2379"]
+backend = "file"
 "#;
 
 /// The base configuration plus `extra` sections.
@@ -150,11 +150,8 @@ fn shards_per_bucket_is_at_most_256() {
 
 #[test]
 fn cluster_id_must_fit_the_write_identity() {
-    let with_id = |id: &str| {
-        format!(
-            "[cluster]\ncluster_id = \"{id}\"\n[control_store]\netcd_endpoints = [\"http://localhost:2379\"]"
-        )
-    };
+    let with_id =
+        |id: &str| format!("[cluster]\ncluster_id = \"{id}\"\n[control_store]\nbackend = \"file\"");
     with_id(&"a".repeat(24)).parse::<Config>().unwrap();
     for bad in [
         "a".repeat(25),
@@ -206,7 +203,7 @@ fn every_violation_is_reported_at_once() {
         [cluster]
         cluster_id = "this-cluster-id-is-much-too-long"
         [control_store]
-        etcd_endpoints = ["https://etcd-1:2379"]
+        backend = "file"
         [replication]
         primary_grace_ms = 4000
         lease_renew_interval_ms = 5000
@@ -748,8 +745,16 @@ fn transport_certificate_files_are_set_together() {
 
 // [control_store]
 
+/// The `[transport]` of a node of a cluster, which an etcd or S3 control
+/// store requires.
+const TRANSPORT: &str = "[transport]\nlisten = \"10.0.0.5:7400\"\n\
+                         tls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
+                         tls_ca_file = \"/ca.crt\"";
+
+/// A configuration with the `[control_store]` lines `body`, and the
+/// transport of a node of a cluster.
 fn control_store(body: &str) -> String {
-    format!("[cluster]\ncluster_id = \"c1\"\n[control_store]\n{body}")
+    format!("[cluster]\ncluster_id = \"c1\"\n{TRANSPORT}\n[control_store]\n{body}")
 }
 
 #[track_caller]
@@ -1336,6 +1341,11 @@ fn an_invalid_cluster_id_does_not_hide_other_violations() {
         bucket = "ctl"
         coordinator_lease_seconds = 0
         config_poll_interval_seconds = 0
+        [transport]
+        listen = "10.0.0.5:7400"
+        tls_cert_file = "/n.crt"
+        tls_key_file = "/n.key"
+        tls_ca_file = "/ca.crt"
         [replication]
         lease_renew_interval_ms = 4000
         [buckets.archive]
@@ -1668,13 +1678,13 @@ tls_ca_file = "/etc/skys3/ca.crt"
     );
 }
 
-// [cluster] multi_node, the transport's address, labels, and handshake caps
-// (M8-04)
+// A node of a cluster, the removed gates, the transport's address, labels,
+// and handshake caps (M8-04, M8-09)
 
-/// A cluster with `multi_node = true` over etcd, plus `extra` sections.
-fn multi_node(extra: &str) -> String {
+/// A node over etcd, plus `extra` sections.
+fn cluster_node(extra: &str) -> String {
     format!(
-        "[cluster]\ncluster_id = \"c1\"\nmulti_node = true\n\
+        "[cluster]\ncluster_id = \"c1\"\n\
          [control_store]\netcd_endpoints = [\"https://etcd-1:2379\"]\n{extra}"
     )
 }
@@ -1692,31 +1702,32 @@ fn violated_keys(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn several_nodes_are_off_by_default() {
+fn a_node_over_the_file_store_is_a_single_node() {
     let config = load("").unwrap();
-    assert!(!config.cluster().multi_node);
+    assert!(!config.multi_node());
     // A single node needs neither certificates nor an address.
     assert_eq!(config.transport().advertised(), None);
-    // Nor a store that several nodes can share.
-    "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\""
-        .parse::<Config>()
+    // The minimal configuration of a single node.
+    let config: Config = "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\""
+        .parse()
         .unwrap();
+    assert!(!config.multi_node());
 }
 
 #[test]
-fn several_nodes_need_a_shared_store_certificates_and_an_address() {
-    let config: Config = multi_node(&format!(
+fn a_node_over_a_shared_store_is_a_node_of_a_cluster_with_certificates_and_an_address() {
+    let config: Config = cluster_node(&format!(
         "[transport]\nlisten = \"0.0.0.0:7400\"\nadvertise = \"node-1.example:7400\"\n{NODE_FILES}"
     ))
     .parse()
     .unwrap();
-    assert!(config.cluster().multi_node);
+    assert!(config.multi_node());
     assert_eq!(
         config.transport().advertised().unwrap().to_string(),
         "node-1.example:7400"
     );
     // A specific listen address is the advertised one.
-    let config: Config = multi_node(&format!(
+    let config: Config = cluster_node(&format!(
         "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
     ))
     .parse()
@@ -1725,10 +1736,19 @@ fn several_nodes_need_a_shared_store_certificates_and_an_address() {
         config.transport().advertised().unwrap().to_string(),
         "10.0.0.5:7400"
     );
+    // An S3 store is shared as well.
+    let config: Config = format!(
+        "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"s3\"\n\
+         endpoint = \"https://control.example\"\nbucket = \"control\"\n\
+         [transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
+    )
+    .parse()
+    .unwrap();
+    assert!(config.multi_node());
 
     // No certificates, and a wildcard listen address without advertise.
     assert_eq!(
-        violated_keys(&multi_node("")),
+        violated_keys(&cluster_node("")),
         [
             "transport.tls_cert_file",
             "transport.tls_key_file",
@@ -1736,75 +1756,93 @@ fn several_nodes_need_a_shared_store_certificates_and_an_address() {
             "transport.advertise"
         ]
     );
+    let violations = violations_of(&cluster_node(""));
+    assert!(
+        violations.to_string().contains("backend = \"file\""),
+        "a single node's way out is named: {violations}"
+    );
     // Some certificates: the usual rule names the missing ones.
     assert_eq!(
-        violated_keys(&multi_node(
+        violated_keys(&cluster_node(
             "[transport]\nlisten = \"10.0.0.5:7400\"\ntls_cert_file = \"/n.crt\""
         )),
         ["transport.tls_key_file", "transport.tls_ca_file"]
     );
-    // The file store serves one node.
-    let text = format!(
-        "[cluster]\ncluster_id = \"c1\"\nmulti_node = true\n[control_store]\nbackend = \"file\"\n\
-         [transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
-    );
-    assert_eq!(violated_keys(&text), ["control_store.backend"]);
-    let violations = violations_of(&text);
-    assert!(
-        violations.to_string().contains("serves one node"),
-        "{violations}"
-    );
     // An advertised address is host:port.
-    let error = parse_error(&multi_node("[transport]\nadvertise = \"no-port\""));
+    let error = parse_error(&cluster_node("[transport]\nadvertise = \"no-port\""));
     assert!(error.contains("advertise"), "{error}");
 }
 
+/// Plan M8-09 removed `[cluster] multi_node`, `[cluster] coordinator`, and
+/// `[ec] enabled`: a configuration that still sets one is refused with the
+/// reason, whatever the value and the store, and never loads as if the key
+/// were not there.
 #[test]
-fn only_a_node_of_several_may_be_elected_coordinator() {
-    let config = load("").unwrap();
-    assert!(!config.cluster().coordinator);
-    let config: Config = multi_node(&format!(
-        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
-    ))
-    .replace("multi_node = true", "multi_node = true\ncoordinator = true")
-    .parse()
-    .unwrap();
-    assert!(config.cluster().coordinator);
-    // Off by default with multi_node too: the node only follows.
-    let config: Config = multi_node(&format!(
-        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
-    ))
-    .parse()
-    .unwrap();
-    assert!(!config.cluster().coordinator);
-    let text =
-        "[cluster]\ncluster_id = \"c1\"\ncoordinator = true\n[control_store]\nbackend = \"file\"";
-    assert_eq!(violated_keys(text), ["cluster.coordinator"]);
-    let violations = violations_of(text);
-    assert!(
-        violations.to_string().contains("multi_node"),
-        "{violations}"
-    );
-}
-
-#[test]
-fn erasure_coding_is_off_by_default_and_needs_several_nodes() {
-    let config = load("").unwrap();
-    assert!(!config.ec().enabled);
-    let config: Config = multi_node(&format!(
+fn the_removed_gates_are_refused_with_their_reason() {
+    let single = "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\"";
+    let cases = [
+        (
+            "multi_node = false",
+            "cluster.multi_node",
+            "backend = \"file\"",
+        ),
+        ("multi_node = true", "cluster.multi_node", "etcd or S3"),
+        (
+            "coordinator = true",
+            "cluster.coordinator",
+            "may be elected",
+        ),
+        (
+            "coordinator = false",
+            "cluster.coordinator",
+            "may be elected",
+        ),
+    ];
+    for (line, key, reason) in cases {
+        let text = single.replace(
+            "cluster_id = \"c1\"",
+            &format!("cluster_id = \"c1\"\n{line}"),
+        );
+        assert_eq!(violated_keys(&text), [key], "{line}");
+        let violations = violations_of(&text);
+        assert!(
+            violations.to_string().contains("was removed"),
+            "{violations}"
+        );
+        assert!(violations.to_string().contains(reason), "{violations}");
+    }
+    for value in ["true", "false"] {
+        let text = format!("{single}\n[ec]\nenabled = {value}");
+        assert_eq!(violated_keys(&text), ["ec.enabled"]);
+        let violations = violations_of(&text);
+        assert!(
+            violations.to_string().contains("min_eligible_nodes"),
+            "{violations}"
+        );
+    }
+    // All three at once, over etcd as an old cluster node had them, are
+    // reported together, before anything else is checked.
+    let text = cluster_node(&format!(
         "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}\n[ec]\nenabled = true"
     ))
-    .parse()
-    .unwrap();
-    assert!(config.ec().enabled);
-    let text = "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\"\n\
-                [ec]\nenabled = true";
-    assert_eq!(violated_keys(text), ["ec.enabled"]);
-    let violations = violations_of(text);
-    assert!(
-        violations.to_string().contains("multi_node"),
-        "{violations}"
+    .replace(
+        "cluster_id = \"c1\"",
+        "cluster_id = \"c1\"\nmulti_node = true\ncoordinator = true",
     );
+    assert_eq!(
+        violated_keys(&text),
+        ["cluster.multi_node", "cluster.coordinator", "ec.enabled"]
+    );
+    // Without them, the same configuration loads.
+    let text = text
+        .replace("\nmulti_node = true", "")
+        .replace("\ncoordinator = true", "")
+        .replace("\nenabled = true", "");
+    let config: Config = text.parse().unwrap();
+    assert!(config.multi_node());
+    // A key of another name is still unknown.
+    let error = parse_error(&format!("{single}\n[ec]\nenable = true"));
+    assert!(error.contains("enable"), "{error}");
 }
 
 #[test]

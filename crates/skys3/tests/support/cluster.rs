@@ -1,4 +1,4 @@
-//! Clusters of nodes with `[cluster] multi_node = true` (plan M8-04 on):
+//! Clusters of nodes over a shared control store (plan M8-04 on):
 //! a throwaway PKI, the `[control_store]` of the in-process stand-in for
 //! etcd, and the configuration of a node of the cluster.
 
@@ -162,9 +162,9 @@ pub fn etcd(fake: &Fake) -> String {
     )
 }
 
-/// A node of the cluster in `dir`: node `node` over `store`, with
-/// `multi_node`, its transport on `port` with the certificate of `cert`
-/// and at most `handshakes` handshakes at once.
+/// A node of the cluster in `dir`: node `node` over `store`, a shared
+/// store, its transport on `port` with the certificate of `cert` and at
+/// most `handshakes` handshakes at once.
 pub fn node_config(
     dir: &Path,
     pki: &Pki,
@@ -183,10 +183,6 @@ pub fn node_config(
         pki.bundle.display()
     );
     config_text(dir, "127.0.0.1:0", "127.0.0.1:0", &transport)
-        .replace(
-            &format!("cluster_id = \"{CLUSTER}\""),
-            &format!("cluster_id = \"{CLUSTER}\"\nmulti_node = true"),
-        )
         .replace(
             "[node]\n",
             &format!("[node]\nnode_id = \"{node}\"\nzone = \"z1\"\nrack = \"r-{node}\"\n"),

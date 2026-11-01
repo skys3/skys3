@@ -144,7 +144,9 @@ fn configuration_and_backend_bound_the_prefix_alike() {
     let load = |prefix: &str| {
         format!(
             "[cluster]\ncluster_id = \"c\"\n[control_store]\nbackend = \"s3\"\n\
-             endpoint = \"https://r2.example\"\nbucket = \"ctl\"\nprefix = \"{prefix}\""
+             endpoint = \"https://r2.example\"\nbucket = \"ctl\"\nprefix = \"{prefix}\"\n\
+             [transport]\nlisten = \"127.0.0.1:7400\"\ntls_cert_file = \"node.pem\"\n\
+             tls_key_file = \"node.key\"\ntls_ca_file = \"ca.pem\""
         )
         .parse::<skys3_config::Config>()
     };

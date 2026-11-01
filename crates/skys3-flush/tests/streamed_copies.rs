@@ -40,7 +40,7 @@ impl World {
     /// with streaming on.
     async fn new(store: SimS3) -> World {
         let config: Config = "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]"
+             [control_store]\nbackend = \"file\""
             .parse()
             .unwrap();
         let control = MemoryControlStore::new();

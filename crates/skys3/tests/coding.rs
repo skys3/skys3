@@ -50,7 +50,6 @@ hot_cache_bytes_per_node = 0
 reserve_fraction = 0.0
 
 [ec]
-enabled = true
 min_eligible_nodes = 3
 parity_fragments = 1
 fragment_release_delay_seconds = 0

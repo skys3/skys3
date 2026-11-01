@@ -11,6 +11,23 @@ jq -e '.ready and .node_id == "n1" and .cluster_id == "e2e" and .control_store.l
     fail "/v1/health: $health"
 log "health: $(jq -c '{ready, shards_open, control_store}' <<<"$health")"
 
+# Over etcd or S3, n1 is the only node of a cluster (plan M8-09): it is
+# registered and holds the coordinator lease. Over the file store it is a
+# single node, without cluster routes.
+if [ "$E2E_CONTROL" = file ]; then
+    jq -e '.cluster.multi_node == false' <<<"$health" >/dev/null ||
+        fail "n1 over the file store is not a single node: $(jq -c .cluster <<<"$health")"
+    if admin "$N1_ADMIN" /v1/cluster >/dev/null 2>&1; then
+        fail "a single node answered /v1/cluster"
+    fi
+else
+    jq -e '.cluster.multi_node and .cluster.registration.registered' <<<"$health" >/dev/null ||
+        fail "n1 over $E2E_CONTROL is not a registered node of a cluster: $(jq -c .cluster <<<"$health")"
+    leads() { admin "$N1_ADMIN" /v1/cluster | jq -e '.coordinator.holder == "n1" and .coordinator.this_node'; }
+    eventually 30 "n1 holds the coordinator lease" leads
+    log "cluster: $(admin "$N1_ADMIN" /v1/cluster | jq -c '{coordinator, nodes: [.nodes[].node_id], fragments}')"
+fi
+
 # The control bucket's versioning, which the node reads at startup from an
 # S3 control store (design section 12): the SkyS3 bucket run.sh uses keeps
 # no versions, so it is 0 and the node warns; -1 for any other store.

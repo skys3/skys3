@@ -13,11 +13,8 @@
 //! requests, `skys3_coord::AdminEndpoint`); replication links, backfills,
 //! and lease messages from other nodes' primaries, through the node's
 //! replication; and the requests other gateways forward to this node's
-//! replicas (plan M8-05b). With `[ec] enabled = true`, it serves fragment
-//! writes, reads, holds, and releases, and orphan queries (plan M8-07a);
-//! without it, a connection whose first frame is of erasure coding is
-//! closed, and the sender's write or read fails as for a node that is
-//! down.
+//! replicas (plan M8-05b); and fragment writes, reads, holds, and
+//! releases, and orphan queries (plan M8-07a).
 
 use std::time::Duration;
 
@@ -48,9 +45,8 @@ pub(crate) struct Services {
     pub(crate) replication: NodeReplication,
     /// Requests other gateways forward to this node's replicas.
     pub(crate) forwarded: Forwarded,
-    /// Fragment writes, reads, holds, and releases, and orphan queries,
-    /// with `[ec] enabled = true`.
-    pub(crate) coding: Option<CodingServices>,
+    /// Fragment writes, reads, holds, and releases, and orphan queries.
+    pub(crate) coding: CodingServices,
 }
 
 impl Services {
@@ -81,15 +77,7 @@ impl Services {
                 }
             }
             Some(MessageClass::Replication) if CodingServices::is_coding(kind) => {
-                match &self.coding {
-                    Some(coding) => coding.serve((receiver, sender), first).await,
-                    None => tracing::info!(
-                        %peer,
-                        ?kind,
-                        "closing a connection of erasure coding, which [ec] enabled = false \
-                         leaves off on this node"
-                    ),
-                }
+                self.coding.serve((receiver, sender), first).await;
             }
             Some(MessageClass::Replication | MessageClass::Lease) => {
                 self.replication.follow((receiver, sender), first).await;
@@ -101,7 +89,7 @@ impl Services {
                 %peer,
                 kind = ?first.header.kind,
                 ?class,
-                "closing an intra-cluster connection this node serves nothing on yet"
+                "closing an intra-cluster connection this node serves nothing on"
             ),
         }
     }

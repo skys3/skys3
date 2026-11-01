@@ -17,7 +17,7 @@
 //! that is not this node's, or that looks reset under a node that has
 //! synced from it before. [`backend`] has every backend behind one type,
 //! and opens the one the configuration names, with the startup probe of
-//! an S3 store and the single-node guard of an etcd or S3 one.
+//! an S3 store.
 
 pub mod backend;
 
@@ -361,8 +361,7 @@ pub enum OpenStoreError {
     /// The store belongs to another node or data directory.
     #[error("{0}")]
     Foreign(String),
-    /// The store cannot be used: it failed the startup probe, or it
-    /// registers another node while this build runs one node per store.
+    /// The store cannot be used: it failed the startup probe.
     #[error("{0}")]
     Refused(String),
 }

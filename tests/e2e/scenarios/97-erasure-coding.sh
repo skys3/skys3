@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Erasure coding in the binary (plans M8-07a and M8-07b, design sections
 # 8.2 to 8.7):
-# nodes ec1 to ec4 of cluster ec, with `[cluster] multi_node = true` and
-# `[ec] enabled = true`, share the etcd control store over mutual TLS
-# (under the prefix `ec/`). A local bucket has one shard of 3 members, and
-# `[ec]` codes stripes of 2+1 from 3 eligible nodes (`min_eligible_nodes =
-# 3`, `parity_fragments = 1`) as soon as an object is written
-# (`ec_after_seconds = 0`). The scenario checks:
+# nodes ec1 to ec4 of cluster ec share the etcd control store over mutual
+# TLS (under the prefix `ec/`), and so run erasure coding, as every node
+# of a cluster does. A local bucket has one shard of 3 members, and
+# `[ec]` codes stripes of 2+1 (`parity_fragments = 1`) as soon as an
+# object is written (`ec_after_seconds = 0`) and enough nodes are
+# eligible. The scenario checks:
 #
-# - that a 16 MiB object is coded: one `EC_PUBLISH` committed
+# - that with the default `min_eligible_nodes` of 5, the four nodes code
+#   nothing: a 16 MiB object stays replicated;
+# - that the runbook "Turning erasure coding on" turns it on: with
+#   `min_eligible_nodes = 3` in every configuration, the nodes restart one
+#   at a time, each once the one before is ready, the primary last, and
+#   the object reads back between the restarts;
+# - that the object is then coded: one `EC_PUBLISH` committed
 #   (`skys3_encoded_objects_total`), and three nodes hold its fragments
 #   (`skys3_fragment_stored_bytes`);
 # - that the members drop their replicas: the log segments holding the
@@ -39,7 +45,7 @@
 # every second. Repairs and moves are paced at 8 MiB/s, so the rebuild of
 # an 8 MiB fragment (two read, one written) takes about 3 seconds, during
 # which its loss is counted. It runs only over etcd (`# e2e: etcd`),
-# beside the other cluster scenarios, takes about 50 seconds, and uses the
+# beside the other cluster scenarios, takes about 80 seconds, and uses the
 # ports E2E_PORT+50 to E2E_PORT+61, which only the single-node scenarios
 # of the file store use otherwise.
 # e2e: etcd
@@ -54,11 +60,12 @@ key=AKIASKYS3E2ECODING secret=skys3-e2e-coding-secret-0123456789
 bucket=coded
 size=$((16 << 20))
 
-# configure <node> <port offset>: the directory $E2E_DIR/<node> and the
-# configuration of node <node>, its gateway at E2E_PORT+<offset>, its
-# admin listener one port up and its transport two.
+# configure <node> <port offset> <eligible>: the directory $E2E_DIR/<node>
+# and the configuration of node <node>, its gateway at E2E_PORT+<offset>,
+# its admin listener one port up and its transport two, coding once
+# <eligible> nodes are eligible (`min_eligible_nodes`).
 configure() {
-    local node=$1 offset=$2 dir=$E2E_DIR/$1
+    local node=$1 offset=$2 eligible=$3 dir=$E2E_DIR/$1
     mkdir -p "$dir"
     printf '%s' "$secret" >"$dir/secret"
     echo "127.0.0.1:$((E2E_PORT + offset + 1))" >"$dir/admin"
@@ -66,7 +73,6 @@ configure() {
     cat >"$dir/skys3.toml" <<EOF
 [cluster]
 cluster_id = "ec"
-multi_node = true
 
 [node]
 node_id = "$node"
@@ -101,8 +107,7 @@ hot_cache_bytes_per_node = 0
 reserve_fraction = 0.0
 
 [ec]
-enabled = true
-min_eligible_nodes = 3
+min_eligible_nodes = $eligible
 parity_fragments = 1
 fragment_release_delay_seconds = 1
 fragment_repair_after_seconds = 10
@@ -177,8 +182,11 @@ read_back() {
 started=$SECONDS
 nodes=(ec1 ec2 ec3 ec4)
 offsets=([1]=50 [2]=53 [3]=56 [4]=59)
+# The nodes start with the default `min_eligible_nodes` of 5: four nodes
+# are too few to code, so objects stay replicated until the runbook
+# "Turning erasure coding on" lowers it.
 for i in 1 2 3 4; do
-    configure "ec$i" "${offsets[$i]}"
+    configure "ec$i" "${offsets[$i]}" 5
     node_start "ec$i"
 done
 echo "${nodes[*]}" >"$work/running"
@@ -209,7 +217,6 @@ random_file "$work/large" "$size"
 sha256sum <"$work/large" | cut -d' ' -f1 >"$work/sha256"
 status=$(put "$work/large")
 [ "$status" = 200 ] || fail "PUT of 16 MiB answered $status: $(cat "$work/put")"
-put_at=$SECONDS
 log "wrote 16 MiB, SHA-256 $(cat "$work/sha256")"
 holders() {
     local node
@@ -219,12 +226,42 @@ holders() {
         fi
     done
 }
+
+# --- Turning erasure coding on: a rolling restart -------------------------------
+
+# With 4 nodes and `min_eligible_nodes = 5`, the encoders, which scan
+# every second here, code nothing: the object stays replicated.
+sleep 5
+[ "$(total skys3_encoded_objects_total)" = 0 ] || fail "a cluster smaller than min_eligible_nodes coded an object"
+[ -z "$(holders)" ] || fail "a cluster smaller than min_eligible_nodes holds fragments: $(holders | paste -sd' ' -)"
+log "4 nodes under min_eligible_nodes = 5 code nothing: the object stays replicated"
+# The runbook's steps: lower `min_eligible_nodes` to 3 in every node's
+# configuration, and restart the nodes one at a time, each once the one
+# before reports ready (node_start waits for that), the primary last. The
+# object reads back between the restarts.
+restarted_at=$SECONDS
+for node in $(for n in "${nodes[@]}"; do [ "$n" = "$primary" ] || echo "$n"; done) "$primary"; do
+    configure "$node" "${offsets[${node#ec}]}" 3
+    node_stop "$node"
+    node_start "$node"
+    reader=ec1
+    [ "$node" != ec1 ] || reader=ec2
+    eventually 60 "GET through $reader returns the object once $node restarted" read_back "$reader"
+done
+log "restarted the 4 nodes one at a time in $((SECONDS - restarted_at)) s with min_eligible_nodes = 3; the object read back throughout"
+# The restarts may move the shard's lease: the primary is the one now.
+eventually 30 "the bucket's shard has 3 members after the restarts" placed
+placement >"$work/shard"
+primary=$(jq -r .primary "$work/shard")
+members=$(jq -r '.members | join(" ")' "$work/shard")
+log "after the restarts: members $members, primary $primary"
+coding_at=$SECONDS
 coded() {
     [ "$(total skys3_encoded_objects_total)" = 1 ] && [ "$(holders | wc -l)" -eq 3 ]
 }
 eventually 60 "the object is coded on 3 nodes" coded
 holding=$(holders | paste -sd' ' -)
-log "coded $((SECONDS - put_at)) s after the PUT; fragments on $holding ($(value "${holding%% *}" skys3_fragment_stored_bytes) bytes each)"
+log "coded $((SECONDS - coding_at)) s after the restarts; fragments on $holding ($(value "${holding%% *}" skys3_fragment_stored_bytes) bytes each)"
 # The 16 MiB the members held are gone, but for the last segment, which
 # still takes records (2 MiB at most).
 dropped() {
@@ -234,7 +271,7 @@ dropped() {
     done
 }
 eventually 60 "the members drop their replicas" dropped
-log "the members dropped their replicas $((SECONDS - put_at)) s after the PUT: bulk segments $(for n in $members; do printf '%s=%s ' "$n" "$(bulk "$n")"; done)"
+log "the members dropped their replicas $((SECONDS - coding_at)) s after the restarts: bulk segments $(for n in $members; do printf '%s=%s ' "$n" "$(bulk "$n")"; done)"
 
 # --- Reads, healthy and with a holder down ------------------------------------
 

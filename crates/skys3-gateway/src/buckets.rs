@@ -1032,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn pending_deletions_are_bounded() {
         let config: Config = "[cluster]\ncluster_id = \"c\"\n[control_store]\n\
-                              etcd_endpoints = [\"https://e:2379\"]"
+                              backend = \"file\""
             .parse()
             .unwrap();
         let buckets = Buckets::load(

@@ -62,7 +62,7 @@ impl World {
     async fn new(store: SimS3, budget: u64, shards: u32) -> World {
         let config: Config = format!(
             "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nmax_dirty_bytes = {budget}\nshards_per_bucket = {shards}"
         )
         .parse()

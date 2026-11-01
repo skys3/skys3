@@ -62,7 +62,7 @@ const CONFIG: &str = r#"
 [cluster]
 cluster_id = "test"
 [control_store]
-etcd_endpoints = ["https://etcd.invalid:2379"]
+backend = "file"
 [buckets.defaults]
 mode = "local"
 [identity]

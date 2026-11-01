@@ -31,7 +31,7 @@ use skys3_types::{
 };
 
 const CONFIG: &str = "[cluster]\ncluster_id = \"c-test\"\n\
-    [control_store]\netcd_endpoints = [\"https://etcd.example:2379\"]\n\
+    [control_store]\nbackend = \"file\"\n\
     [buckets.photos]\nmode = \"write_back\"\n\
     [buckets.vault]\nmode = \"local\"\nbackup_target = \"https://backup.example/vault\"\n";
 

@@ -136,7 +136,9 @@ fn a_node_that_cannot_start_exits_with_failure() {
         "backend = \"file\"",
         "backend = \"etcd\"\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
          etcd_tls_ca_file = \"/nonexistent/etcd-ca.pem\"",
-    );
+    ) + "\n[transport]\nlisten = \"127.0.0.1:0\"\nadvertise = \"localhost:7400\"\n\
+         tls_cert_file = \"/nonexistent/node.pem\"\ntls_key_file = \"/nonexistent/node.key\"\n\
+         tls_ca_file = \"/nonexistent/cluster-ca.pem\"\n";
     std::fs::write(&config, text).unwrap();
     let output = Command::new(BINARY)
         .arg("--config")
@@ -144,7 +146,11 @@ fn a_node_that_cannot_start_exits_with_failure() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("etcd-ca.pem"));
+    // A node of a cluster loads its certificate first.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("[transport] certificate"),
+        "{output:?}"
+    );
 }
 
 /// Runs `skys3 control <args>` with the configuration at `config`.

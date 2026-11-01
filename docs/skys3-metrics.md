@@ -107,7 +107,7 @@ sections of the [design](skys3-design.md) the metric reports on.
 | `skys3_control_store_last_success_timestamp_seconds` | gauge | none | §6.2, §6.10 | exported (M7-04) | When the node last read the control store successfully, as Unix time: the generation check it makes at least every `config_poll_interval_seconds`, or a sync of its copy. 0 if it has not since it started. `time()` minus this is how long the node has gone without the store, also for an outage that starts after startup. |
 | `skys3_identity_synced_timestamp_seconds` | gauge | none | §6.2, §6.10 | exported (M7-04) | When the sync that produced the node's identity copy started, as Unix time; for the copy a node loads at startup, the sync that produced its stored copy. STS issues no new sessions once `time()` minus this exceeds `identity_max_staleness`. While the store answers, the node syncs at least every half of it. 0 before the first sync. |
 | `skys3_identity_max_staleness_seconds` | gauge | none | §6.10 | exported (M7-04) | The configured `identity_max_staleness` (`[identity] identity_max_staleness_hours`), so that alerts compare the identity copy's age with the node's own setting. |
-| `skys3_handshakes_in_flight` | gauge | `listener` (`gateway`, `transport`, `peer`) | §12 | exported (M8-04) | TLS handshakes a listener runs now: the gateway's with HTTPS, the intra-cluster transport's with `[cluster] multi_node = true`, and the QUIC peer endpoint's with `[peering.peers]`. Never above the listener's cap (`[gateway] max_inflight_handshakes`, `[transport] max_inflight_handshakes`, `[peering] peer_max_inflight_handshakes`): a gauge that sits at its cap means connections wait (or, at the peer endpoint, are refused), as under a flood of connections that never finish a handshake. |
+| `skys3_handshakes_in_flight` | gauge | `listener` (`gateway`, `transport`, `peer`) | §12 | exported (M8-04) | TLS handshakes a listener runs now: the gateway's with HTTPS, the intra-cluster transport's on a node of a cluster (an etcd or S3 control store), and the QUIC peer endpoint's with `[peering.peers]`. Never above the listener's cap (`[gateway] max_inflight_handshakes`, `[transport] max_inflight_handshakes`, `[peering] peer_max_inflight_handshakes`): a gauge that sits at its cap means connections wait (or, at the peer endpoint, are refused), as under a flood of connections that never finish a handshake. |
 | `skys3_handshakes_total` | counter | `listener` (`gateway`, `transport`, `peer`), `outcome` (`completed`, `failed`, `timed_out`, `refused`) | §12 | exported (M8-04) | TLS handshakes a listener ended. `failed` counts untrusted certificates (another CA, another cluster's SPIFFE ID), protocol errors, and connections closed early; `timed_out` those that did not finish within the handshake timeout (10 s on the transport, 30 s on the gateway, `peer_connect_timeout_ms` at the peer endpoint); `refused` the connections the peer endpoint turned away at its cap. |
 
 ### 3.2 Flush and loss exposure
@@ -156,13 +156,13 @@ after a member was removed from a shard. A shard counts on the node that
 leads it, so summing the series of every node counts each shard once; the
 cluster's oldest age is the maximum over the nodes. The metrics are defined
 by M2-11 (`skys3_shard::replication::ReplicationMetrics`) and exported by
-nodes with `[cluster] multi_node = true` (M8-05b), whose shards have other
-members; a single node does not export them.
+every node of a cluster (an etcd or S3 control store, M8-05b), whose
+shards have other members; a single node does not export them.
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
-| `skys3_under_replicated_bytes` | gauge | none | §6.4 | exported (M2-11; with `multi_node` from M8-05b) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
-| `skys3_oldest_under_replicated_age_seconds` | gauge | none | §6.4 | exported (M2-11; with `multi_node` from M8-05b) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
+| `skys3_under_replicated_bytes` | gauge | none | §6.4 | exported (M2-11; by nodes of a cluster from M8-05b) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
+| `skys3_oldest_under_replicated_age_seconds` | gauge | none | §6.4 | exported (M2-11; by nodes of a cluster from M8-05b) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
 
 ### 3.4 Read-through fill
 
@@ -255,9 +255,8 @@ before every placement round. Only the node that is coordinator reports a
 judgement; every other node reports 0, and a tenure that ends clears its
 node's gauges, so the maximum over the nodes is the cluster's value. The
 metrics are defined by M7-04 (`skys3_coord::CoordinatorMetrics`) and exported
-since M8-06 by the nodes that may be elected (`[cluster] coordinator =
-true`); a node that may not exports none of them, so the sums and maxima
-are over the candidates.
+since M8-06 by every node of a cluster, each of which may be elected
+(M8-09; until then only the nodes with `[cluster] coordinator = true`).
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
@@ -271,8 +270,8 @@ Design sections 8.7 and 10.3. A node keeps each fragment its shard primary
 released, or that orphan reclamation judged an orphan, for
 `fragment_release_delay_seconds` and while reads hold it, then reclaims it;
 fragment-segment compaction then gives its space back. The metrics are
-defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported by nodes with
-`[ec] enabled = true` (M8-07a).
+defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported by every node
+of a cluster (M8-07a; M8-09 removed the `[ec] enabled` gate).
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
@@ -285,8 +284,8 @@ defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported by nodes with
 
 ### 3.12 Erasure coding
 
-Design sections 8.2 to 8.5. Exported by nodes with `[ec] enabled = true`
-(M8-07a): each such node runs an encoder on every replica of a `local`
+Design sections 8.2 to 8.5. Exported by every node of a cluster (M8-07a;
+M8-09 removed the `[ec] enabled` gate): each node runs an encoder on every replica of a `local`
 bucket's shard, which codes only while the replica leads the shard, keeps a
 fragment store on each disk, and reads coded objects from their fragments in
 its gateway.

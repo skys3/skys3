@@ -1,6 +1,6 @@
-//! The coordinator (design §6.7; plan M8-06): with `[cluster] coordinator
-//! = true`, the node contends for `coordinator.lease` through an
-//! [`Elector`], and while it holds the lease, its [`Coordinator`] plans
+//! The coordinator (design §6.7; plan M8-06): every node of a cluster
+//! contends for `coordinator.lease` through an [`Elector`], and while it
+//! holds the lease, its [`Coordinator`] plans
 //! and applies every placement change and its [`Pusher`] pushes the
 //! generation that announces each one to the nodes the registry lists.
 //!
@@ -22,10 +22,9 @@
 //!   that joins included, empties drained nodes, and asks primaries for
 //!   handoffs over the transport ([`HandoffClient`]).
 //!
-//! A node without the flag runs none of this and never contends: it only
-//! follows whichever node holds the lease (its heartbeats go there), so
-//! the gate keeps the coordinator unreachable until an operator turns it
-//! on, and a cluster where no node has it runs as plan M8-05b left it.
+//! Until plan M8-09, a node took part only with `[cluster] coordinator =
+//! true`; every node of a cluster now does, and while another node holds
+//! the lease, this node's coordinator waits and its heartbeats go there.
 //! The registry also answers the heartbeats other nodes send this node
 //! ([`hints`](super::hints)), and the elector's leadership tells them
 //! whether it is coordinator.
@@ -85,13 +84,10 @@ fn pace(config: &ReplicationConfig) -> (ReplacementConfig, RebalanceConfig) {
 /// and the latest placement judgement.
 #[derive(Debug, Clone)]
 pub(crate) struct CoordinatorView {
-    /// Whether the node contends for the lease (`[cluster] coordinator`).
-    pub(crate) candidate: bool,
     /// The registry heartbeats are recorded in, which the coordinator
     /// refreshes from `nodes/` while it holds the lease.
     pub(crate) registry: NodeRegistry,
-    /// Whether this node is coordinator, as its elector decides; always a
-    /// follower without one.
+    /// Whether this node is coordinator, as its elector decides.
     pub(crate) leadership: watch::Receiver<Leadership>,
     /// The latest placement judgement of this node's tenure.
     pub(crate) placement: PlacementHealth,
@@ -106,8 +102,8 @@ impl CoordinatorView {
     }
 }
 
-/// The elector and the coordinator of a node with `[cluster] coordinator =
-/// true`, ready to run ([`NodeCoordinator::spawn`]).
+/// The elector and the coordinator of a node of a cluster, ready to run
+/// ([`NodeCoordinator::spawn`]).
 pub(crate) struct NodeCoordinator {
     elector: Elector<Backend>,
     coordinator: Coordinator<Backend, NodePlacement, Pusher<TokioNetwork>>,
@@ -121,11 +117,11 @@ impl std::fmt::Debug for NodeCoordinator {
     }
 }
 
-/// The coordinator services of node `node`: with `[cluster] coordinator =
-/// true`, an elector and a coordinator over `store` (the control store's
-/// own client) that reach other nodes through `transport` and record
-/// pushes to this node in `hints`, with their metrics in `metrics`; a view
-/// of them either way.
+/// The coordinator services of node `node`: an elector and a coordinator
+/// over `store` (the control store's own client) that reach other nodes
+/// through `transport` and record pushes to this node in `hints`, with
+/// their metrics in `metrics`, and a view of them for the node's other
+/// services.
 ///
 /// # Errors
 ///
@@ -139,21 +135,9 @@ pub(crate) fn start(
     hints: &ControlHints,
     clock: &Arc<dyn Clock>,
     metrics: &MetricsRegistry,
-) -> Result<(Option<NodeCoordinator>, CoordinatorView), StartError> {
+) -> Result<(NodeCoordinator, CoordinatorView), StartError> {
     let registry = NodeRegistry::new(Arc::clone(clock), RegistryConfig::from_config(config));
     let placement = PlacementHealth::new();
-    if !config.cluster().coordinator {
-        // Never coordinator: no elector decides otherwise.
-        let (_, leadership) = watch::channel(Leadership::Follower { holder: None });
-        let view = CoordinatorView {
-            candidate: false,
-            registry,
-            leadership,
-            placement,
-            clock: Arc::clone(clock),
-        };
-        return Ok((None, view));
-    }
     let lease = LeaseConfig::from_config(config)
         .map_err(|error| StartError::Cluster(format!("the coordinator lease: {error}")))?;
     let elector = Elector::new(
@@ -204,17 +188,16 @@ pub(crate) fn start(
     .with_metrics(coordinator_metrics);
     registry.set_waker(coordinator.waker());
     let view = CoordinatorView {
-        candidate: true,
         registry,
         leadership,
         placement,
         clock: Arc::clone(clock),
     };
     Ok((
-        Some(NodeCoordinator {
+        NodeCoordinator {
             elector,
             coordinator,
-        }),
+        },
         view,
     ))
 }

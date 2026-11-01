@@ -15,14 +15,11 @@
 //!   at the next attempt. At startup it also reads the control bucket's
 //!   versioning ([`read_versioning`]).
 //!
-//! **One node per store, unless `[cluster] multi_node`.** A single node
-//! serves each of its shards alone, so two of them on one store would
-//! serve the same buckets apart. A node without `multi_node` therefore
-//! refuses an etcd or S3 store whose `nodes/` registers another node
-//! ([`check_single_node`]), as the file store refuses a second node
-//! itself. With `multi_node = true`, nodes share the store and register in
-//! it, and the guard gives way to registration, which refuses only a
-//! registration of the node's own ID from another data directory
+//! **Shared stores make a cluster.** The file store serves one node, a
+//! single node that serves each of its shards alone, and refuses a second
+//! node itself. The nodes over an etcd or S3 store are the nodes of a
+//! cluster (plan M8-09): they register in it, and registration refuses only
+//! a registration of the node's own ID from another data directory
 //! (`crate::cluster::registration`).
 
 use std::path::PathBuf;
@@ -34,14 +31,13 @@ use skys3_config::{ControlStoreBackend, ControlStoreConfig};
 use skys3_control::{
     Change, ChangeFeed, ChangeStream, ControlError, ControlProbe, ControlStore, DeleteOutcome,
     EtcdControlStore, EtcdStoreConfig, Expected, FileControlStore, KeyPrefix, PutOutcome,
-    RegisterKey, RegisterKind, RetryPolicy, S3Changes, S3ControlStore, S3StoreConfig, Version,
-    Versioned,
+    RegisterKey, S3Changes, S3ControlStore, S3StoreConfig, Version, Versioned,
 };
 use skys3_io::BlockingPool;
 use skys3_remote::aws::{AwsS3, BucketVersioning, default_credentials, profile_credentials};
-use skys3_types::{Generation, NodeId, RemoteTarget};
+use skys3_types::{Generation, RemoteTarget};
 
-use super::{OpenStoreError, OpenedStore, StoreOwner, open_file_store, retrying};
+use super::{OpenStoreError, OpenedStore, StoreOwner, open_file_store};
 use crate::tls::{self, TlsError};
 
 /// How long one request to an S3 control store may take, its whole answer
@@ -252,41 +248,6 @@ pub async fn probe<C: ControlStore>(store: &C) -> Result<(), OpenStoreError> {
     }
 }
 
-/// Refuses a store whose `nodes/` registers a node other than `node`: the
-/// single-node guard of this build (see the [module
-/// documentation](self)).
-///
-/// # Errors
-///
-/// [`OpenStoreError::Refused`] naming the other nodes, and
-/// [`OpenStoreError::Unavailable`] if the listing fails.
-pub async fn check_single_node<C: ControlStore>(
-    store: &C,
-    node: &NodeId,
-    retry: &RetryPolicy,
-) -> Result<(), OpenStoreError> {
-    let nodes = KeyPrefix::nodes();
-    let others: Vec<String> = retrying(retry, || store.list(&nodes))
-        .await?
-        .into_iter()
-        .filter_map(|(key, _)| match key.kind() {
-            RegisterKind::Node(other) if other != *node => Some(other.to_string()),
-            _ => None,
-        })
-        .collect();
-    if others.is_empty() {
-        return Ok(());
-    }
-    Err(OpenStoreError::Refused(format!(
-        "the control store registers node(s) {} besides this node {node}, but this build runs \
-         one node per control store: until replication is wired in (plan M8-05b), each node \
-         serves every shard of its buckets alone, so nodes sharing a store would serve the \
-         same buckets apart. Give each node a store of its own ([control_store] prefix or \
-         backend in its configuration), or delete the registration of a node that is gone",
-        others.join(", ")
-    )))
-}
-
 /// Reads the S3 control bucket's versioning at startup, for the gauge and
 /// a warning when it is not `Enabled` (design §12): without it, an
 /// overwritten or deleted register leaves no history for an audit or a
@@ -326,12 +287,7 @@ pub async fn read_versioning(store: &Backend) -> Option<BucketVersioning> {
 /// startup, and again while the node runs from its copy without a store.
 #[derive(Debug)]
 pub struct Opener {
-    node: NodeId,
-    retry: RetryPolicy,
     kind: Kind,
-    /// Whether nodes share the store (`[cluster] multi_node`), so that
-    /// other nodes' registrations are expected.
-    multi_node: bool,
 }
 
 #[derive(Debug)]
@@ -351,26 +307,20 @@ impl Opener {
     #[must_use]
     pub fn file(directory: PathBuf, owner: StoreOwner, pool: BlockingPool) -> Self {
         Self {
-            node: owner.node_id().clone(),
-            retry: RetryPolicy::default(),
             kind: Kind::File {
                 directory,
                 owner,
                 pool,
             },
-            multi_node: false,
         }
     }
 
-    /// Opens `store`, an etcd or S3 store [`connect`] built, for `node`,
-    /// one of several nodes sharing it if `multi_node`.
+    /// Opens `store`, an etcd or S3 store [`connect`] built, which the
+    /// node shares with the other nodes of its cluster.
     #[must_use]
-    pub fn shared(store: Backend, node: NodeId, multi_node: bool) -> Self {
+    pub fn shared(store: Backend) -> Self {
         Self {
-            node,
-            retry: RetryPolicy::default(),
             kind: Kind::Shared(store),
-            multi_node,
         }
     }
 
@@ -387,12 +337,10 @@ impl Opener {
     /// Opens the store for the node, which has synced from it before if
     /// `initialized`.
     ///
-    /// A file store is opened as [`open_file_store`] opens it. A shared
-    /// store must not register another node ([`check_single_node`]) unless
-    /// nodes share it (`multi_node`), and an S3 store must pass the
-    /// startup probe ([`probe`]). A node that
-    /// never synced from a shared store counts as claiming it, so that it
-    /// drops no shard on the strength of registers it did not write.
+    /// A file store is opened as [`open_file_store`] opens it, and an S3
+    /// store must pass the startup probe ([`probe`]). A node that never
+    /// synced from a shared store counts as claiming it, so that it drops
+    /// no shard on the strength of registers it did not write.
     ///
     /// # Errors
     ///
@@ -411,9 +359,6 @@ impl Opener {
                 })
             }
             Kind::Shared(store) => {
-                if !self.multi_node {
-                    check_single_node(store, &self.node, &self.retry).await?;
-                }
                 if let Backend::S3(_) = store {
                     probe(store).await?;
                 }
@@ -434,19 +379,6 @@ mod tests {
     };
 
     use super::*;
-
-    fn node(name: &str) -> NodeId {
-        NodeId::new(name).unwrap()
-    }
-
-    async fn register(store: &MemoryControlStore, name: &str) {
-        let key = RegisterKey::new(format!("nodes/{name}.json")).unwrap();
-        let written = store
-            .put_if(&key, Expected::Absent, Bytes::from_static(b"{}"))
-            .await
-            .unwrap();
-        assert!(matches!(written, PutOutcome::Written(_)));
-    }
 
     /// A control store configuration built in code, past the checks of
     /// configuration loading.
@@ -498,49 +430,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_store_that_registers_another_node_is_refused() {
-        let store = MemoryControlStore::new();
-        let retry = RetryPolicy::default();
-        check_single_node(&store, &node("n1"), &retry)
-            .await
-            .unwrap();
-        // The node's own registration is no other node's.
-        register(&store, "n1").await;
-        check_single_node(&store, &node("n1"), &retry)
-            .await
-            .unwrap();
-        register(&store, "n2").await;
-        register(&store, "n3").await;
-        let error = check_single_node(&store, &node("n1"), &retry)
-            .await
-            .unwrap_err();
-        let OpenStoreError::Refused(message) = &error else {
-            panic!("{error}");
-        };
-        assert!(
-            message.contains("node(s) n2, n3 besides this node n1"),
-            "{message}"
-        );
-        assert!(message.contains("[control_store] prefix"), "{message}");
-        assert!(message.contains("M8-05b"), "{message}");
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn a_store_that_does_not_answer_is_tried_again_and_a_broken_one_refused() {
+    async fn a_probe_that_gets_no_answer_is_tried_again_and_a_broken_store_refused() {
         let store = FaultyStore::new(MemoryControlStore::new());
-        let retry = RetryPolicy {
-            max_attempts: 2,
-            ..RetryPolicy::default()
-        };
-        store.script([Fault::Unavailable, Fault::Unavailable]);
-        let error = check_single_node(&store, &node("n1"), &retry)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, OpenStoreError::Unavailable(_)), "{error}");
-
         // Both racing writers exhaust their retries in the first round.
-        let attempts = RetryPolicy::default().max_attempts as usize;
+        let attempts = skys3_control::RetryPolicy::default().max_attempts as usize;
         store.script(vec![Fault::Unavailable; 2 * attempts]);
         let error = probe(&store).await.unwrap_err();
         assert!(matches!(error, OpenStoreError::Unavailable(_)), "{error}");

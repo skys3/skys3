@@ -5,17 +5,17 @@
 #   tests/e2e/control-stores.sh
 #
 # Runs tests/e2e/run.sh three times side by side: every scenario over the
-# file control store, the scenarios of the single-node cluster over etcd
-# with mutual TLS, with the multi-node cluster scenarios beside them (plan
-# M8-04's registration, M8-05b's replication, M8-06's coordinator, and
-# M8-07a's erasure coding),
-# and the single-node
-# scenarios over an S3 control bucket. Each run has ports
-# and a directory of its own: SKYS3_E2E_PORT (default 19000) and
-# SKYS3_E2E_DIR (default target/e2e-run) for the file store, and the next
-# hundred ports and the directory's `-etcd` and `-s3` siblings for the
-# others. The single-node runs finish within the peering scenario's five
-# minutes, so the three take about as long as the file store's alone.
+# file control store, where node n1 is a single node; the same scenarios
+# over etcd with mutual TLS, where n1 is a one-node cluster (plan M8-09),
+# with the multi-node cluster scenarios beside them (plan M8-04's
+# registration, M8-05b's replication, M8-06's coordinator, and M8-07a's
+# erasure coding); and those scenarios over an S3 control bucket, where n1
+# is a one-node cluster again. Each run has ports and a directory of its
+# own: SKYS3_E2E_PORT (default 19000) and SKYS3_E2E_DIR (default
+# target/e2e-run) for the file store, and the next hundred ports and the
+# directory's `-etcd` and `-s3` siblings for the others. The etcd and S3
+# runs finish within the peering scenario's five minutes, so the three
+# take about as long as the file store's alone.
 #
 # Each run's output is printed once all three are done, in turn, with its
 # own scenario groups. It exits non-zero if any run failed. Every other

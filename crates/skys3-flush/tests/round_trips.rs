@@ -158,7 +158,7 @@ fn archive() -> BucketDocument {
 fn receiving() -> GatewayConfig {
     let config: Config = format!(
         "[cluster]\ncluster_id = \"{DESTINATION}\"\n[control_store]\n\
-         etcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+         backend = \"file\"\n\
          [transport]\ntls_cert_file = \"/etc/skys3/node.crt\"\n\
          tls_key_file = \"/etc/skys3/node.key\"\ntls_ca_file = \"/etc/skys3/ca.crt\"\n\
          [buckets.archive]\nmode = \"local\"\npeer_source = \"{SOURCE}\"\n\

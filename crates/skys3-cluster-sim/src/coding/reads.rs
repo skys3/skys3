@@ -279,7 +279,7 @@ pub(super) async fn start_gateway(
     let forwards = routed.server().clone();
     let config = format!(
         "[cluster]\ncluster_id = \"{}\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n",
+         [control_store]\nbackend = \"file\"\n",
         reads.cluster
     )
     .parse::<skys3_config::Config>()?;
