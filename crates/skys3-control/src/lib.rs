@@ -33,8 +33,12 @@
 //!   be trusted.
 //!
 //! With the `test-util` feature, `faults` injects lost requests and
-//! responses, late requests, conflicts, and outages into any backend, and
-//! `conformance` is the suite every backend must pass.
+//! responses, late requests, conflicts, and outages into any backend,
+//! `conformance` is the suite every backend must pass, and `etcd_fake` is
+//! an in-process stand-in for etcd's gRPC API.
+//!
+//! Every backend refuses register values over [`MAX_REGISTER_BYTES`], on
+//! writes and, before buffering them, on reads.
 //!
 //! ```
 //! use skys3_control::{Bootstrap, MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
@@ -73,6 +77,8 @@ mod s3;
 mod store;
 
 pub use cluster::{Bootstrap, FIRST_GENERATION, bootstrap, bump_generation, read_cluster};
+#[cfg(feature = "test-util")]
+pub use etcd::fake as etcd_fake;
 pub use etcd::{EtcdConfigError, EtcdControlStore, EtcdStoreConfig};
 pub use feed::ChangeFeed;
 pub use file::{FileControlStore, FileStoreConfig};
@@ -89,6 +95,6 @@ pub use rebuild::{
 };
 pub use s3::{S3Changes, S3ControlStore, S3StoreConfig};
 pub use store::{
-    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
-    Versioned,
+    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, MAX_REGISTER_BYTES,
+    PutOutcome, Version, Versioned,
 };

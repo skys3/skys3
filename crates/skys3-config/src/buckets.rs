@@ -593,7 +593,7 @@ fn settle<'a>(
 
 /// Whether `profile` can name a profile of the shared AWS configuration:
 /// visible ASCII, without the brackets of a section header.
-fn valid_profile(profile: &str) -> bool {
+pub(crate) fn valid_profile(profile: &str) -> bool {
     (1..=MAX_ORIGIN_PROFILE_BYTES).contains(&profile.len())
         && profile
             .bytes()

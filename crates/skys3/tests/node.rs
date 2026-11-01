@@ -526,12 +526,17 @@ async fn the_gateway_serves_https_and_sts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_refuses_what_it_cannot_run() {
     let dir = tempfile::tempdir().unwrap();
+    // A node that never synced does not start without its store: here an
+    // etcd endpoint where nothing listens.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
     let text = config_text(dir.path(), "127.0.0.1:0", "127.0.0.1:0", "").replace(
         "backend = \"file\"",
-        "backend = \"etcd\"\netcd_endpoints = [\"https://etcd.invalid:2379\"]",
+        &format!("backend = \"etcd\"\netcd_endpoints = [\"http://127.0.0.1:{port}\"]"),
     );
     let error = Node::start(text.parse().unwrap()).await.unwrap_err();
-    assert!(matches!(error, StartError::Unsupported(_)), "{error}");
+    assert!(matches!(error, StartError::Control(_)), "{error}");
 
     // A second node cannot use a data directory in use.
     let node = start(dir.path(), "").await;

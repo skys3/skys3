@@ -18,9 +18,9 @@
 //!    than its copy and syncs, and each replica finds its register equal
 //!    to its own configuration.
 //!
-//! This build runs every node alone over the file control store
-//! (`[control_store] backend = "file"`), so it rebuilds only that store,
-//! from the one node's export, and records the node as the store's owner.
+//! This command rebuilds only the file control store
+//! (`[control_store] backend = "file"`), from the one node's export, and
+//! records the node as the store's owner; it refuses an etcd or S3 store.
 //! The plan and its checks are the same for every backend; the cluster
 //! simulation rebuilds a shared S3 control store with them.
 

@@ -82,7 +82,10 @@ pub use buckets::{
     BucketSettings, BucketsConfig, Freshness, MAX_FRESHNESS_TTL_SECONDS,
     MAX_IMPORT_PARALLEL_STREAMS, MAX_ORIGIN_PROFILE_BYTES, TargetTransport,
 };
-pub use cluster::{ClusterConfig, ControlStoreBackend, ControlStoreConfig, FailureDomain};
+pub use cluster::{
+    ClusterConfig, ControlStoreBackend, ControlStoreConfig, DEFAULT_CONTROL_REGION, EtcdTls,
+    FailureDomain,
+};
 pub use ec::{EcConfig, MAX_FRAGMENT_BYTES};
 pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};

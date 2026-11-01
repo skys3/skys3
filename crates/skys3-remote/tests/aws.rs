@@ -16,8 +16,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use skys3_remote::aws::{
-    AwsS3, Credentials, ProvideCredentials, SharedCredentialsProvider, default_credentials,
-    web_identity_credentials,
+    AwsS3, BucketVersioning, Credentials, ProvideCredentials, SharedCredentialsProvider,
+    default_credentials, web_identity_credentials,
 };
 use skys3_remote::probe::{ConditionalProbe, CopySupport};
 use skys3_remote::{
@@ -822,6 +822,37 @@ async fn errors_map_to_kinds_without_retries() {
     let error = store.put_object(put()).await.unwrap_err();
     assert_eq!(error.kind(), S3ErrorKind::Other);
     assert!(error.may_have_applied());
+}
+
+#[tokio::test]
+async fn bucket_versioning_is_read() {
+    let mock = Mock::start().await;
+    let store = mock.client();
+    let answer = |status: &str| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             {status}</VersioningConfiguration>"
+        )
+    };
+    for (body, expected) in [
+        ("<Status>Enabled</Status>", BucketVersioning::Enabled),
+        ("<Status>Suspended</Status>", BucketVersioning::Suspended),
+        ("", BucketVersioning::Disabled),
+    ] {
+        mock.reply(ok(&[("content-type", "application/xml")], &answer(body)));
+        assert_eq!(store.bucket_versioning().await.unwrap(), expected);
+        let request = mock.only_request();
+        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.path(), "/bucket/");
+        assert_eq!(request.query(), ["versioning"]);
+    }
+    mock.reply(error_xml(403, "AccessDenied", "denied"));
+    let error = store.bucket_versioning().await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "403 AccessDenied: GetBucketVersioning: denied"
+    );
 }
 
 #[tokio::test]

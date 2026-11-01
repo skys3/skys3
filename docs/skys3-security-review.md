@@ -64,9 +64,9 @@ transfer run in the simulation and the libraries' tests only.
 | Fragment reads, holds, releases, transfers, orphan checks (`skys3-ec` `read/wire.rs`, `release/wire.rs`, `orphans/wire.rs`, `transfer`) | No | Yes, same transport | `Replication` class (`FragmentData`, `FragmentNoted`): nodes only; the reader's node ID from the certificate (`read/wire.rs:620`, `orphans/wire.rs:382`), which also names whose holds a `FragmentHold` changes; releases only from node certificates (`release/wire.rs:429`), and only of fragments whose header names the released shard, key, version, stripe, and index (`release/wire.rs:362`) | Not applicable yet; holds |
 | Peer QUIC transport (`skys3-peer`) | Yes, when `[peering.peers]` is set (`skys3/src/peering.rs`) | Yes: mTLS, the peer's chain against that peer's own `ca_file` (`skys3-peer/src/tls.rs:210`) | Leaf's trust domain must be a configured peer and lead to its bundle; holder must be a `node`; a source checks the destination cluster from the server name (`tls.rs:296`); `HELLO`'s cluster must equal the certificate's (`endpoint.rs:466`); every `BEGIN`, `COMMIT`, `BATCH` item, and `ABORT` authorized against the peer's bucket pairs (`trust.rs:198`) | Holds |
 | Peer S3 REST fallback (`s3_access_key_ids`, `x-skys3-apply-by`; `skys3-gateway/src/peer_s3.rs`) | Yes | No: the source signs with SigV4 (a shared secret); the destination is authenticated only by the target endpoint's TLS (WebPKI), or not at all over `http://` | The access key maps to one peer (`peer_s3.rs:118`, config refuses a key listed twice); a write identity must name that peer and one of its pairs (`peer_s3.rs:129`); `x-skys3-*` headers must be signed (`sigv4/mod.rs:356`); the apply-by time is read only from the peer's keys and required where `COMMIT`s land (`peer_s3.rs:199`); the descriptor is verified against the peer's bundle before any address is used (`skys3-peer/src/descriptor.rs:409`) | Holds as designed; finding T2 (no destination authentication over `http://`) |
-| Control store, file (`skys3-control/src/file.rs`) | Yes | Not a network path: a local directory under an exclusive lock | Directory permissions | Holds; findings T4 (no value bound), K1 (no reopen after a failed write) |
-| Control store, S3 (`skys3-control/src/s3.rs`) | No (the binary refuses it, `skys3/src/node.rs:811`) | One-way: the store by its endpoint's TLS; SkyS3 by its SigV4 credential | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Not applicable yet; findings T4, T8 |
-| Control store, etcd (`skys3-control/src/etcd`) | No | Optional: `https://` with a `rustls` client configuration that may carry a client certificate (`etcd/mod.rs:53`); `http://` endpoints are accepted | None beyond TLS; no configuration keys load a client certificate yet | Not applicable yet; finding T3 |
+| Control store, file (`skys3-control/src/file.rs`) | Yes | Not a network path: a local directory under an exclusive lock | Directory permissions | Holds; T4 and K1 fixed in M8-03 (values bounded; a failed store is detached and reopened, `skys3/src/node.rs` `Shared::detach`) |
+| Control store, S3 (`skys3-control/src/s3.rs`) | Yes, since M8-03 (`skys3/src/control/backend.rs`), after the startup probe, one node per store until M8-05b | One-way: the store by its endpoint's TLS (`http://` only on loopback, refused at configuration loading and again in `backend::connect`, fixed in M8-03, see T2); SkyS3 by its SigV4 credential, from `[control_store] profile` or the default chain | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Holds; T4 and T8 fixed in M8-03 (ranged reads bounded by `MAX_REGISTER_BYTES`; versioning read at startup, `skys3_control_store_versioning`) |
+| Control store, etcd (`skys3-control/src/etcd`) | Yes, since M8-03, one node per store until M8-05b | `https://`, verified against `etcd_tls_ca_file` or the system roots, with the client certificate of `etcd_tls_cert_file` and `etcd_tls_key_file` (`skys3/src/tls.rs` `client_config`); `http://` only on loopback, refused at configuration loading (`skys3-config/src/cluster.rs` `etcd_backend`) | etcd's `--client-cert-auth` against the client certificate | Holds; T3 fixed in M8-03 (`tests/control_stores.rs` `a_node_runs_on_etcd_over_mutual_tls`, `tests/validation.rs` `etcd_backend_rules`) |
 | Admin HTTP listener: metrics, health, admin API (`skys3-obs/src/admin.rs`) | Yes | No: plain HTTP, bearer token, loopback by default | Token of at least 32 bytes in constant time (`admin.rs:168`, fixed here); a non-loopback `listen` without a token is refused (`admin.rs:111`); `/healthz` and `/readyz` are open by design | Holds as designed; finding T1 (no TLS, no `admin` certificates) |
 | Gateway (S3 and STS clients) | Yes | No, by design: clients sign with SigV4; the gateway serves HTTPS when configured (`skys3/src/tls.rs:35`) and warns on plain HTTP off loopback (`node.rs:724`) | SigV4 signatures in constant time (`sigv4/canonical.rs:260`) | Holds |
 
@@ -96,7 +96,7 @@ One row per claim of §12, and per item of the plan entry.
 | 18 | Gateway HTTPS with `rustls` on `aws-lc-rs`, TLS 1.2 and 1.3, HTTP/1.1; warns on plain HTTP off loopback | `skys3/src/tls.rs:35`; `node.rs:724` | `tls.rs` `loads_a_certificate_and_its_key`; `skys3/tests/sdk.rs` (HTTPS) | Holds |
 | 19 | The control store gets a dedicated bucket or prefix | S3 backend: keys only under the prefix (`skys3-control/src/s3.rs:160`, `RegisterKey` grammar); config refuses overlapping targets (`skys3-config/src/cluster.rs:137`) | `tests/validation.rs` `a_target_must_not_overlap_the_control_prefix_even_when_correlation_is_allowed`, `attached_targets_must_not_share_the_control_stores_scope` (extended), `aws_bucket_names_are_compared_within_their_partition` (new); `skys3-types/src/aws.rs` `endpoints_name_their_partition_and_region` | Gap, fixed: the overlap check skipped AWS endpoints of other regions, and did not recognize China (`amazonaws.com.cn`) or GovCloud endpoints as AWS partitions of their own |
 | 20 | Least-privilege control-store credentials | Operator's (§6.1); SkyS3 cannot verify scope | none | Holds as designed; §12 now says what SkyS3 checks |
-| 21 | Remote-side versioning for audit | Operator's; no code reads the bucket's versioning | none | Gap in the design's wording, fixed: §12 now says SkyS3 does not check it; T8 proposes a check |
+| 21 | Remote-side versioning for audit | Operator's; since M8-03 a node reads the S3 control bucket's versioning at startup when its credential allows `s3:GetBucketVersioning`, warns unless `Enabled`, and exports `skys3_control_store_versioning` (`skys3/src/control/backend.rs` `read_versioning`) | `skys3-remote/tests/aws.rs` `bucket_versioning_is_read`; `skys3/src/metrics.rs` gauge test | Holds (T8 fixed in M8-03) |
 | 22 | E2EE ciphertext never decrypted; keys, sizes, and access patterns visible | No decryption code exists | none | Holds |
 | 23 | Peer clusters authenticate each other with mTLS against a configured trust bundle | `skys3-peer/src/tls.rs:210` (per-peer roots from `PeerTrust`) | `skys3-peer/tests/endpoint.rs` `untrusted_peers_are_rejected`; `tests/trust.rs` `trust_bundles_load_from_the_peering_section` | Holds |
 | 24 | A CA shared by two peers cannot vouch for one as the other; holder must be a node; a source checks the destination cluster | `tls.rs:210` (roots chosen by the leaf's trust domain), `:296` | `endpoint.rs` `untrusted_peers_are_rejected`, `hellos_must_match_the_certificate_and_share_a_version` | Holds |
@@ -131,7 +131,7 @@ The simulation's QUIC endpoints use the node binary's `PeerEndpoint` and
 | Node private key (`[transport]`) | PEM file at startup, buffer zeroed (`pki.rs` `Credentials::load`) | `rustls` `CertifiedKey` | `Debug` of `Credentials`, `PeerTls`, `DescriptorSigner` omit it | n/a | Holds |
 | Continuation-token HMAC keys | Generated, or shared by configuration | `aws-lc-rs` `hmac::Key` | `Debug` of `ListTokenKeys` shows counts only | `hmac::verify` (constant time, `listing/token.rs:150`) | Holds |
 | Remote target and control-store credentials | `aws-config` providers, including web identity (`skys3-remote/src/aws`) | The SDK's providers | The SDK redacts `Debug`; SkyS3 logs no request headers or URIs | n/a | Holds |
-| etcd client certificate | `EtcdStoreConfig::tls`, a prebuilt `rustls` configuration | `rustls` | `Debug` shows only whether TLS is set (`etcd/mod.rs:83`) | n/a | Holds; no configuration keys yet (T3) |
+| etcd client certificate | `[control_store] etcd_tls_key_file` at startup (`skys3/src/tls.rs` `client_config`), into `EtcdStoreConfig::tls` | `rustls` | `Debug` shows only whether TLS is set (`etcd/mod.rs:83`) | n/a | Holds (T3 fixed in M8-03) |
 
 The configuration holds paths, never secret values, so printing a
 `Config` prints no secret. No `tracing` call in the gateway, STS, admin
@@ -155,7 +155,7 @@ so presigned URL signatures and `Authorization` headers stay out of logs.
 | Peer frames | Peer clusters | 1 MiB header, 16 MiB payload, prefix checked first (`skys3-peer/src/frame.rs:46`); batch, range, and piece counts (`message.rs:26`–`44`); 256 streams, no unidirectional streams (`endpoint.rs:106`) | `skys3-peer` | `peer_messages` | Holds |
 | Peer descriptor | A target's S3 endpoint | 64 KiB, checked before decoding (`descriptor.rs:298`) and, since this PR, before the body is buffered (`aws/store.rs:215`) | `skys3-peer`, `skys3-remote` | `peer_descriptor`; `aws.rs` `a_ranged_read_answered_with_more_than_the_range_is_refused` | Gap, fixed |
 | Control-store documents, etcd | etcd | 4 MiB gRPC message, prefix checked first (`etcd/grpc.rs:36`, `:248`) | `skys3-control` | `control_etcd_frame` | Holds |
-| Control-store documents, S3 and file | Control bucket, local directory | None: a register is read whole (`s3.rs` `get`, `file.rs:329`) | `skys3-control` | none | Gap, tracked as T4 (low: the store is a trust anchor) |
+| Control-store documents, S3 and file | Control bucket, local directory | `MAX_REGISTER_BYTES` (1 MiB), refused by every backend's `put_if`; an S3 read is ranged to one byte past it, which `AwsS3` checks against `Content-Length` before buffering (`s3.rs` `read_request`); the file backend checks each file's length (`file.rs` `load_dir`) | `skys3-control` | conformance `values_are_bounded`; `tests/s3.rs`, `file.rs`, `etcd/fake_tests.rs` `registers_over_the_bound_are_neither_written_nor_read` / `a_value_over_the_bound_is_refused` | Holds (T4 fixed in M8-03) |
 | Register JSON | Control store | `serde_json` recursion limit, `deny_unknown_fields` | `skys3-types/src/register.rs` | `tests/registers.rs` | Holds |
 | Control rebuild exports | Operator files | Typed decoder | `skys3-control/src/rebuild.rs` | `control_rebuild` | Holds |
 | Log records on recovery | Local disk | 16 MiB payload (`skys3-types/src/limits.rs:18`), counts bounded by bytes present | `skys3-log/src/record` | `log_record`; `tests/recovery_props.rs` | Holds |
@@ -236,6 +236,18 @@ fix. Each is written for an issue of its own.
   the control store at configuration loading, unless the host is
   loopback or `allow_plaintext_endpoint = true` is set on that target;
   warn at startup when it is.
+- **The control-store part is fixed in M8-03.** Once the binary ran the S3
+  control store, an `http://` control endpoint off loopback was the same
+  hole on the trust anchor (§12): SigV4 authenticates requests, not
+  answers, so a machine on the path could pass the startup probe through,
+  then forge register reads and listings, or acknowledge writes that were
+  never applied. Configuration loading now refuses it like an etcd
+  endpoint (T3), with the same message, and `backend::connect`, the only
+  way the node, its reopen path, and `skys3 control identity` reach an
+  etcd or S3 store, checks again (`ControlStoreConfig::check_transport`).
+  There is no opt-in key, as for etcd: a control store is reached over
+  TLS or on loopback. Targets, origins, and the peer fallback stay open
+  under #103.
 
 ### T3. The etcd control store accepts `http://` and has no certificate keys
 
@@ -248,6 +260,9 @@ fix. Each is written for an issue of its own.
 - **Proposed fix:** `[control_store] etcd_tls_ca_file`,
   `etcd_tls_cert_file`, and `etcd_tls_key_file`, building the existing
   `EtcdStoreConfig::tls`; refuse `http://` endpoints off loopback.
+- **Fixed in M8-03 (#104)** as proposed: configuration loading refuses
+  `http://` etcd endpoints off loopback; without `etcd_tls_ca_file`,
+  `https://` endpoints are verified against the system's roots.
 
 ### T4. Control-store register values have no size bound on the S3 and file backends
 
@@ -261,6 +276,12 @@ fix. Each is written for an issue of its own.
   `skys3-control`, refused by `put_if` and checked on reads: the S3
   backend from `Content-Length` before buffering (as `AwsS3::get_object`
   now does for ranges), the file backend from the file's length.
+- **Fixed in M8-03 (#105):** every backend refuses a larger write; an S3
+  read asks for `Range: bytes=0-<MAX_REGISTER_BYTES>`, so `AwsS3` refuses
+  a longer body before reading it and the backend refuses a larger
+  object; the file backend checks each file's length; etcd checks the
+  value it got too. The conformance suite checks the bound on every
+  backend.
 
 ### T5. Unranged remote reads are buffered whole
 
@@ -309,6 +330,9 @@ fix. Each is written for an issue of its own.
   `s3:GetBucketVersioning`, read the status and warn when it is not
   `Enabled`; export it as a gauge. §12 now states that SkyS3 does not
   check it.
+- **Fixed in M8-03 (#109)** as proposed: `skys3_control_store_versioning`
+  is 1, 0, or -1 when not known (another backend, or no
+  `s3:GetBucketVersioning`); §12 says what is checked.
 
 ### K1. The file control store is not reopened after a failed write
 
@@ -322,6 +346,9 @@ fix. Each is written for an issue of its own.
   until a restart, although §6.2 has it use the store once it answers.
 - **Proposed fix:** when the attached store reports `failed`, detach it
   and let the loop's `reopen` open it again.
+- **Fixed in M8-03 (#110)** as proposed: the node serves its latest copy
+  meanwhile, as when the store does not answer
+  (`tests/control_stores.rs` `a_failed_file_store_is_opened_again`).
 
 ### K2. Bucket changes answer `500` instead of `503` when the store fails
 
@@ -337,7 +364,7 @@ fix. Each is written for an issue of its own.
 ### K3. Rollback detection relies on the generation number alone
 
 - **Severity:** medium.
-- **Path:** control-state copies (`skys3/src/control.rs:92`
+- **Path:** control-state copies (`skys3/src/control/mod.rs:96`
   `ControlCopy::fetch_since`).
 - **Verified:** still present: only `generation < previous.generation` is
   refused.

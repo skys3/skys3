@@ -15,7 +15,11 @@
 //! The file control store is opened through [`open_file_store`], which
 //! records the node and data directory that own it and refuses a store
 //! that is not this node's, or that looks reset under a node that has
-//! synced from it before.
+//! synced from it before. [`backend`] has every backend behind one type,
+//! and opens the one the configuration names, with the startup probe of
+//! an S3 store and the single-node guard of an etcd or S3 one.
+
+pub mod backend;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -327,6 +331,12 @@ impl StoreOwner {
             instance_id,
         }
     }
+
+    /// The node the store belongs to.
+    #[must_use]
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
 }
 
 impl HasFormat for StoreOwner {
@@ -335,7 +345,8 @@ impl HasFormat for StoreOwner {
     }
 }
 
-/// Why [`open_file_store`] did not give the node a store.
+/// Why [`open_file_store`], or [`backend::Opener::open`], did not give the
+/// node a store.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenStoreError {
     /// The store could not be opened or read; it may answer later.
@@ -350,6 +361,10 @@ pub enum OpenStoreError {
     /// The store belongs to another node or data directory.
     #[error("{0}")]
     Foreign(String),
+    /// The store cannot be used: it failed the startup probe, or it
+    /// registers another node while this build runs one node per store.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl From<DataDirError> for OpenStoreError {
@@ -363,11 +378,12 @@ impl From<DataDirError> for OpenStoreError {
     }
 }
 
-/// A file control store [`open_file_store`] opened.
+/// A control store [`open_file_store`] or [`backend::Opener::open`]
+/// opened.
 #[derive(Debug)]
-pub struct OpenedStore {
+pub struct OpenedStore<C = FileControlStore> {
     /// The store.
-    pub store: FileControlStore,
+    pub store: C,
     /// Whether this open claimed an empty store for the node. Its
     /// registers are then new, so they say nothing about which buckets
     /// exist.
@@ -528,6 +544,16 @@ impl<C: ControlStore + Clone> NodeStore<C> {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .store = Some(store);
+    }
+
+    /// Drops the node's store and serves `copy`, the node's latest, until
+    /// a store is attached again and the node goes live: for a store that
+    /// refuses every request until it is reopened, such as a file store
+    /// after a failed write.
+    pub fn detach(&self, copy: ControlCopy) {
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        state.store = None;
+        state.kept = Some(Arc::new(copy));
     }
 
     /// Uses the store directly from now on. A node without a store keeps
@@ -765,10 +791,26 @@ mod tests {
             node.changes(Generation::ZERO).await,
             Err(ControlError::Unavailable(_))
         ));
-        node.attach(store);
+        node.attach(store.clone());
         node.go_live();
         assert!(node.is_live());
         assert!(node.get(&key("nodes/n.json")).await.unwrap().is_some());
+
+        // A detached store leaves the node on the copy it is given.
+        let copy = ControlCopy::fetch(&store, &cluster, &RetryPolicy::default(), Duration::ZERO)
+            .await
+            .unwrap();
+        node.detach(copy);
+        assert!(!node.is_live() && node.store().is_none());
+        assert!(node.get(&key("buckets/a.json")).await.unwrap().is_some());
+        assert!(matches!(
+            node.put_if(&key("buckets/b.json"), Expected::Absent, Bytes::new())
+                .await,
+            Err(ControlError::Unavailable(_))
+        ));
+        node.attach(store);
+        node.go_live();
+        assert!(node.is_live());
     }
 
     /// A store that counts the reads it serves.

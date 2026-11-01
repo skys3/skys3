@@ -89,6 +89,50 @@ fn prefixes_must_end_with_a_slash_and_leave_room_for_keys() {
     }
 }
 
+/// Values over the bound are never written, and objects over it are
+/// refused with at most one byte past it read; an empty object is no
+/// register either.
+#[tokio::test]
+async fn registers_over_the_bound_are_neither_written_nor_read() {
+    use skys3_control::MAX_REGISTER_BYTES;
+    let store = store();
+    let large = Bytes::from(vec![b' '; MAX_REGISTER_BYTES + 1]);
+    let register = key("buckets/large.json");
+    let error = store
+        .put_if(&register, Expected::Absent, large.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ControlError::TooLarge { .. }), "{error}");
+    assert_eq!(store.get(&register).await.unwrap(), None);
+
+    // Written behind the backend's back, as a provider fault or another
+    // writer of the control bucket could.
+    let object_key = store.object_key(&register);
+    let objects = store.objects();
+    objects
+        .put_object(PutObject::new(object_key.clone(), large.clone()))
+        .await
+        .unwrap();
+    let error = store.get(&register).await.unwrap_err();
+    assert!(
+        matches!(error, ControlError::TooLarge { len, .. } if len == large.len() as u64),
+        "{error}"
+    );
+    objects
+        .put_object(PutObject::new(object_key.clone(), large.slice(1..)))
+        .await
+        .unwrap();
+    let read = store.get(&register).await.unwrap().unwrap();
+    assert_eq!(read.value.len(), MAX_REGISTER_BYTES);
+
+    objects
+        .put_object(PutObject::new(object_key, Bytes::new()))
+        .await
+        .unwrap();
+    let error = store.get(&register).await.unwrap_err();
+    assert!(error.to_string().contains("empty object"), "{error}");
+}
+
 /// Configuration validation and the backend agree on the longest prefix,
 /// so a configuration that loads never fails at startup.
 #[test]

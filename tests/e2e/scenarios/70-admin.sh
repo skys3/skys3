@@ -11,6 +11,20 @@ jq -e '.ready and .node_id == "n1" and .cluster_id == "e2e" and .control_store.l
     fail "/v1/health: $health"
 log "health: $(jq -c '{ready, shards_open, control_store}' <<<"$health")"
 
+# The control bucket's versioning, which the node reads at startup from an
+# S3 control store (design section 12): the SkyS3 bucket run.sh uses keeps
+# no versions, so it is 0 and the node warns; -1 for any other store.
+versioning=$(metric "$N1_ADMIN" skys3_control_store_versioning)
+expected=-1
+if [ "$E2E_CONTROL" = s3 ]; then
+    expected=0
+    grep -q "the control bucket's versioning is not enabled" "$E2E_DIR/logs/n1.log" ||
+        fail "n1 did not warn that the control bucket keeps no versions"
+fi
+[ "$versioning" = "$expected" ] ||
+    fail "skys3_control_store_versioning is ${versioning:-missing}, not $expected"
+log "control store: $E2E_CONTROL, versioning $versioning"
+
 n1 s3api create-bucket --bucket admin-check >/dev/null
 buckets=$(admin "$N1_ADMIN" /v1/buckets)
 names=$(jq -r '[.buckets[].name] | sort | join(" ")' <<<"$buckets")

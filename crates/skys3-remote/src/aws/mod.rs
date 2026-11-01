@@ -65,8 +65,11 @@ use aws_sdk_s3::config::{
     BehaviorVersion, Region, RequestChecksumCalculation, ResponseChecksumValidation,
     SharedHttpClient,
 };
+use aws_sdk_s3::types::BucketVersioningStatus;
 use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use skys3_types::RemoteTarget;
+
+use crate::S3Result;
 
 pub use aws_sdk_s3::config::{Credentials, ProvideCredentials, SharedCredentialsProvider};
 
@@ -239,6 +242,44 @@ impl AwsS3 {
     pub fn is_path_style(&self) -> bool {
         self.path_style
     }
+
+    /// `GetBucketVersioning`: whether the bucket keeps overwritten and
+    /// deleted objects as noncurrent versions. It needs
+    /// `s3:GetBucketVersioning`, which a credential scoped to keys under a
+    /// prefix does not have.
+    ///
+    /// # Errors
+    ///
+    /// `403 AccessDenied` without the permission, `501 NotImplemented`
+    /// from a store without versioning, and transport and server errors.
+    pub async fn bucket_versioning(&self) -> S3Result<BucketVersioning> {
+        let output = self
+            .client
+            .get_bucket_versioning()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|error| error::map_sdk_error("GetBucketVersioning", error))?;
+        Ok(match output.status() {
+            Some(BucketVersioningStatus::Enabled) => BucketVersioning::Enabled,
+            Some(BucketVersioningStatus::Suspended) => BucketVersioning::Suspended,
+            // No status: versioning was never enabled. A status this SDK
+            // does not know is not `Enabled` either.
+            _ => BucketVersioning::Disabled,
+        })
+    }
+}
+
+/// A bucket's versioning status, as `GetBucketVersioning` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BucketVersioning {
+    /// Overwritten and deleted objects stay as noncurrent versions.
+    Enabled,
+    /// Versioning was enabled and then suspended: versions kept so far
+    /// remain, but new overwrites replace the current object.
+    Suspended,
+    /// Versioning was never enabled.
+    Disabled,
 }
 
 /// The HTTP client of the S3 client and the credential providers: rustls

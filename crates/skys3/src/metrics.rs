@@ -12,6 +12,7 @@ use std::time::Duration;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Unit;
 use skys3_obs::MetricsRegistry;
+use skys3_remote::aws::BucketVersioning;
 
 /// A gauge of seconds, such as a Unix time.
 type Seconds = Gauge<f64, AtomicU64>;
@@ -57,16 +58,25 @@ pub(crate) struct ControlMetrics {
     last_success: Seconds,
     identity_synced: Seconds,
     identity_max_staleness: Seconds,
+    versioning: Gauge,
 }
 
 impl ControlMetrics {
     fn register(registry: &MetricsRegistry) -> Self {
         let metrics = Self::default();
+        metrics.set_versioning(None);
         registry.register(
             "control_store_live",
             "1 once the control store answered since startup; 0 while the node serves its \
              local copy of control state.",
             metrics.live.clone(),
+        );
+        registry.register(
+            "control_store_versioning",
+            "1 if the S3 control bucket keeps versions, 0 if its versioning is suspended or \
+             was never enabled, -1 if it is not known: another backend, or a credential \
+             without s3:GetBucketVersioning.",
+            metrics.versioning.clone(),
         );
         registry.register_with_unit(
             "control_store_last_success_timestamp",
@@ -109,6 +119,16 @@ impl ControlMetrics {
     pub(crate) fn identity_synced(&self, started: Duration) {
         self.identity_synced.set(started.as_secs_f64());
     }
+
+    /// Records the S3 control bucket's versioning, or `None` if it is not
+    /// known (§12).
+    pub(crate) fn set_versioning(&self, versioning: Option<BucketVersioning>) {
+        self.versioning.set(match versioning {
+            Some(BucketVersioning::Enabled) => 1,
+            Some(BucketVersioning::Suspended | BucketVersioning::Disabled) => 0,
+            None => -1,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +151,7 @@ mod tests {
             "skys3_identity_synced_timestamp_seconds 0.0\n",
             "skys3_identity_max_staleness_seconds 86400.0\n",
             "skys3_disks_out_of_service 0\n",
+            "skys3_control_store_versioning -1\n",
         ] {
             assert!(text.contains(line), "{line} in {text}");
         }
@@ -139,8 +160,16 @@ mod tests {
         control.set_live(true);
         control.store_answered(Duration::from_millis(1_700_000_000_500));
         control.identity_synced(Duration::from_secs(1_699_999_000));
+        control.set_versioning(Some(BucketVersioning::Enabled));
+        let text = metrics.registry.encode().unwrap();
+        assert!(
+            text.contains("skys3_control_store_versioning 1\n"),
+            "{text}"
+        );
+        control.set_versioning(Some(BucketVersioning::Suspended));
         let text = metrics.registry.encode().unwrap();
         for line in [
+            "skys3_control_store_versioning 0\n",
             "skys3_control_store_live 1\n",
             "skys3_control_store_last_success_timestamp_seconds 1700000000.5\n",
             "skys3_identity_synced_timestamp_seconds 1699999000.0\n",

@@ -59,12 +59,15 @@
 //! overwritten blindly: a register that changed between its read and the
 //! write is read again and written again.
 //!
-//! **Backends.** [`put`] and [`delete`] run on any [`ControlStore`]. The
-//! command opens the store the configuration names; this build opens the
-//! file store only, the one its nodes run with. That store is locked by
-//! the node it serves and read when the node starts, so the command runs
-//! while the node is stopped, after its first start created the store,
-//! and the node follows the change when it starts again.
+//! **Backends.** [`put`] and [`delete`] run on any [`ControlStore`], and
+//! the command opens the store the configuration names, as its nodes do
+//! ([`backend`]). An etcd or S3 store is shared, so the command runs while
+//! nodes are up, and they follow the change at their next sync; an S3
+//! store must pass the startup probe first, as it must for a node. The
+//! file store is locked by the node it serves and read when the node
+//! starts, so with it the command runs while the node is stopped, after
+//! its first start created the store, and the node follows the change
+//! when it starts again.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,6 +85,7 @@ use skys3_types::policy::trust::TrustPolicy;
 use skys3_types::policy::{Policy, PolicyDocument};
 use skys3_types::{ClusterId, Generation, ProposalId, RegisterDocument, RoleDocument};
 
+use crate::control::backend::{self, Backend, ConnectError};
 use crate::control::{OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError};
 
@@ -141,6 +145,9 @@ pub enum IdentityError {
     /// The control store could not be opened.
     #[error("the control store: {0}")]
     Open(#[from] OpenStoreError),
+    /// No client could be built for the control store.
+    #[error("the control store: {0}")]
+    Connect(#[from] ConnectError),
     /// The node's data directory could not be opened.
     #[error(transparent)]
     DataDir(#[from] DataDirError),
@@ -594,15 +601,19 @@ pub enum Request {
 ///
 /// # Errors
 ///
-/// [`IdentityError::Refused`] for a backend this build does not open or a
-/// data directory that holds no node yet, [`IdentityError::DataDir`] if
-/// the node is running, and the errors of [`put`] and [`delete`].
+/// For the file store, [`IdentityError::Refused`] for a data directory
+/// that holds no node yet and [`IdentityError::DataDir`] if the node is
+/// running; for an etcd or S3 store, [`IdentityError::Connect`] if no
+/// client can be built and [`IdentityError::Open`] if an S3 store fails
+/// the startup probe; and the errors of [`put`] and [`delete`].
 pub async fn run(config: &Config, request: &Request) -> Result<Applied, IdentityError> {
+    let cluster = &config.cluster().cluster_id;
     let ControlStoreBackend::File { directory } = &config.control_store().backend else {
-        return Err(IdentityError::Refused(
-            "this build opens only the file control store, the only one its nodes run with"
-                .to_owned(),
-        ));
+        let store = backend::connect(config.control_store()).await?;
+        if let Backend::S3(_) = store {
+            backend::probe(&store).await?;
+        }
+        return apply(&store, cluster, request).await;
     };
     let node_file = config.node().data_dir.join(datadir::NODE_FILE);
     if !node_file.exists() {
@@ -612,7 +623,6 @@ pub async fn run(config: &Config, request: &Request) -> Result<Applied, Identity
             config.node().data_dir.display()
         )));
     }
-    let cluster = config.cluster().cluster_id.clone();
     let pool = BlockingPool::new("control", std::num::NonZeroUsize::MIN)
         .map_err(|error| IdentityError::Store(ControlError::Io(error)))?;
     let result = async {
@@ -629,13 +639,7 @@ pub async fn run(config: &Config, request: &Request) -> Result<Applied, Identity
             data_dir.instance_id().to_owned(),
         );
         let store = open_file_store(directory, &owner, true, &pool).await?.store;
-        let (mut ids, retry) = (ProposalIds::from_os_rng(), RetryPolicy::default());
-        let applied = match request {
-            Request::Put(file) => put(&store, &cluster, file, &mut ids, &retry).await,
-            Request::Delete { providers, roles } => {
-                delete(&store, &cluster, providers, roles, &mut ids, &retry).await
-            }
-        };
+        let applied = apply(&store, cluster, request).await;
         drop(store);
         drop(data_dir);
         applied
@@ -643,6 +647,21 @@ pub async fn run(config: &Config, request: &Request) -> Result<Applied, Identity
     .await;
     pool.shutdown();
     result
+}
+
+/// Runs `request` against `store`, the control store of `cluster`.
+async fn apply<C: ControlStore>(
+    store: &C,
+    cluster: &ClusterId,
+    request: &Request,
+) -> Result<Applied, IdentityError> {
+    let (mut ids, retry) = (ProposalIds::from_os_rng(), RetryPolicy::default());
+    match request {
+        Request::Put(file) => put(store, cluster, file, &mut ids, &retry).await,
+        Request::Delete { providers, roles } => {
+            delete(store, cluster, providers, roles, &mut ids, &retry).await
+        }
+    }
 }
 
 /// Reads an identity file of at most [`MAX_FILE_BYTES`] bytes.

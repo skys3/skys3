@@ -134,7 +134,8 @@ fn a_node_that_cannot_start_exits_with_failure() {
     let config = configure(dir.path());
     let text = std::fs::read_to_string(&config).unwrap().replace(
         "backend = \"file\"",
-        "backend = \"etcd\"\netcd_endpoints = [\"https://etcd.invalid:2379\"]",
+        "backend = \"etcd\"\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+         etcd_tls_ca_file = \"/nonexistent/etcd-ca.pem\"",
     );
     std::fs::write(&config, text).unwrap();
     let output = Command::new(BINARY)
@@ -143,7 +144,7 @@ fn a_node_that_cannot_start_exits_with_failure() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("backend"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("etcd-ca.pem"));
 }
 
 /// Runs `skys3 control <args>` with the configuration at `config`.

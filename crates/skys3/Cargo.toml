@@ -19,6 +19,7 @@ http-body-util.workspace = true
 prometheus-client.workspace = true
 rand.workspace = true
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 skys3-config.workspace = true
@@ -55,6 +56,8 @@ rcgen.workspace = true
 # The coordinator's and repair's metrics, for the metrics reference tests.
 skys3-coord.workspace = true
 skys3-ec.workspace = true
+# Enables `test-util` for fault injection and the etcd stand-in.
+skys3-control = { workspace = true, features = ["test-util"] }
 # Enables `test-util` for the in-memory shards in unit tests.
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-sim.workspace = true

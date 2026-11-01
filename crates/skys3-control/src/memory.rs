@@ -11,13 +11,14 @@ use crate::feed::ChangeFeed;
 use crate::key::{KeyPrefix, RegisterKey};
 use crate::store::{
     ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+    check_register_len,
 };
 
 /// A control store held in memory: registers in a map, versioned by a
 /// counter of writes, so no two writes share a version.
 ///
-/// Clones share the registers. Every call answers at once and never fails;
-/// wrap the store in `faults::FaultyStore` (feature `test-util`) to inject
+/// Clones share the registers. Every call answers at once and fails only
+/// for a value over [`MAX_REGISTER_BYTES`](crate::MAX_REGISTER_BYTES); wrap the store in `faults::FaultyStore` (feature `test-util`) to inject
 /// conflicts, outages, and lost requests and responses. Its change feed is
 /// notified by every write.
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ impl ControlStore for MemoryControlStore {
         expected: Expected,
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
+        check_register_len(key, value.len() as u64)?;
         let mut state = self.state();
         let current = state.registers.get(key).map(|current| &current.version);
         let holds = match (&expected, current) {
