@@ -64,7 +64,12 @@
 //!   planned handoff it asks the primary for ([`Handoff`],
 //!   [`HandoffClient`]), at a pace [`RebalanceConfig`] bounds.
 //! - [`AdminEndpoint`]: serves pushes, heartbeats, and handoff requests on
-//!   a node, the last through a [`HandoffSink`].
+//!   a node, the last through a [`HandoffSink`], from the peers a
+//!   [`HandoffAuthority`] admits: the coordinator or an `admin`
+//!   certificate ([`CoordinatorOrAdmin`], threat T6).
+//! - [`set_draining`]: an operator drains a node, which placement then
+//!   empties as it does a departing node, and the node keeps the mark when
+//!   it registers again.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -96,9 +101,11 @@
 //! ```
 
 mod admin;
+mod authority;
 mod buckets;
 mod change;
 mod coordinator;
+mod drain;
 mod fragments;
 mod handoff;
 mod heartbeat;
@@ -115,6 +122,7 @@ mod replace;
 mod testing;
 
 pub use admin::AdminEndpoint;
+pub use authority::{CoordinatorOrAdmin, HandoffAuthority};
 pub use buckets::{
     BucketShards, Creation, CreationError, create_bucket, first_config, registrations,
 };
@@ -122,6 +130,7 @@ pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
+pub use drain::{DrainError, Drained, set_draining};
 pub use fragments::{
     FragmentPlanner, GeometryPolicy, MoveReason, MoveRequest, NoGeometry, PlannedMove,
     ReplaceRequest, ShardStripe, StripePlan, StripeRequest, StripeRoom,

@@ -6,8 +6,9 @@
 #
 # Runs tests/e2e/run.sh three times side by side: every scenario over the
 # file control store, the scenarios of the single-node cluster over etcd
-# with mutual TLS, with the three-node cluster scenarios beside them (plan
-# M8-04's registration and M8-05b's replication), and the single-node
+# with mutual TLS, with the multi-node cluster scenarios beside them (plan
+# M8-04's registration, M8-05b's replication, and M8-06's coordinator),
+# and the single-node
 # scenarios over an S3 control bucket. Each run has ports
 # and a directory of its own: SKYS3_E2E_PORT (default 19000) and
 # SKYS3_E2E_DIR (default target/e2e-run) for the file store, and the next

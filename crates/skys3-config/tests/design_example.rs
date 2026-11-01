@@ -149,6 +149,8 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.node().node_id, None);
     assert!(!minimal.cluster().multi_node);
     assert!(!example.cluster().multi_node);
+    assert!(!minimal.cluster().coordinator);
+    assert!(!example.cluster().coordinator);
     assert_eq!(
         minimal.transport().max_inflight_handshakes,
         example.transport().max_inflight_handshakes
@@ -182,6 +184,7 @@ const EVERY_KEY: &str = r#"
 cluster_id = "c1"
 failure_domain = "zone"
 multi_node = true
+coordinator = true
 
 [node]
 node_id = "node-7"
@@ -224,6 +227,10 @@ primary_lease_ms = 3000
 primary_grace_ms = 5000
 assumed_clock_drift = 0.02
 node_forget_after_hours = 48
+removal_interval_seconds = 5
+rebalance_max_moves = 8
+rebalance_handoff_interval_seconds = 3
+rebalance_handoff_retry_seconds = 20
 
 [storage]
 inline_max_bytes = 65536
@@ -377,6 +384,12 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
     assert_eq!(config.transport().listen.port(), 7401);
     assert!(config.cluster().multi_node);
+    assert!(config.cluster().coordinator);
+    let replication = config.replication();
+    assert_eq!(replication.removal_interval().as_secs(), 5);
+    assert_eq!(replication.rebalance_max_moves, 8);
+    assert_eq!(replication.rebalance_handoff_interval().as_secs(), 3);
+    assert_eq!(replication.rebalance_handoff_retry().as_secs(), 20);
     assert_eq!(
         config.transport().advertised().unwrap().to_string(),
         "node-7.c1.example:7401"

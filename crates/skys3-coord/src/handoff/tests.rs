@@ -246,6 +246,59 @@ async fn the_coordinator_asks_a_primary_to_hand_a_shard_off() {
 }
 
 #[tokio::test]
+async fn only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff() {
+    use skys3_control::{ControlStore as _, Expected, MemoryControlStore, TypedKey};
+    use skys3_io::{Clock, MonotonicClock};
+    use skys3_types::{CoordinatorLease, ProposalId, RegisterDocument};
+
+    use crate::authority::CoordinatorOrAdmin;
+
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let lease = CoordinatorLease {
+        holder: node(9),
+        proposal_id: ProposalId::new("lease-1").unwrap(),
+    };
+    let _ = store
+        .put_if(
+            TypedKey::coordinator_lease().key(),
+            Expected::Absent,
+            lease.to_json().unwrap().into(),
+        )
+        .await
+        .unwrap();
+    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+    let authority = Arc::new(CoordinatorOrAdmin::new(store, clock));
+    let sink = Arc::new(Recording::default());
+    let listener: Listener<TokioNetwork> = pki
+        .transport(&node(1))
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = address(listener.local_addr().unwrap());
+    let endpoint = AdminEndpoint::new(ControlHints::new())
+        .with_handoffs_from(Arc::clone(&sink) as Arc<dyn HandoffSink>, authority);
+    assert!(format!("{endpoint:?}").contains("handoff_authority: true"));
+    tokio::spawn(async move { endpoint.serve(listener).await });
+
+    // The coordinator, node-9, may ask.
+    let coordinator = HandoffClient::new(pki.transport(&node(9)), WAIT);
+    coordinator.send(&node(1), &addr, &handoff()).await.unwrap();
+    // Another node of the cluster, with a valid certificate, may not.
+    let other = HandoffClient::new(pki.transport(&node(2)), WAIT);
+    let refused = other.send(&node(1), &addr, &handoff()).await;
+    assert!(
+        matches!(&refused, Err(HandoffError::Refused(reason))
+            if reason.contains("does not hold the coordinator lease")),
+        "{refused:?}"
+    );
+    // An operator tool may.
+    let tool = HandoffClient::new(pki.tool("ops"), WAIT);
+    tool.send(&node(1), &addr, &handoff()).await.unwrap();
+    assert_eq!(*sink.asked.lock().unwrap(), vec![handoff(), handoff()]);
+}
+
+#[tokio::test]
 async fn a_node_without_a_sink_refuses_handoffs() {
     let pki = Pki::new();
     let addr = serving(&pki, 1, None).await;

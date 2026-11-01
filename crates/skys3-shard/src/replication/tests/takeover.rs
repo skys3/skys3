@@ -10,13 +10,15 @@ use skys3_control::{
 };
 use skys3_io::SimMount;
 use skys3_net::TokioNetwork;
-use skys3_types::{Epoch, NodeId, ShardConfig};
+use skys3_types::{Epoch, NodeId, ProposalId, ShardConfig};
 use tokio::time::Instant;
 
 use super::removal::{Proxy, initial, ms, put, register, timing, until};
 use super::{Pki, WAIT, node, shard_set};
 use crate::error::ShardError;
-use crate::replication::{ControlRegisters, Replication, ReplicationConfig};
+use crate::replication::{
+    ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters as _,
+};
 use crate::shard::{Role, Shard};
 
 /// One node of the test cluster, and the proxies its links to each other
@@ -293,4 +295,44 @@ async fn single_survivor() {
     assert_eq!(survivor.config().members, [node(2)]);
     assert!(survivor.entry("a").await.unwrap().is_some());
     survivor.commit(put("b", 10)).await.unwrap();
+}
+
+#[test]
+fn a_member_removed_while_up_stops_once_its_grace_passes() {
+    run(removed_while_up());
+}
+
+/// Node 3 is removed while it is up, as a coordinator's move removes a
+/// member, and is not told: the primary stops sending to it, its grace
+/// passes, and its takeover finds the register without it. Its replica
+/// then stops in that configuration rather than stay open as a member of
+/// the old one.
+async fn removed_while_up() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let nodes = cluster(&pki, 3, &initial(), &store, patient).await;
+    let primary = &nodes[0].shard;
+    until(|| primary.is_serving() && primary.leader().unwrap().holds_leases()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let removed = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1), node(2)],
+        proposal_id: ProposalId::new("remove-3").unwrap(),
+        ..initial()
+    };
+    assert_eq!(
+        registers.replace(&initial(), &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    nodes[0].replication.open(&removed).await.unwrap();
+    primary.commit(put("b", 10)).await.unwrap();
+    let stale = &nodes[2].shard;
+    until(|| stale.is_stopped()).await;
+    assert_eq!(stale.config(), removed);
+    assert_eq!(register(&store).await, removed);
+    // The others go on.
+    primary.commit(put("c", 10)).await.unwrap();
+    assert_eq!(nodes[1].shard.role(), Role::Member);
 }

@@ -125,12 +125,13 @@ impl Candidate {
     /// A node that holds no shard yet, as `registration` describes it: for
     /// a node that judges placement without a registry, such as a gateway
     /// checking a new bucket's policy. It is live, unless the coordinator
-    /// has marked the registration `departing`: then it is
+    /// has marked the registration `departing` or an operator `draining`
+    /// ([`NodeRegistration::is_leaving`]): then it is
     /// [`NodeState::Departing`], as the registry judges it too, and
     /// receives nothing.
     #[must_use]
     pub fn from_registration(registration: &NodeRegistration) -> Self {
-        let state = if registration.departing {
+        let state = if registration.is_leaving() {
             NodeState::Departing
         } else {
             NodeState::Live
@@ -150,8 +151,8 @@ impl Candidate {
     }
 
     /// A node the coordinator's registry lists, in the state it judges. A
-    /// registration marked `departing` is departing whatever the entry
-    /// says (the registry judges it so as well).
+    /// registration marked `departing` or `draining` is departing whatever
+    /// the entry says (the registry judges it so as well).
     #[must_use]
     pub fn from_entry(entry: &NodeEntry) -> Self {
         let candidate = Self::from_registration(&entry.registration);

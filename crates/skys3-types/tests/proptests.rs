@@ -178,23 +178,27 @@ fn node_registration() -> impl Strategy<Value = NodeRegistration> {
         proptest::collection::btree_map(label(), any::<u64>(), 0..8),
         proposal_id(),
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_map(
-            |(node_id, address, zone, rack, disks, proposal_id, departing)| NodeRegistration {
-                node_id,
-                address,
-                zone,
-                rack,
-                disks: disks
-                    .into_iter()
-                    .map(|(disk_id, capacity_bytes)| DiskInfo {
-                        disk_id,
-                        capacity_bytes,
-                    })
-                    .collect(),
-                instance_id: None,
-                departing,
-                proposal_id,
+            |(node_id, address, zone, rack, disks, proposal_id, departing, draining)| {
+                NodeRegistration {
+                    node_id,
+                    address,
+                    zone,
+                    rack,
+                    disks: disks
+                        .into_iter()
+                        .map(|(disk_id, capacity_bytes)| DiskInfo {
+                            disk_id,
+                            capacity_bytes,
+                        })
+                        .collect(),
+                    instance_id: None,
+                    departing,
+                    draining,
+                    proposal_id,
+                }
             },
         )
 }

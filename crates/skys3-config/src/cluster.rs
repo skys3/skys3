@@ -36,6 +36,12 @@ pub struct ClusterConfig {
     /// `nodes/`, sends heartbeats, and receives pushed generations. Off by
     /// default, until the cluster is complete in the binary (plan M8-09).
     pub multi_node: bool,
+    /// `coordinator`: whether the node may be elected coordinator (§6.7):
+    /// it contends for `coordinator.lease` and, while it holds the lease,
+    /// places, replaces, and rebalances shards. A node without it never
+    /// contends, and follows whichever node holds the lease. Needs
+    /// `multi_node`; off by default, until plan M8-09.
+    pub coordinator: bool,
 }
 
 /// `[cluster]` as written.
@@ -47,15 +53,26 @@ pub(crate) struct RawCluster {
     failure_domain: FailureDomain,
     #[serde(default)]
     pub(crate) multi_node: bool,
+    #[serde(default)]
+    coordinator: bool,
 }
 
 impl RawCluster {
     pub(crate) fn resolve(&self, checker: &mut Checker) -> Option<ClusterConfig> {
+        checker.require(
+            self.multi_node || !self.coordinator,
+            "cluster.coordinator",
+            || {
+                "needs [cluster] multi_node = true: a single node has nothing to coordinate"
+                    .to_owned()
+            },
+        );
         match ClusterId::new(self.cluster_id.as_str()) {
             Ok(cluster_id) => Some(ClusterConfig {
                 cluster_id,
                 failure_domain: self.failure_domain,
                 multi_node: self.multi_node,
+                coordinator: self.coordinator,
             }),
             Err(error) => {
                 checker.report("cluster.cluster_id", error);

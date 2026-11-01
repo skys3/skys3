@@ -7,13 +7,14 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use skys3_control::{ChangeStream, ControlError, ControlStore, read_cluster};
-use skys3_types::Generation;
+use skys3_types::{BucketId, Generation};
 use tokio::time::timeout;
 
 use crate::admin::ControlState;
 use crate::control::backend::Backend;
 use crate::control::{self, ControlCopy, OpenStoreError};
 use crate::node::{Shared, StartError, no_store};
+use crate::sessions::SESSIONS_BUCKET_ID;
 
 impl Shared {
     /// Syncs the identity copy from the store, with its age running from
@@ -67,6 +68,13 @@ impl Shared {
     /// store from now on: buckets, identity, and the shards of new
     /// buckets.
     pub(crate) async fn sync(&self) -> Result<(), StartError> {
+        // A node of several drops its replicas of the buckets deleted
+        // elsewhere: those open before this sync lists the buckets.
+        let open = match &self.cluster {
+            Some(_) => self.shards.set().shards().await,
+            None => Vec::new(),
+        };
+        let before = self.generation();
         let copy = self.refresh_copy().await?;
         let started = copy.synced_at;
         self.control_metrics.store_answered(self.wall.now());
@@ -74,6 +82,14 @@ impl Shared {
         self.control_metrics.set_live(true);
         self.gateway.reload_buckets().await?;
         self.sync_identity(started).await?;
+        if let Some(cluster) = &self.cluster
+            && before.is_some_and(|before| copy.generation > before)
+        {
+            let keep = BucketId::new(SESSIONS_BUCKET_ID).expect("the ID is valid");
+            cluster
+                .drop_deleted(&open, &self.gateway.buckets(), &keep)
+                .await;
+        }
         self.open_bucket_shards().await?;
         *self.control.lock().unwrap_or_else(PoisonError::into_inner) = ControlState {
             live: true,

@@ -11,6 +11,9 @@
 //! | `POST /v1/buckets/<name>/conflicts/<policy>/<key>` | Resolves the conflict `key` is held in under `policy` (M4-06, below). |
 //! | `GET /v1/buckets/<name>/reconcile` | The bucket's reconciliation scans on this node (§9.1, M7-07, below). |
 //! | `GET /v1/shards` | Every shard of every bucket: its configuration as this node knows it, and this node's role in it (M8-05b, below). |
+//! | `GET /v1/cluster` | The coordinator, the registered nodes, and the placement judgement (M8-06, below). |
+//! | `POST /v1/shards/<bucket>/<n>/handoff` | Hands shard `n` of the bucket off to another member (M8-06, below). |
+//! | `POST`, `DELETE /v1/nodes/<id>/drain` | Drains the node, or stops draining it (M8-06, below). |
 //!
 //! Answers are JSON objects; later fields are added, never renamed. A
 //! bucket's status counts the objects and the unflushed entries (dirty,
@@ -89,9 +92,55 @@
 //! - `pushed_generation`: the newest generation another node pushed, or
 //!   `null` before any (design §6.2).
 //!
-//! Once the node runs the coordinator, `health` gains a `placement` object
-//! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
-//! shards' members (M3-04).
+//! While the node is coordinator (plan M8-06), `health` also has a
+//! `placement` object, the coordinator's latest placement judgement
+//! (design §6.7, §12): `failure_domain`, `eligible_nodes`, `domains`,
+//! `unlabeled` (nodes lacking the label the level needs), and
+//! `unsatisfied`, one entry per bucket whose policy is not satisfied, with
+//! its `name`, `bucket_id`, `replicas`, `placeable`, `short` (`shard`,
+//! `members`, `domains`), and `co_located` (`shard`, `domain`, `members`).
+//! It is absent on other nodes, and `null` until the first placement round
+//! of the node's tenure.
+//!
+//! **Cluster** (§6.7, plan M8-06). With `[cluster] multi_node = true`:
+//!
+//! - `GET /v1/cluster` answers the `node_id`; the cluster's `generation`;
+//!   `coordinator`: `holder`, the node `coordinator.lease` names (`null`
+//!   without one), `lease_version`, the version the lease holds, which
+//!   each renewal changes, `this_node`, whether this node serves a tenure
+//!   now, and `candidate`, whether it may (`[cluster] coordinator`);
+//!   `nodes`, each registered node with its `node_id`, `address`, `zone`,
+//!   `rack`, `capacity_bytes`, `draining` and `departing` marks, the
+//!   shards whose registers name it as `primaries`, `members`, and
+//!   `learners`, and on the coordinator its `state` (`live`, `suspect`, or
+//!   `departing`) and `silent_seconds`, how long since the coordinator last
+//!   heard from it (its last heartbeat, or the coordinator's tenure or the
+//!   registration if later), `null` on other nodes; `shards`, the number
+//!   of shard registers; and `placement`, as in `health`, `null` on other
+//!   nodes.
+//! - `POST /v1/shards/<bucket>/<n>/handoff`, with an optional JSON body
+//!   `{"to": "<node-id>"}`, starts a planned handoff of shard `n` (§5.4):
+//!   its primary steps down and `to`, another member, proposes itself.
+//!   Without `to`, the member on a registered node that is neither
+//!   draining nor departing (nor, on the coordinator, suspected) that
+//!   leads the fewest shards. The primary takes the request only from
+//!   itself, the coordinator, or an `admin` certificate (threat T6), so
+//!   the call succeeds on the primary's node or the coordinator, and any
+//!   other node answers `409` with the `primary` and the `coordinator` to
+//!   ask. It answers `202` once the handoff has started, with the
+//!   `bucket`, `bucket_id`, `shard`, `epoch`, `from`, `to`, `started`, and
+//!   `via` (`primary` or `coordinator`); `400` for a malformed body; `404`
+//!   for an unknown bucket or shard; `409` when `to` is not another member
+//!   or the primary refuses (a promotion outstanding, a newer epoch); and
+//!   `503` when the store or the primary does not answer.
+//! - `POST /v1/nodes/<id>/drain` marks the node's registration `draining`
+//!   (§6.7): the coordinator assigns it nothing more, moves its shards to
+//!   other nodes, and hands off those it leads. `DELETE` clears the mark.
+//!   Any node serves either. It answers `200` with the `node_id`,
+//!   `draining`, `changed`, and the `generation` that announced the
+//!   change; `404` for a node that is not registered.
+//!
+//! On a single node these routes answer `404`.
 //!
 //! **Shards** (§5, §6.3, plan M8-05b). `GET /v1/shards` answers the
 //! `node_id` and `shards`, one object per shard of every bucket the node
@@ -180,6 +229,7 @@ use skys3_remote::ObjectStore;
 use skys3_shard::{Role, ShardSet};
 use skys3_types::{
     BucketDocument, BucketId, ClusterId, Generation, Label, NodeAddress, NodeId, ShardConfig,
+    ShardId,
 };
 use tokio::sync::watch;
 
@@ -292,6 +342,89 @@ impl<S: ObjectStore, D: Disk> Flushers for FlushService<S, D> {
 /// The future of [`ShardsReport::report`].
 pub type ReportFuture<'a> = Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
 
+/// The future of a [`ClusterApi`] route: the answer's status and body.
+pub type ClusterFuture<'a> = Pin<Box<dyn Future<Output = (StatusCode, Value)> + Send + 'a>>;
+
+/// The cluster routes of a node with `[cluster] multi_node = true` (plan
+/// M8-06; see the [module](self) docs).
+pub trait ClusterApi: Send + Sync + 'static {
+    /// `GET /v1/cluster`.
+    fn cluster(&self) -> ClusterFuture<'_>;
+
+    /// `POST /v1/shards/<bucket>/<n>/handoff`: hands `shard` of `bucket`
+    /// off to `to`, or to a member chosen when `to` is `None`.
+    fn hand_off<'a>(
+        &'a self,
+        bucket: &'a BucketDocument,
+        shard: ShardId,
+        to: Option<NodeId>,
+    ) -> ClusterFuture<'a>;
+
+    /// `POST` (`draining`) or `DELETE` `/v1/nodes/<id>/drain`.
+    fn drain<'a>(&'a self, node: &'a NodeId, draining: bool) -> ClusterFuture<'a>;
+
+    /// The `placement` object of `GET /v1/health`, while the node is
+    /// coordinator.
+    fn placement(&self) -> Option<Value>;
+}
+
+/// The body of `POST /v1/shards/<bucket>/<n>/handoff`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffBody {
+    /// The member to hand off to, if the caller chooses one.
+    #[serde(default)]
+    to: Option<String>,
+}
+
+/// The member a handoff request's `body` names, if any.
+fn handoff_target(body: &[u8]) -> Result<Option<NodeId>, String> {
+    if body.trim_ascii().is_empty() {
+        return Ok(None);
+    }
+    let body: HandoffBody = serde_json::from_slice(body)
+        .map_err(|error| format!("the body is not {{\"to\": \"<node-id>\"}}: {error}"))?;
+    body.to
+        .map(|to| NodeId::new(to).map_err(|error| format!("\"to\" is not a node ID: {error}")))
+        .transpose()
+}
+
+/// A cluster route, parsed from the path after `/v1/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClusterRoute<'a> {
+    /// `cluster`.
+    Cluster,
+    /// `shards/<bucket>/<n>/handoff`.
+    Handoff { bucket: &'a str, shard: &'a str },
+    /// `nodes/<id>/drain`.
+    Drain { node: &'a str },
+}
+
+impl<'a> ClusterRoute<'a> {
+    fn parse(route: &'a str) -> Option<Self> {
+        if route == "cluster" {
+            return Some(Self::Cluster);
+        }
+        if let Some(rest) = route.strip_prefix("shards/") {
+            let (bucket, rest) = rest.split_once('/')?;
+            let shard = rest.strip_suffix("/handoff")?;
+            return (!bucket.is_empty() && !shard.contains('/'))
+                .then_some(Self::Handoff { bucket, shard });
+        }
+        let node = route.strip_prefix("nodes/")?.strip_suffix("/drain")?;
+        (!node.is_empty() && !node.contains('/')).then_some(Self::Drain { node })
+    }
+
+    /// The methods the route takes, as an `Allow` header lists them.
+    fn allowed(&self) -> &'static str {
+        match self {
+            Self::Cluster => "GET, HEAD",
+            Self::Handoff { .. } => "POST",
+            Self::Drain { .. } => "POST, DELETE",
+        }
+    }
+}
+
 /// What `GET /v1/shards` reports on a node with `[cluster] multi_node =
 /// true`, whose shards live on several nodes (plan M8-05b).
 pub trait ShardsReport: Send + Sync + 'static {
@@ -394,6 +527,8 @@ pub struct NodeAdmin<D: Disk> {
     /// true`; `None` for a single node, whose shards are in
     /// [`NodeAdmin::shards`].
     pub replicated: Option<Arc<dyn ShardsReport>>,
+    /// The cluster routes, with `[cluster] multi_node = true`.
+    pub operations: Option<Arc<dyn ClusterApi>>,
 }
 
 impl<D: Disk> fmt::Debug for NodeAdmin<D> {
@@ -439,7 +574,8 @@ impl<D: Disk> NodeAdmin<D> {
             })
             .collect();
         let not_ready = self.health.not_ready();
-        json!({
+        let placement = self.operations.as_ref().and_then(|ops| ops.placement());
+        let mut health = json!({
             "node_id": self.node_id.as_str(),
             "cluster_id": self.cluster_id.as_str(),
             "ready": not_ready.is_empty(),
@@ -455,7 +591,11 @@ impl<D: Disk> NodeAdmin<D> {
                 .cluster
                 .as_ref()
                 .map_or_else(|| json!({ "multi_node": false }), ClusterView::report),
-        })
+        });
+        if let Some(placement) = placement {
+            health["placement"] = placement;
+        }
+        health
     }
 
     /// The status of `bucket`.
@@ -597,8 +737,71 @@ impl<D: Disk> NodeAdmin<D> {
         }
     }
 
-    async fn route(&self, method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
+    /// Answers a cluster route (see the [module](self) docs).
+    async fn cluster_route(
+        &self,
+        method: &Method,
+        route: ClusterRoute<'_>,
+        body: &[u8],
+    ) -> Response<Full<Bytes>> {
+        let error = |status, message: &str| json_response(status, &json!({ "error": message }));
+        let allowed = match route {
+            ClusterRoute::Cluster => method == Method::GET || method == Method::HEAD,
+            ClusterRoute::Handoff { .. } => method == Method::POST,
+            ClusterRoute::Drain { .. } => method == Method::POST || method == Method::DELETE,
+        };
+        if !allowed {
+            let mut response = error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            response.headers_mut().insert(
+                header::ALLOW,
+                http::HeaderValue::from_static(route.allowed()),
+            );
+            return response;
+        }
+        let Some(operations) = &self.operations else {
+            return error(
+                StatusCode::NOT_FOUND,
+                "this node is not one of several ([cluster] multi_node = false)",
+            );
+        };
+        let (status, body) = match route {
+            ClusterRoute::Cluster => operations.cluster().await,
+            ClusterRoute::Handoff { bucket, shard } => {
+                let Some(bucket) = (self.buckets)()
+                    .into_iter()
+                    .find(|known| known.name.as_str() == bucket)
+                else {
+                    return error(StatusCode::NOT_FOUND, "no such bucket");
+                };
+                let Some(shard) = shard.parse::<u8>().ok().map(ShardId::new) else {
+                    return error(StatusCode::NOT_FOUND, "no such shard");
+                };
+                let to = match handoff_target(body) {
+                    Ok(to) => to,
+                    Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+                };
+                operations.hand_off(&bucket, shard, to).await
+            }
+            ClusterRoute::Drain { node } => {
+                let Ok(node) = NodeId::new(node) else {
+                    return error(StatusCode::NOT_FOUND, "not a node ID");
+                };
+                operations.drain(&node, method == Method::POST).await
+            }
+        };
+        json_response(status, &body)
+    }
+
+    async fn route(
+        &self,
+        method: &Method,
+        path: &str,
+        body: &[u8],
+    ) -> Option<Response<Full<Bytes>>> {
         let route = path.strip_prefix("/v1/")?;
+        if let Some(cluster) = ClusterRoute::parse(route) {
+            return Some(self.cluster_route(method, cluster, body).await);
+        }
         let known = route == "health"
             || route == "shards"
             || route == "buckets"
@@ -841,7 +1044,16 @@ fn flush_status(status: &BucketStatus) -> Value {
 
 impl<D: Disk> AdminApi for NodeAdmin<D> {
     fn call<'a>(&'a self, method: &'a Method, path: &'a str) -> ApiFuture<'a> {
-        Box::pin(self.route(method, path))
+        Box::pin(self.route(method, path, &[]))
+    }
+
+    fn call_with_body<'a>(
+        &'a self,
+        method: &'a Method,
+        path: &'a str,
+        body: Bytes,
+    ) -> ApiFuture<'a> {
+        Box::pin(async move { self.route(method, path, &body).await })
     }
 }
 
@@ -874,6 +1086,61 @@ mod tests {
         assert_eq!(percent_decode("%zz"), None);
         assert_eq!(percent_decode("%+1"), None);
         assert_eq!(percent_decode("%ff"), None);
+    }
+
+    #[test]
+    fn cluster_routes_are_parsed_from_the_path() {
+        assert_eq!(ClusterRoute::parse("cluster"), Some(ClusterRoute::Cluster));
+        assert_eq!(
+            ClusterRoute::parse("shards/photos/3/handoff"),
+            Some(ClusterRoute::Handoff {
+                bucket: "photos",
+                shard: "3"
+            })
+        );
+        assert_eq!(
+            ClusterRoute::parse("nodes/n-2/drain"),
+            Some(ClusterRoute::Drain { node: "n-2" })
+        );
+        for other in [
+            "shards",
+            "shards/photos",
+            "shards/photos/3",
+            "shards//3/handoff",
+            "shards/photos/3/x/handoff",
+            "nodes//drain",
+            "nodes/a/b/drain",
+            "nodes/n-2",
+            "clusters",
+        ] {
+            assert_eq!(ClusterRoute::parse(other), None, "{other}");
+        }
+        assert_eq!(ClusterRoute::Cluster.allowed(), "GET, HEAD");
+        assert_eq!(ClusterRoute::Drain { node: "n" }.allowed(), "POST, DELETE");
+    }
+
+    #[test]
+    fn a_handoff_body_names_the_target_or_nobody() {
+        assert_eq!(handoff_target(b""), Ok(None));
+        assert_eq!(handoff_target(b" \n"), Ok(None));
+        assert_eq!(handoff_target(b"{}"), Ok(None));
+        assert_eq!(handoff_target(br#"{"to": null}"#), Ok(None));
+        assert_eq!(
+            handoff_target(br#"{"to": "n-2"}"#),
+            Ok(Some(NodeId::new("n-2").unwrap()))
+        );
+        for bad in [
+            &br#"{"to": "N 2"}"#[..],
+            br#"{"to": 2}"#,
+            br#"{"target": "n-2"}"#,
+            b"n-2",
+        ] {
+            assert!(
+                handoff_target(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

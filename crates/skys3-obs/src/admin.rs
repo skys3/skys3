@@ -12,7 +12,10 @@
 //!
 //! Paths under `/v1/` belong to the admin API, which the node supplies as
 //! an [`AdminApi`] ([`AdminListener::with_api`]); without one they answer
-//! 404.
+//! 404. The listener reads the body of an authenticated API request, up
+//! to [`MAX_API_BODY`] bytes within [`API_BODY_TIMEOUT`], for the routes
+//! that take one ([`AdminApi::call_with_body`]); a longer body is answered
+//! `413`, and one that does not arrive in time `408`.
 //!
 //! `/healthz` answers 200 while the listener serves. `/readyz` answers 200
 //! when every [`Health`] component is ready, and 503 with the names of the
@@ -269,6 +272,12 @@ pub type AdminResponse = Response<Full<Bytes>>;
 /// API does not have.
 pub type ApiFuture<'a> = Pin<Box<dyn Future<Output = Option<AdminResponse>> + Send + 'a>>;
 
+/// The most bytes of a request body the listener reads for the admin API.
+pub const MAX_API_BODY: usize = 64 * 1024;
+
+/// How long the listener waits for the body of an admin API request.
+pub const API_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The admin API: the routes under `/v1/`, which the node serves through
 /// the admin listener, behind its authentication (design section 12).
 pub trait AdminApi: Send + Sync + 'static {
@@ -276,6 +285,19 @@ pub trait AdminApi: Send + Sync + 'static {
     /// `None` for a path the API does not have, which the listener answers
     /// with 404. The caller is already authenticated.
     fn call<'a>(&'a self, method: &'a Method, path: &'a str) -> ApiFuture<'a>;
+
+    /// Answers `method` on `path` given the request's `body`, at most
+    /// [`MAX_API_BODY`] bytes, for the routes that take one. By default
+    /// the body is ignored and [`AdminApi::call`] answers.
+    fn call_with_body<'a>(
+        &'a self,
+        method: &'a Method,
+        path: &'a str,
+        body: Bytes,
+    ) -> ApiFuture<'a> {
+        drop(body);
+        self.call(method, path)
+    }
 }
 
 /// The labels of `skys3_admin_requests_total`.
@@ -336,8 +358,54 @@ struct AdminState {
 }
 
 impl AdminState {
-    /// Answers one request, the admin API's included, and counts it.
+    /// Answers one request as it arrives on a connection: the body of an
+    /// authenticated admin API request is read first, within its bounds.
+    async fn serve_incoming<B>(&self, request: Request<B>) -> Response<Full<Bytes>>
+    where
+        B: hyper::body::Body<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let (parts, body) = request.into_parts();
+        let head = Request::from_parts(parts, ());
+        let api = Endpoint::from_path(head.uri().path()) == Endpoint::Api
+            && authorized(self.token.as_ref(), head.headers());
+        if !api {
+            return self.serve(&head).await;
+        }
+        let read = tokio::time::timeout(
+            API_BODY_TIMEOUT,
+            http_body_util::BodyExt::collect(http_body_util::Limited::new(body, MAX_API_BODY)),
+        )
+        .await;
+        let body = match read {
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(error)) => {
+                let response = if error.is::<http_body_util::LengthLimitError>() {
+                    text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n")
+                } else {
+                    text(StatusCode::BAD_REQUEST, "cannot read the request body\n")
+                };
+                self.count(Endpoint::Api, &head, &response);
+                return response;
+            }
+            Err(_) => {
+                let response = text(StatusCode::REQUEST_TIMEOUT, "request body timed out\n");
+                self.count(Endpoint::Api, &head, &response);
+                return response;
+            }
+        };
+        self.serve_with_body(&head, body).await
+    }
+
+    /// Answers one request without a body, the admin API's included, and
+    /// counts it.
     async fn serve<B>(&self, request: &Request<B>) -> Response<Full<Bytes>> {
+        self.serve_with_body(request, Bytes::new()).await
+    }
+
+    /// Answers one request, whose admin API call gets `body`, and counts
+    /// it.
+    async fn serve_with_body<B>(&self, request: &Request<B>, body: Bytes) -> Response<Full<Bytes>> {
         let path = request.uri().path();
         let endpoint = Endpoint::from_path(path);
         if endpoint != Endpoint::Api {
@@ -346,7 +414,7 @@ impl AdminState {
         let response = if !authorized(self.token.as_ref(), request.headers()) {
             unauthorized()
         } else if let Some(api) = &self.api {
-            api.call(request.method(), path)
+            api.call_with_body(request.method(), path, body)
                 .await
                 .unwrap_or_else(|| text(StatusCode::NOT_FOUND, "not found\n"))
         } else {
@@ -594,7 +662,7 @@ impl AdminListener {
             let state = Arc::clone(&state);
             let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                 let state = Arc::clone(&state);
-                async move { Ok::<_, Infallible>(state.serve(&request).await) }
+                async move { Ok::<_, Infallible>(state.serve_incoming(request).await) }
             });
             let connection =
                 graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
@@ -932,6 +1000,75 @@ mod tests {
                 (path == "/v1/known").then(|| text(StatusCode::OK, method.to_string()))
             })
         }
+    }
+
+    /// An API that echoes the body it is given.
+    struct Echo;
+
+    impl AdminApi for Echo {
+        fn call<'a>(&'a self, _: &'a Method, _: &'a str) -> ApiFuture<'a> {
+            Box::pin(async { None })
+        }
+
+        fn call_with_body<'a>(
+            &'a self,
+            method: &'a Method,
+            _: &'a str,
+            body: Bytes,
+        ) -> ApiFuture<'a> {
+            Box::pin(async move {
+                let answer = format!("{method} {}", String::from_utf8_lossy(&body));
+                Some(text(StatusCode::OK, answer))
+            })
+        }
+    }
+
+    /// A body of `bytes` bytes.
+    fn with_body(request: Request<()>, bytes: usize) -> Request<Full<Bytes>> {
+        request.map(|()| Full::new(Bytes::from(vec![b'x'; bytes])))
+    }
+
+    #[tokio::test]
+    async fn api_requests_carry_their_bounded_body() {
+        let mut state = state(Some(TOKEN));
+        let bearer = format!("Bearer {TOKEN}");
+        // The default ignores the body.
+        state.api = Some(Arc::new(OnePath));
+        let known = state
+            .serve_incoming(with_body(
+                request(Method::POST, "/v1/known", Some(&bearer)),
+                3,
+            ))
+            .await;
+        assert_eq!(known.status(), StatusCode::OK);
+        state.api = Some(Arc::new(Echo));
+        let echoed = state
+            .serve_incoming(with_body(
+                request(Method::POST, "/v1/echo", Some(&bearer)),
+                3,
+            ))
+            .await;
+        let body = echoed.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, "POST xxx");
+        let large = state
+            .serve_incoming(with_body(
+                request(Method::POST, "/v1/echo", Some(&bearer)),
+                MAX_API_BODY + 1,
+            ))
+            .await;
+        assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Without the token, the body is never read.
+        let denied = state
+            .serve_incoming(with_body(
+                request(Method::POST, "/v1/echo", None),
+                MAX_API_BODY + 1,
+            ))
+            .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let health = state
+            .serve_incoming(with_body(request(Method::GET, "/healthz", None), 1))
+            .await;
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     #[tokio::test]

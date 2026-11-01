@@ -1,16 +1,20 @@
 //! The node's endpoint for admin messages from other nodes (design §12):
 //! pushed generations ([`ControlChanged`]) on every node, heartbeats
 //! ([`Heartbeat`]) on a node that may become coordinator, and requests to
-//! hand a shard off ([`Handoff`]) on a node that leads shards.
+//! hand a shard off ([`Handoff`]) on a node that leads shards, from the
+//! peers a [`HandoffAuthority`] admits (threat T6).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use skys3_io::Clock;
-use skys3_net::{Connection, Frame, Listener, MessageKind, Network, Receiver, Sender};
+use skys3_net::{
+    Connection, Frame, Listener, MessageKind, Network, PeerIdentity, Receiver, Sender,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
+use crate::authority::HandoffAuthority;
 use crate::handoff::{Handoff, HandoffAck, HandoffSink};
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
 use crate::lease::Leadership;
@@ -27,7 +31,15 @@ use crate::registry::NodeRegistry;
 pub struct AdminEndpoint {
     hints: ControlHints,
     heartbeats: Option<Heartbeats>,
-    handoffs: Option<Arc<dyn HandoffSink>>,
+    handoffs: Option<Handoffs>,
+}
+
+/// What starts handoffs, and who may ask for them.
+#[derive(Clone)]
+struct Handoffs {
+    sink: Arc<dyn HandoffSink>,
+    /// `None` admits every authenticated peer.
+    authority: Option<Arc<dyn HandoffAuthority>>,
 }
 
 /// What answers heartbeats: the registry they are recorded in, and
@@ -45,6 +57,13 @@ impl std::fmt::Debug for AdminEndpoint {
             .field("hints", &self.hints)
             .field("heartbeats", &self.heartbeats.is_some())
             .field("handoffs", &self.handoffs.is_some())
+            .field(
+                "handoff_authority",
+                &self
+                    .handoffs
+                    .as_ref()
+                    .is_some_and(|handoffs| handoffs.authority.is_some()),
+            )
             .finish()
     }
 }
@@ -60,11 +79,31 @@ impl AdminEndpoint {
         }
     }
 
-    /// Also starts the planned handoffs it is asked for ([`Handoff`]),
-    /// through `sink`. Without one, it refuses them.
+    /// Also starts the planned handoffs any authenticated peer asks for
+    /// ([`Handoff`]), through `sink`, as in a harness whose every peer is
+    /// trusted. Without it, it refuses them. A node uses
+    /// [`AdminEndpoint::with_handoffs_from`].
     #[must_use]
     pub fn with_handoffs(mut self, sink: Arc<dyn HandoffSink>) -> Self {
-        self.handoffs = Some(sink);
+        self.handoffs = Some(Handoffs {
+            sink,
+            authority: None,
+        });
+        self
+    }
+
+    /// Also starts, through `sink`, the planned handoffs that the peers
+    /// `authority` admits ask for, and refuses the others' (threat T6).
+    #[must_use]
+    pub fn with_handoffs_from(
+        mut self,
+        sink: Arc<dyn HandoffSink>,
+        authority: Arc<dyn HandoffAuthority>,
+    ) -> Self {
+        self.handoffs = Some(Handoffs {
+            sink,
+            authority: Some(authority),
+        });
         self
     }
 
@@ -177,13 +216,7 @@ impl AdminEndpoint {
                     let handoff = Handoff::from_frame(&frame)?;
                     let ack = match &self.handoffs {
                         None => HandoffAck::refused("this node starts no handoffs"),
-                        Some(sink) => {
-                            tracing::info!(peer = %receiver.peer(), ?handoff, "asked to hand a shard off");
-                            match sink.hand_off(handoff).await {
-                                Ok(()) => HandoffAck::started(),
-                                Err(reason) => HandoffAck::refused(reason),
-                            }
-                        }
+                        Some(handoffs) => handoffs.serve(receiver.peer(), handoff).await,
                     };
                     Some(ack.frame(request))
                 }
@@ -195,6 +228,24 @@ impl AdminEndpoint {
             next = next_frame(&mut receiver).await?;
         }
         Ok(())
+    }
+}
+
+impl Handoffs {
+    /// Starts `handoff`, which `peer` asks for, if the authority admits
+    /// the peer.
+    async fn serve(&self, peer: &PeerIdentity, handoff: Handoff) -> HandoffAck {
+        if let Some(authority) = &self.authority
+            && let Err(reason) = authority.permits(peer).await
+        {
+            tracing::warn!(%peer, ?handoff, %reason, "refused a handoff request");
+            return HandoffAck::refused(reason);
+        }
+        tracing::info!(%peer, ?handoff, "asked to hand a shard off");
+        match self.sink.hand_off(handoff).await {
+            Ok(()) => HandoffAck::started(),
+            Err(reason) => HandoffAck::refused(reason),
+        }
     }
 }
 

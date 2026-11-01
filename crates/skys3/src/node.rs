@@ -1095,6 +1095,7 @@ impl Node {
         });
         shared.sync_identity(copy.synced_at).await?;
         let mut background = JoinSet::new();
+        let mut operations = None;
         let (cluster_view, registration) = match (shared.opener.shared_store(), &shared.cluster) {
             (Some(store), Some(cluster)) => {
                 // The transport serves, and the node is registered, before
@@ -1105,12 +1106,13 @@ impl Node {
                     data_dir,
                     store.clone(),
                     shared.hints.clone(),
-                    &metrics.handshakes,
+                    (&metrics.handshakes, &metrics.registry),
                     &pools.index,
                     cluster,
                 )
                 .await?;
                 let (view, status) = (services.view(), services.status());
+                operations = Some(services.operations() as Arc<dyn crate::admin::ClusterApi>);
                 services.spawn(&mut background);
                 cluster.resume().await?;
                 (Some(view), Some(status))
@@ -1160,6 +1162,7 @@ impl Node {
                 .cluster
                 .clone()
                 .map(|cluster| cluster as Arc<dyn crate::admin::ShardsReport>),
+            operations,
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?

@@ -322,6 +322,10 @@ fn durations_and_sizes_must_be_positive() {
     for (section, key) in [
         ("replication", "replica_ack_timeout_ms"),
         ("replication", "node_forget_after_hours"),
+        ("replication", "removal_interval_seconds"),
+        ("replication", "rebalance_max_moves"),
+        ("replication", "rebalance_handoff_interval_seconds"),
+        ("replication", "rebalance_handoff_retry_seconds"),
         ("storage", "extent_bytes"),
         ("storage", "group_commit_max_bytes"),
         ("storage", "index_checkpoint_interval_seconds"),
@@ -1753,6 +1757,34 @@ fn several_nodes_need_a_shared_store_certificates_and_an_address() {
     // An advertised address is host:port.
     let error = parse_error(&multi_node("[transport]\nadvertise = \"no-port\""));
     assert!(error.contains("advertise"), "{error}");
+}
+
+#[test]
+fn only_a_node_of_several_may_be_elected_coordinator() {
+    let config = load("").unwrap();
+    assert!(!config.cluster().coordinator);
+    let config: Config = multi_node(&format!(
+        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
+    ))
+    .replace("multi_node = true", "multi_node = true\ncoordinator = true")
+    .parse()
+    .unwrap();
+    assert!(config.cluster().coordinator);
+    // Off by default with multi_node too: the node only follows.
+    let config: Config = multi_node(&format!(
+        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
+    ))
+    .parse()
+    .unwrap();
+    assert!(!config.cluster().coordinator);
+    let text =
+        "[cluster]\ncluster_id = \"c1\"\ncoordinator = true\n[control_store]\nbackend = \"file\"";
+    assert_eq!(violated_keys(text), ["cluster.coordinator"]);
+    let violations = violations_of(text);
+    assert!(
+        violations.to_string().contains("multi_node"),
+        "{violations}"
+    );
 }
 
 #[test]

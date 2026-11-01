@@ -9,7 +9,8 @@
 #   load;
 # - each node's registration in etcd (address, zone, rack, disks, data
 #   directory) and in its admin API's `cluster` object;
-# - heartbeats: no node runs an elector in this build (plan M8-06), so the
+# - heartbeats: no node of this cluster may be elected (`[cluster]
+#   coordinator` is off; the coordinator scenario runs one), so the
 #   scenario writes `coordinator.lease` naming c1, as a coordinator would,
 #   and c2 and c3 send c1 heartbeats over the transport, which c1 answers
 #   as a follower;

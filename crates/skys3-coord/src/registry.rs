@@ -100,8 +100,9 @@ pub enum NodeState {
     /// nothing is taken from this one.
     Suspect,
     /// Silent for `node_forget_after`, or its registration carries the
-    /// `departing` mark. Placement assigns it nothing and re-homes its
-    /// shards, and the node is forgotten once no shard names it.
+    /// `departing` mark, or an operator's `draining` one. Placement assigns
+    /// it nothing and re-homes its shards, and a silent node is forgotten
+    /// once no shard names it.
     Departing,
 }
 
@@ -254,7 +255,7 @@ impl NodeRegistry {
             .flatten()
             .fold(known.seen, MonoTime::max);
         let silent_for = now.saturating_duration_since(since);
-        let state = if silent_for >= self.config.forget_after || known.registration.departing {
+        let state = if silent_for >= self.config.forget_after || known.registration.is_leaving() {
             NodeState::Departing
         } else if silent_for >= self.config.suspect_after {
             NodeState::Suspect
@@ -306,12 +307,13 @@ impl NodeRegistry {
             match read(store, &TypedKey::node(&node)).await {
                 Ok(Some(current)) if current.value.node_id == node => {
                     // A new registration counts as hearing from the node,
-                    // but a coordinator's `departing` mark does not.
+                    // but a coordinator's `departing` mark, or an
+                    // operator's `draining` one, does not.
                     let seen = self
                         .state()
                         .nodes
                         .get(&node)
-                        .filter(|_| current.value.departing)
+                        .filter(|_| current.value.is_leaving())
                         .map_or_else(|| self.clock.now(), |known| known.seen);
                     let known = Known {
                         registration: current.value,

@@ -351,8 +351,23 @@ pub struct NodeRegistration {
     /// again. Written only when set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub departing: bool,
+    /// Whether an operator drains the node (§6.7): placement assigns it
+    /// nothing and moves what it holds elsewhere, as for a departing node,
+    /// but the node keeps the mark when it registers again, and only an
+    /// operator clears it. Written only when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draining: bool,
     /// The proposal ID of the write that stored this document.
     pub proposal_id: ProposalId,
+}
+
+impl NodeRegistration {
+    /// Whether placement treats the node as leaving: marked `departing` by
+    /// a coordinator, or `draining` by an operator.
+    #[must_use]
+    pub const fn is_leaving(&self) -> bool {
+        self.departing || self.draining
+    }
 }
 
 impl RegisterDocument for NodeRegistration {

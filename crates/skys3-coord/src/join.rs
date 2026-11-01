@@ -6,7 +6,8 @@
 //! and disks. The first start creates the register with `If-None-Match: *`.
 //! A restart rewrites it with `If-Match` only if something changed, so a
 //! node that restarts as it was costs one read; it also clears a
-//! coordinator's `departing` mark. Every write goes through the
+//! coordinator's `departing` mark, but keeps an operator's `draining` one,
+//! which only an operator clears ([`set_draining`](crate::set_draining)). Every write goes through the
 //! coordinator's change path ([`apply`]) and is announced by a generation
 //! increment once it is known to have landed, so other nodes find the
 //! registration when they next list `nodes/`.
@@ -55,12 +56,14 @@ impl NodeProfile {
             disks: self.disks.clone(),
             instance_id: self.instance.clone(),
             departing: false,
+            draining: false,
             proposal_id: proposal,
         }
     }
 
     /// Whether `registration` already says everything this profile does,
-    /// and carries no `departing` mark.
+    /// and carries no `departing` mark. An operator's `draining` mark is
+    /// not the node's to judge, and is kept.
     #[must_use]
     pub fn describes(&self, registration: &NodeRegistration) -> bool {
         registration.node_id == self.node
@@ -178,7 +181,11 @@ pub async fn register<S: ControlStore>(
     let key = TypedKey::node(&profile.node);
     for _ in 0..MAX_ROUNDS {
         let current = skys3_control::read_with_retries(store, &key, policy).await?;
-        let document = profile.document(proposals.next_id());
+        let mut document = profile.document(proposals.next_id());
+        // A drain outlives the node's restarts and changes.
+        document.draining = current
+            .as_ref()
+            .is_some_and(|current| current.value.draining);
         if let Some(instance) = current
             .as_ref()
             .and_then(|current| profile.claimed_by(&current.value))

@@ -416,19 +416,31 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 Err(error) => Err(error.to_string()),
             }
         };
+        let lost = |error: String| {
+            // The node's other idle connections most likely failed with
+            // this one, as when it restarted: the next request connects
+            // anew rather than lose its answer on one of them too.
+            self.forget_idle(node);
+            Attempt::Lost(error)
+        };
         let timeout = self.answer_timeout(request);
         let reply: Frame = match tokio::time::timeout(timeout, exchange).await {
             Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => return Attempt::Lost(error),
-            Err(_) => return Attempt::Lost(format!("no answer within {timeout:?}")),
+            Ok(Err(error)) => return lost(error),
+            Err(_) => return lost(format!("no answer within {timeout:?}")),
         };
         match wire::decode_reply(&reply, shard) {
             Ok(reply) => {
                 self.idle(node, connection);
                 Attempt::Reply(reply)
             }
-            Err(error) => Attempt::Lost(format!("an answer that does not decode: {error}")),
+            Err(error) => lost(format!("an answer that does not decode: {error}")),
         }
+    }
+
+    /// Drops the idle connections to `node`.
+    fn forget_idle(&self, node: &NodeId) {
+        lock(&self.inner.idle).remove(node);
     }
 
     /// How long the answer to `request` may take once sent: a flush wait's
