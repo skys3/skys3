@@ -5447,6 +5447,27 @@ of this file. A task with nothing unexpected keeps "None."
 - **No new fuzz target.** The simulation's TCP framing reads frames with
   `parse_prefix` and `Message::decode_parts`, which M6-01's
   `peer_messages` target already fuzzes.
+- **Fixed: a flusher subscribed only once its task first ran (found in
+  CI).** Under coverage instrumentation,
+  `a_body_whose_put_never_commits_is_aborted` timed out after 60 s
+  waiting for the `ABORT`. `ShardFlusher::start` spawned the task, and
+  the task subscribed to the shard. The shard drops an announcement made
+  while nothing follows it, so a body announced before the task first
+  ran was never known: no body timeout fired, and nothing was aborted.
+  In the same window `Shard::await_flush` refused a write-through wait
+  with `no flusher follows the shard`. `start` now subscribes before it
+  spawns the task and hands it the receiver. The task still reads
+  `State::since` first, after the subscription. A write applied in the
+  wider gap between the two is at or before `since`, and the
+  subscription still reports it, so it is tracked as before; a wait for
+  it on an untracked key still goes to the index (`prove`). Every version
+  after `since` is still reported, so a wait for one still means its key
+  was flushed. The lazy subscription dates from M1-16. It is fixed here,
+  where the racing tests were added, rather than on the M1-16 branch,
+  which would have meant restacking every branch since. Tested in `tests/flusher.rs`
+  (`a_flusher_follows_its_shard_from_its_start`): on a current-thread
+  runtime the body is announced, and the wait asked, before the task can
+  run.
 
 ### M6-07 Discovery and fallback
 
