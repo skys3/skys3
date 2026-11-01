@@ -6106,6 +6106,22 @@ of this file. A task with nothing unexpected keeps "None."
   that holds it, so after a primary change a `hold` key is held again and
   must be resolved again. The namespace import's stall (M2-17) is worked
   around in the simulation, not fixed.
+- **Fixed: a wait while the `FLUSHED` is on its way.** A flusher that
+  flushed a version from before it subscribed, as after a primary
+  change, untracked the key as soon as it started the lazy `FLUSHED`,
+  which rides the next group commit up to a second later. A wait that
+  arrived meanwhile found the key untracked and the entry still dirty,
+  so it was left unanswered; the ask ended `Pending` only after its full
+  5 seconds, and a write with a short `write_through_timeout_seconds`
+  got `503` for a version the remote held. The flusher now also answers
+  `Flushed` for an untracked key at the very version a flush of its own
+  put at the remote while that `FLUSHED` is not yet applied (its
+  `recording`). This is the answer a tracked key's waits already get when
+  the flush lands, before the record: the remote holds the version even
+  if the record then fails to commit, which only stops the flusher.
+  Tested in `conflicts.rs`
+  (`a_wait_while_the_flushed_is_on_its_way_is_answered_at_once`) and the
+  flusher state's unit tests.
 
 ### M4-08 Write-through buckets
 
