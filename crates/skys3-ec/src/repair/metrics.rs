@@ -120,6 +120,13 @@ impl RepairMetrics {
         self.oldest.get()
     }
 
+    /// Forgets what `shard` had left to repair, as when the replica whose
+    /// repairer counted it closes in the middle of a pass: the shard's next
+    /// primary finds the lost fragments again and counts them.
+    pub fn forget(&self, shard: &ShardRef) {
+        self.backlog(shard, 0, None);
+    }
+
     /// Counts a fragment moved.
     pub(crate) fn moved_fragment(&self) {
         self.moved.inc();
@@ -173,6 +180,9 @@ mod tests {
         metrics.backlog(&shard(0), 0, None);
         assert_eq!(metrics.unrepaired(), 2);
         metrics.backlog(&shard(1), 0, Some(start));
+        assert_eq!(metrics.unrepaired(), 0);
+        metrics.backlog(&shard(2), 4, Some(start));
+        metrics.forget(&shard(2));
         assert_eq!(metrics.unrepaired(), 0);
         assert!(metrics.oldest.get().abs() < 1e-9);
 

@@ -1,12 +1,15 @@
-//! Erasure coding in the node binary (plan M8-07a; design §8.2–§8.5,
-//! §8.7), on four nodes over the in-process stand-in for etcd: a large
+//! Erasure coding in the node binary (plans M8-07a and M8-07b; design
+//! §8.2–§8.7), on four nodes over the in-process stand-in for etcd: a large
 //! object of a `local` bucket is coded and its members drop their
 //! replicas; it reads back whole through every node; a fragment no layout
 //! names is reclaimed as an orphan, and an operator tool's certificate
 //! cannot write fragments; an overwrite codes the new version and
 //! releases the old version's fragments, which their nodes reclaim; and
 //! the new version reads back through the others while each node that
-//! does not lead the shard is down in turn.
+//! does not lead the shard is down in turn. Then, with repair: a drained
+//! holder's fragment moves to the node outside the stripe, and a holder
+//! lost for good has its fragment rebuilt on the survivors, which then
+//! read the object without decoding.
 
 mod support;
 
@@ -27,7 +30,7 @@ use skys3_types::{
 };
 use support::cluster::{CLUSTER, Pki, etcd, node_config};
 use support::process::free_port;
-use support::{admin_json, http_get};
+use support::{admin_json, http_get, http_send};
 
 /// Short replication timings, so a primary removes a stopped member
 /// within seconds, and erasure coding as the end-to-end scenario runs it:
@@ -54,6 +57,15 @@ fragment_release_delay_seconds = 0
 fragment_orphan_after_seconds = 1
 ";
 
+/// Repair as the end-to-end scenario runs it: a node whose checks go
+/// unanswered for 2 s has lost its fragments, so passes come every second,
+/// and repairs are paced at 256 KiB/s, so a rebuild of the large object's
+/// lost fragment (two fragments read, one written) takes seconds, while
+/// its loss is counted.
+const REPAIR: &str = "fragment_repair_after_seconds = 2
+repair_bytes_per_second_per_node = 262144
+";
+
 /// The large object's size: past `ec_min_object_bytes`, and several log
 /// segments long.
 const LARGE: usize = 600 * 1024;
@@ -63,6 +75,8 @@ const WAIT: Duration = Duration::from_secs(60);
 
 /// Four nodes coding a `local` bucket of one shard of three members.
 struct Cluster {
+    /// Keys appended to `[ec]`.
+    ec: &'static str,
     root: tempfile::TempDir,
     pki: Pki,
     store: String,
@@ -73,7 +87,8 @@ struct Cluster {
 }
 
 impl Cluster {
-    async fn start() -> Self {
+    /// Starts the four nodes, with `ec` appended to their `[ec]` table.
+    async fn start(ec: &'static str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let pki = Pki::new(root.path());
         let fake = Fake::start(None).await;
@@ -81,6 +96,7 @@ impl Cluster {
         let names: Vec<String> = (1..=4).map(|n| format!("n{n}")).collect();
         let ports: Vec<u16> = names.iter().map(|_| free_port()).collect();
         let mut cluster = Self {
+            ec,
             root,
             pki,
             store,
@@ -118,7 +134,8 @@ impl Cluster {
              ec_min_object_bytes = 262144",
         )
         .replace("[storage]\n", "[storage]\nsegment_bytes = 131072\n")
-            + SETTINGS;
+            + SETTINGS
+            + self.ec;
         Node::start(text.parse().unwrap()).await.unwrap()
     }
 
@@ -158,6 +175,28 @@ impl Cluster {
         holders
     }
 
+    /// What node `i`'s fragment stores hold, by its `GET /v1/cluster`:
+    /// all fragments, and those not released.
+    async fn fragments(&self, i: usize) -> (u64, u64) {
+        let answer = admin_json(&self.admin(i), "/v1/cluster").await;
+        let held = &answer["fragments"];
+        (
+            held["held"].as_u64().unwrap(),
+            held["unreleased"].as_u64().unwrap(),
+        )
+    }
+
+    /// The nodes that hold fragments no shard primary released.
+    async fn unreleased_holders(&self) -> Vec<usize> {
+        let mut holders = Vec::new();
+        for i in self.running() {
+            if self.fragments(i).await.1 > 0 {
+                holders.push(i);
+            }
+        }
+        holders
+    }
+
     /// The bucket's one shard as the first node that reports it placed
     /// knows it: with three members and a primary. A node that holds no
     /// replica of the shard reports no members.
@@ -170,6 +209,41 @@ impl Cluster {
             }
         }
         None
+    }
+
+    /// Creates the bucket `coded`, and waits until its shard has three
+    /// members, each holding its replica.
+    async fn create_bucket(&self) -> Placed {
+        self.client(0)
+            .create_bucket()
+            .bucket("coded")
+            .send()
+            .await
+            .unwrap();
+        until("the shard has three members", || async {
+            self.placed().await.is_some()
+        })
+        .await;
+        let shard = self.placed().await.unwrap();
+        let index = |name: &str| self.names.iter().position(|n| n == name).unwrap();
+        let primary = index(shard["primary"].as_str().unwrap());
+        let members: Vec<usize> = shard["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| index(member.as_str().unwrap()))
+            .collect();
+        for &member in &members {
+            until("every member holds its replica", || async {
+                self.shard(member).await["source"] == "replica"
+            })
+            .await;
+        }
+        Placed {
+            primary,
+            members,
+            bucket_id: BucketId::new(shard["bucket_id"].as_str().unwrap()).unwrap(),
+        }
     }
 
     /// The bucket's one shard as `node` knows it.
@@ -194,6 +268,13 @@ impl Cluster {
             .map(|entry| entry.metadata().unwrap().len())
             .sum()
     }
+}
+
+/// The bucket's shard as placed: its primary's and members' indices.
+struct Placed {
+    primary: usize,
+    members: Vec<usize>,
+    bucket_id: BucketId,
 }
 
 /// The value of one series of a node's `/metrics`, or 0 if it is absent.
@@ -288,41 +369,12 @@ fn stray_fragment(shard: ShardRef, key: &str) -> (FragmentHeader, Bytes) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
-    let mut cluster = Cluster::start().await;
-    cluster
-        .client(0)
-        .create_bucket()
-        .bucket("coded")
-        .send()
-        .await
-        .unwrap();
-    until("the shard has three members", || async {
-        cluster.placed().await.is_some()
-    })
-    .await;
-    let shard = cluster.placed().await.unwrap();
-    let primary_name = shard["primary"].as_str().unwrap().to_owned();
-    let primary = cluster
-        .names
-        .iter()
-        .position(|n| *n == primary_name)
-        .unwrap();
-    let members: Vec<usize> = shard["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|member| {
-            let name = member.as_str().unwrap();
-            cluster.names.iter().position(|n| n == name).unwrap()
-        })
-        .collect();
-    let bucket_id = BucketId::new(shard["bucket_id"].as_str().unwrap()).unwrap();
-    for &member in &members {
-        until("every member holds its replica", || async {
-            cluster.shard(member).await["source"] == "replica"
-        })
-        .await;
-    }
+    let mut cluster = Cluster::start("").await;
+    let Placed {
+        primary,
+        members,
+        bucket_id,
+    } = cluster.create_bucket().await;
 
     // The large object is coded, as 2+1 on three of the four nodes; the
     // small one stays replicated.
@@ -456,6 +508,93 @@ async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
         cluster.nodes[down] = Some(node);
     }
     assert!(parity_reads > 0.0, "no read decoded around a node down");
+
+    for node in cluster.nodes.iter_mut().filter_map(Option::take) {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_holder_is_emptied_and_a_lost_one_repaired() {
+    let mut cluster = Cluster::start(REPAIR).await;
+    let Placed { primary, .. } = cluster.create_bucket().await;
+    let admin = cluster.admin(primary);
+    let large = support::body(4, LARGE);
+    put(&cluster.client(primary), "large", &large).await;
+    until("the large object is coded on three nodes", || async {
+        cluster.total("skys3_encoded_objects_total").await >= 1.0
+            && cluster.unreleased_holders().await.len() == 3
+    })
+    .await;
+    let holders = cluster.unreleased_holders().await;
+    let outside = (0..4).find(|i| !holders.contains(i)).unwrap();
+    assert_eq!(cluster.fragments(outside).await, (0, 0));
+
+    // Draining a holder that does not lead moves its fragment to the node
+    // outside the stripe, the only one eligible, and the drained node
+    // reports no fragment a layout names.
+    let drained = *holders.iter().find(|i| **i != primary).unwrap();
+    let name = &cluster.names[drained];
+    let path = format!("/v1/nodes/{name}/drain");
+    let (status, _) = http_send(&cluster.admin(outside), "POST", &path, "")
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    until("the drained node holds no unreleased fragment", || async {
+        cluster.fragments(drained).await.1 == 0
+    })
+    .await;
+    assert_eq!(metric(&admin, "skys3_moved_fragments_total").await, 1.0);
+    assert!(metric(&admin, "skys3_repair_bytes_total").await >= LARGE as f64);
+    assert_eq!(cluster.fragments(outside).await.1, 1);
+    let parity = "skys3_fragment_reads_total{fragment=\"parity\",outcome=\"read\"}";
+    for i in 0..4 {
+        assert!(reads(&cluster.client(i), "large", &large).await);
+    }
+    assert_eq!(cluster.total(parity).await, 0.0, "a read decoded");
+    let (status, _) = http_send(&cluster.admin(outside), "DELETE", &path, "")
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+
+    // A holder that does not lead is lost for good: once it has left the
+    // checks unanswered for 2 s, the primary counts its fragment lost and
+    // rebuilds it on the survivors, the drained node now among them.
+    let holders = cluster.unreleased_holders().await;
+    assert_eq!(holders.len(), 3);
+    let lost = *holders.iter().find(|i| **i != primary).unwrap();
+    cluster.nodes[lost]
+        .take()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    // The loss is counted while the rebuild waits for the bandwidth cap.
+    let counted = std::sync::Mutex::new(0.0_f64);
+    until("the lost fragment is rebuilt", || async {
+        let unrepaired = metric(&admin, "skys3_unrepaired_fragments").await;
+        let repaired = metric(&admin, "skys3_repaired_fragments_total").await;
+        let mut counted = counted.lock().unwrap();
+        *counted = counted.max(unrepaired);
+        repaired >= 1.0
+    })
+    .await;
+    assert_eq!(*counted.lock().unwrap(), 1.0, "the loss was never counted");
+    until("nothing is left to repair", || async {
+        cluster.total("skys3_unrepaired_fragments").await == 0.0
+            && cluster.total("skys3_oldest_unrepaired_age_seconds").await == 0.0
+    })
+    .await;
+    assert_eq!(
+        metric(&admin, "skys3_repair_duration_seconds_count").await,
+        1.0
+    );
+    let survivors: Vec<usize> = cluster.running().collect();
+    assert_eq!(cluster.unreleased_holders().await, survivors);
+    for &i in &survivors {
+        assert!(reads(&cluster.client(i), "large", &large).await);
+    }
+    assert_eq!(cluster.total(parity).await, 0.0, "a read decoded");
 
     for node in cluster.nodes.iter_mut().filter_map(Option::take) {
         node.shutdown().await.unwrap();

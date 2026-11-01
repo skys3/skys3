@@ -21,7 +21,8 @@
 //!   state, handoffs, and drains (plan M8-06).
 //! - [`coding`]: with `[ec] enabled = true`, erasure coding: the fragment
 //!   stores and their server, the encoders, coded reads, fragment release,
-//!   and orphan reclamation (design §8, plan M8-07a).
+//!   orphan reclamation, repair, and fragment moves (design §8, plans
+//!   M8-07a and M8-07b).
 //!
 //! All but the first two run only with `[cluster] multi_node = true`
 //! ([`ClusterServices`], [`replication::ClusterShards`]); without it, the
@@ -166,15 +167,18 @@ impl ClusterServices {
             ),
             replication: shards.replication().clone(),
             forwarded: shards.server().clone(),
-            coding,
+            coding: coding.clone(),
         };
-        let operations = Arc::new(ClusterOperations::new(
-            (node, config.cluster().cluster_id.clone()),
-            store.clone(),
-            coordinating.clone(),
-            shards.handoffs(),
-            transport.clone(),
-        ));
+        let operations = Arc::new(
+            ClusterOperations::new(
+                (node, config.cluster().cluster_id.clone()),
+                store.clone(),
+                coordinating.clone(),
+                shards.handoffs(),
+                transport.clone(),
+            )
+            .with_coding(coding),
+        );
         let profile = registration::profile(config, data_dir, advertise.clone(), pool).await?;
         let mut heartbeater = registration::heartbeater(config, store, transport, profile, clock);
         if coordinating.candidate {

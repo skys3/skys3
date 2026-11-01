@@ -43,3 +43,32 @@ tests:
       - eval_time: 20m
         alertname: SkyS3FlushRefused
         exp_alerts: []
+
+  # SkyS3FragmentsUnrepaired (plan M8-07b): a shard primary on node-1 finds
+  # a holder's fragments lost at minute 1 and cannot rebuild them, as when
+  # no eligible node has room, until a node joins after minute 80 and the
+  # repair commits; node-2 leads shards that lost nothing.
+  - interval: 1m
+    input_series:
+      - series: 'skys3_oldest_unrepaired_age_seconds{job="skys3",instance="node-1:7490"}'
+        values: '0 60+60x79 0x10'
+      - series: 'skys3_oldest_unrepaired_age_seconds{job="skys3",instance="node-2:7490"}'
+        values: '0x90'
+    alert_rule_test:
+      # Pending: the oldest loss passed an hour at minute 61.
+      - eval_time: 70m
+        alertname: SkyS3FragmentsUnrepaired
+        exp_alerts: []
+      - eval_time: 78m
+        alertname: SkyS3FragmentsUnrepaired
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Coded objects have had lost fragments unrepaired for over an hour."
+              description: "Degraded reads decode from the remaining fragments, but each further loss brings a stripe closer to unreadable (design sections 8.6 and 13)."
+              runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#fragment-repair
+      # Once the repair commits, the gauge falls back to 0 and the alert ends.
+      - eval_time: 82m
+        alertname: SkyS3FragmentsUnrepaired
+        exp_alerts: []

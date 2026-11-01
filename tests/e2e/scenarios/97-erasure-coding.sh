@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Erasure coding in the binary (plan M8-07a, design sections 8.2 to 8.5):
+# Erasure coding in the binary (plans M8-07a and M8-07b, design sections
+# 8.2 to 8.7):
 # nodes ec1 to ec4 of cluster ec, with `[cluster] multi_node = true` and
 # `[ec] enabled = true`, share the etcd control store over mutual TLS
 # (under the prefix `ec/`). A local bucket has one shard of 3 members, and
@@ -18,15 +19,29 @@
 #   killed in turn (`kill -9`), GET through another node returns the same
 #   SHA-256, decoded from the parity fragment where the killed node held a
 #   data fragment, as at least one of them did
-#   (`skys3_fragment_reads_total{fragment="parity"}`).
+#   (`skys3_fragment_reads_total{fragment="parity"}`);
+# - that draining a holder that does not lead (`POST /v1/nodes/<id>/drain`)
+#   moves its fragment to the node outside the stripe: the drained node's
+#   `GET /v1/cluster` reports no unreleased fragment, the primary counts
+#   the move (`skys3_moved_fragments_total`), and reads decode nothing;
+# - that once a holder that does not lead is lost for good (`kill -9`, not
+#   restarted), the primary counts its fragment lost
+#   (`skys3_unrepaired_fragments`) after `fragment_repair_after_seconds`
+#   (10), rebuilds it on the survivors (`skys3_repaired_fragments_total`,
+#   `skys3_repair_bytes_total`), and the backlog that
+#   `SkyS3FragmentsUnrepaired` reads clears
+#   (`skys3_oldest_unrepaired_age_seconds` back to 0); the three survivors
+#   then hold the stripe, and GET through each reads data fragments alone.
 #
 # The gateways keep no hot cache, so every GET reads fragments. Log
 # segments are 2 MiB, so the object's bytes fill closed segments that
 # compaction can remove, and checkpoints, which compaction follows, come
-# every second. It runs only over etcd (`# e2e: etcd`), beside the other
-# cluster scenarios, takes about 25 seconds, and uses the ports
-# E2E_PORT+50 to E2E_PORT+61, which only the single-node scenarios of the
-# file store use otherwise.
+# every second. Repairs and moves are paced at 8 MiB/s, so the rebuild of
+# an 8 MiB fragment (two read, one written) takes about 3 seconds, during
+# which its loss is counted. It runs only over etcd (`# e2e: etcd`),
+# beside the other cluster scenarios, takes about 50 seconds, and uses the
+# ports E2E_PORT+50 to E2E_PORT+61, which only the single-node scenarios
+# of the file store use otherwise.
 # e2e: etcd
 set -euo pipefail
 . "$E2E_HERE/lib.sh"
@@ -90,6 +105,8 @@ enabled = true
 min_eligible_nodes = 3
 parity_fragments = 1
 fragment_release_delay_seconds = 1
+fragment_repair_after_seconds = 10
+repair_bytes_per_second_per_node = 8388608
 
 [buckets.defaults]
 mode = "local"
@@ -256,7 +273,102 @@ for victim in $holding; do
 done
 [ "$decoded" -gt 0 ] || fail "no holder down held a data fragment: nothing was decoded"
 
+# --- A drained holder's fragment moves off it -----------------------------------
+
+# unreleased <node>: the fragments the node's stores hold that no primary
+# released, from its GET /v1/cluster.
+unreleased() { admin "$(admin_of "$1")" /v1/cluster | jq -er '.fragments.unreleased'; }
+# named: the running nodes holding fragments no primary released.
+named() {
+    local node
+    for node in $(cat "$work/running"); do
+        if [ "$(unreleased "$node")" -gt 0 ]; then
+            echo "$node"
+        fi
+    done
+}
+three() { [ "$(named | wc -l)" -eq 3 ]; }
+# drain <method> <node>: POST or DELETE /v1/nodes/<node>/drain on ec1.
+drain() {
+    curl -sS -o "$work/drain" -w '%{http_code}' --max-time 10 -X "$1" \
+        "http://$(admin_of ec1)/v1/nodes/$2/drain"
+}
+# more <a> <b>: whether number a is above b.
+more() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+
+# The holders the restarts left (a repair may have moved a fragment while
+# a holder was down), and the node outside the stripe.
+eventually 60 "three nodes hold the stripe" three
+drained= outside=
 for node in "${nodes[@]}"; do
+    if [ "$(unreleased "$node")" = 0 ]; then
+        outside=$node
+    elif [ "$node" != "$primary" ] && [ -z "$drained" ]; then
+        drained=$node
+    fi
+done
+moved=$(value "$primary" skys3_moved_fragments_total)
+parity_before=$(total "$parity")
+status=$(drain POST "$drained")
+[ "$status" = 200 ] || fail "POST /v1/nodes/$drained/drain answered $status: $(cat "$work/drain")"
+drained_at=$SECONDS
+emptied() { [ "$(unreleased "$drained")" = 0 ]; }
+eventually 60 "drained $drained holds no unreleased fragment" emptied
+[ "$(unreleased "$outside")" -gt 0 ] || fail "the fragment did not move to $outside"
+more "$(value "$primary" skys3_moved_fragments_total)" "$moved" ||
+    fail "the primary $primary counted no move"
+for node in "${nodes[@]}"; do
+    read_back "$node" || fail "GET through $node does not return the object after the drain"
+done
+[ "$(total "$parity")" = "$parity_before" ] || fail "a read decoded after the drain"
+log "drained $drained in $((SECONDS - drained_at)) s: its fragment moved to $outside, and reads decode nothing"
+status=$(drain DELETE "$drained")
+[ "$status" = 200 ] || fail "DELETE /v1/nodes/$drained/drain answered $status: $(cat "$work/drain")"
+
+# --- A holder lost for good is rebuilt on the survivors -------------------------
+
+victim=
+for node in $(named); do
+    if [ "$node" != "$primary" ]; then
+        victim=$node
+        break
+    fi
+done
+kill -KILL "$(cat "$E2E_DIR/$victim/pid")"
+wait "$(cat "$E2E_DIR/$victim/pid")" 2>/dev/null || true
+rm -f "$E2E_DIR/$victim/pid"
+lost_at=$SECONDS
+survivors=$(for node in "${nodes[@]}"; do [ "$node" = "$victim" ] || echo "$node"; done | paste -sd' ' -)
+echo "$survivors" >"$work/running"
+repaired=$(value "$primary" skys3_repaired_fragments_total)
+repair_bytes=$(value "$primary" skys3_repair_bytes_total)
+parity_before=$(total "$parity")
+# The primary counts the loss once the victim has left its checks
+# unanswered for 10 s, and until the rebuild's EC_RELOCATE commits and the
+# next pass finds nothing lost.
+counted_at= deadline=$((SECONDS + 90))
+until more "$(value "$primary" skys3_repaired_fragments_total)" "$repaired"; do
+    if [ -z "$counted_at" ] && more "$(value "$primary" skys3_unrepaired_fragments)" 0; then
+        counted_at=$SECONDS
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || fail "the primary $primary did not repair $victim's fragment within 90 s"
+    sleep 0.5
+done
+repaired_at=$SECONDS
+[ -n "$counted_at" ] || fail "the primary $primary never counted $victim's fragment lost"
+more "$(value "$primary" skys3_repair_bytes_total)" "$repair_bytes" || fail "the repair read and wrote nothing"
+cleared() {
+    [ "$(total skys3_unrepaired_fragments)" = 0 ] && [ "$(total skys3_oldest_unrepaired_age_seconds)" = 0 ]
+}
+eventually 30 "nothing is left to repair (SkyS3FragmentsUnrepaired clears)" cleared
+[ "$(named | paste -sd' ' -)" = "$survivors" ] || fail "the survivors do not hold the stripe: $(named | paste -sd' ' -)"
+for node in $survivors; do
+    read_back "$node" || fail "GET through $node does not return the object after the repair"
+done
+[ "$(total "$parity")" = "$parity_before" ] || fail "a read decoded after the repair"
+log "$victim lost: counted lost after $((counted_at - lost_at)) s, rebuilt on the survivors after $((repaired_at - lost_at)) s; reads decode nothing"
+
+for node in $survivors; do
     node_stop "$node"
 done
 log "the scenario took $((SECONDS - started)) s"
