@@ -6555,6 +6555,27 @@ of this file. A task with nothing unexpected keeps "None."
   origin keeps its stub until a later version replaces it; nothing
   removes stubs of keys the origin no longer has. There are no metrics
   of revalidations or forwarded listings.
+- **Fixed: an origin without `Last-Modified` defeated the cache.** Once
+  revalidation compared `Last-Modified`, an origin whose HEAD sends none
+  never matched: the reader stamps such an answer with its wall clock,
+  so every HEAD looked like a new version. Under `revalidate` every GET
+  committed an `ADOPT` and refilled the object, and concurrent GETs of a
+  hot key could supersede each other's `ADOPT`s until `503`; under `ttl`
+  the same on every expiry. `RemoteObject::last_modified_ms` now keeps
+  what the HEAD sent, `OriginVersion` holds that `Option`, and `serves`
+  skips the comparison without one. The fill's `ADOPT` keeps its clock
+  fallback, which `serves` now ignores. Tested in `tests/origin.rs`
+  (`an_origin_that_sends_no_last_modified_is_still_served_from_the_cache`,
+  under both modes).
+- **Fixed: a metadata change within the second was missed.**
+  `Last-Modified` has one-second resolution, so a copy onto itself with
+  new metadata in the second of the cached version kept its ETag and
+  `Last-Modified`, and the old `Content-Type` was served. `OriginVersion`
+  now holds the HEAD's metadata too, which `serves` compares exactly,
+  since an `ADOPT` stores it unchanged. Validations kept under a TTL
+  hold it as well (S3 allows 2 KB of user metadata per object). Tested in
+  `tests/origin.rs`
+  (`a_metadata_only_change_within_the_same_second_is_seen_by_the_next_read`).
 
 ## M5 Local erasure coding
 
