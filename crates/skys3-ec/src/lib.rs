@@ -62,6 +62,12 @@
 //!   fragments off nodes that are no longer eligible, out of failure
 //!   domains over their cap, and toward each node's share, one
 //!   `EC_RELOCATE` a fragment, after repairs on the bandwidth cap.
+//! - **Fragment release** ([`release`]): the fragments that writes and
+//!   relocations replace are released to their nodes by the shard primary
+//!   ([`Releaser`], `EC_RELEASE`), kept there for the release delay and
+//!   while reads hold them ([`FragmentHolds`]), then reclaimed, and
+//!   fragment-segment compaction gives their space back
+//!   ([`FragmentStore::compact`]).
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -89,6 +95,7 @@ pub mod orphans;
 pub mod read;
 mod reed_solomon;
 pub mod reindex;
+pub mod release;
 pub mod repair;
 mod store;
 mod transfer;
@@ -111,6 +118,10 @@ pub use read::{
 };
 pub use reed_solomon::ReedSolomonV1;
 pub use reindex::{HeaderError, HeaderSource, Reindexed, SnapshotState, reindex};
+pub use release::{
+    FragmentHolds, HoldSettings, ReleaseClient, ReleaseMetrics, ReleaseReport, ReleaseSettings,
+    ReleaseSink, ReleasedFragment, Releaser,
+};
 pub use repair::{
     RepairBandwidth, RepairError, RepairEvent, RepairMetrics, RepairObserver, RepairReport,
     RepairSettings, RepairStep, Repairer, Repairing,
@@ -122,8 +133,8 @@ pub use skys3_types::{
 #[doc(hidden)]
 pub use store::SeededBug;
 pub use store::{
-    FragmentError, FragmentRange, FragmentSegment, FragmentStore, FragmentStoreConfig,
-    RecoveryError, RecoveryReport, TornTail,
+    CompactionReport, FragmentError, FragmentRange, FragmentSegment, FragmentStore,
+    FragmentStoreConfig, RecoveryError, RecoveryReport, TornTail,
 };
 pub use transfer::{
     CHUNK_LEN, FragmentClient, FragmentServer, FragmentWrite, FragmentWriter, FragmentWritten,

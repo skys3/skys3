@@ -41,8 +41,10 @@ use crate::tables::{
 /// to fragments, and the attempt numbers a primary reserved (§8.4); an
 /// older build could not read a coded entry, and could reuse an attempt
 /// number. Version 10 adds each shard's import progress (§9.1); an older
-/// build would apply a late `IMPORT` over a removed tombstone.
-pub const FORMAT_VERSION: u64 = 10;
+/// build would apply a late `IMPORT` over a removed tombstone. Version 11
+/// adds each shard's index of released fragments (§8.7); an older build
+/// would never release them.
+pub const FORMAT_VERSION: u64 = 11;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -258,6 +260,7 @@ impl Index {
             txn.open_table(tables::FRAGMENTS)?;
             txn.open_table(tables::ATTEMPTS)?;
             txn.open_table(tables::IMPORT_PROGRESS)?;
+            txn.open_table(tables::RELEASED)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -478,6 +481,7 @@ impl Index {
                 tables::ShardTable::RemoteParts => tables::REMOTE_PARTS,
                 tables::ShardTable::Fragments => tables::FRAGMENTS,
                 tables::ShardTable::ImportProgress => tables::IMPORT_PROGRESS,
+                tables::ShardTable::Released => tables::RELEASED,
             };
             let mut table = txn.open_table(definition)?;
             for (key, value) in rows {

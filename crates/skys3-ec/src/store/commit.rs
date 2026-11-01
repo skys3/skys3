@@ -1,5 +1,6 @@
 //! The fragment committer: one task per disk that writes queued fragments,
-//! syncs them, and only then acknowledges them (§10.4).
+//! and the copies fragment-segment compaction makes, syncs them, and only
+//! then acknowledges them (§10.4).
 
 use std::io;
 use std::sync::Arc;
@@ -20,19 +21,53 @@ pub(crate) const MAX_SEGMENT: u64 = (1 << 56) - 1;
 /// it, or the error that took the disk out of service.
 pub(crate) type Reply = Result<FragmentId, Arc<io::Error>>;
 
-/// One fragment waiting for a group commit: its header after the fixed
-/// header ([`encode_tail`](crate::fragment::encode_tail)) and its payload.
+/// One record waiting for a group commit, and whom to tell once it is
+/// durable.
 #[derive(Debug)]
 pub(crate) struct Request {
-    pub(crate) tail: Vec<u8>,
-    pub(crate) payload: Bytes,
+    pub(crate) record: Record,
     pub(crate) reply: oneshot::Sender<Reply>,
+}
+
+/// What a [`Request`] appends.
+#[derive(Debug)]
+pub(crate) enum Record {
+    /// A new fragment: its header after the fixed header
+    /// ([`encode_tail`](crate::fragment::encode_tail)) and its payload. It
+    /// gets a new ID.
+    Fragment { tail: Vec<u8>, payload: Bytes },
+    /// A copy of fragment `id`'s record, byte for byte, which compaction
+    /// moves out of the segment at `from` (§10.3). Once durable, it
+    /// becomes the fragment's location if the map still locates the
+    /// fragment at `from`: a fragment reclaimed meanwhile stays reclaimed,
+    /// and its copy is dead.
+    Copy {
+        id: FragmentId,
+        bytes: Bytes,
+        from: Located,
+    },
 }
 
 impl Request {
     fn record_len(&self) -> u64 {
-        (FIXED_LEN + self.tail.len()) as u64 + self.payload.len() as u64
+        match &self.record {
+            Record::Fragment { tail, payload } => {
+                (FIXED_LEN + tail.len()) as u64 + payload.len() as u64
+            }
+            Record::Copy { bytes, .. } => bytes.len() as u64,
+        }
     }
+}
+
+/// Where a group commit put one record.
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    Fragment(FragmentId, Located),
+    Copy {
+        id: FragmentId,
+        from: Located,
+        to: Located,
+    },
 }
 
 /// The segment fragments are appended to.
@@ -133,17 +168,34 @@ impl<D: Disk> Committer<D> {
         let mut end = active.len;
         let mut placed = Vec::with_capacity(group.len());
         for request in group.iter() {
-            let id = compose_id(self.config.disk, active.id, end);
-            let header = seal(id, request.payload.len() as u64, &request.tail);
-            let located = Located {
-                segment: active.id,
-                offset: end,
-                header_len: header.len() as u32,
-                payload_len: request.payload.len() as u64,
-            };
-            end = append(active.file.as_ref(), header.into(), end).await?;
-            end = append(active.file.as_ref(), request.payload.clone(), end).await?;
-            placed.push((id, located));
+            match &request.record {
+                Record::Fragment { tail, payload } => {
+                    let id = compose_id(self.config.disk, active.id, end);
+                    let header = seal(id, payload.len() as u64, tail);
+                    let located = Located {
+                        segment: active.id,
+                        offset: end,
+                        header_len: header.len() as u32,
+                        payload_len: payload.len() as u64,
+                    };
+                    end = append(active.file.as_ref(), header.into(), end).await?;
+                    end = append(active.file.as_ref(), payload.clone(), end).await?;
+                    placed.push(Placed::Fragment(id, located));
+                }
+                Record::Copy { id, bytes, from } => {
+                    let to = Located {
+                        segment: active.id,
+                        offset: end,
+                        ..*from
+                    };
+                    end = append(active.file.as_ref(), bytes.clone(), end).await?;
+                    placed.push(Placed::Copy {
+                        id: *id,
+                        from: *from,
+                        to,
+                    });
+                }
+            }
         }
         if self.bugs.acknowledge_before_sync {
             self.acknowledge(group, &placed);
@@ -160,14 +212,24 @@ impl<D: Disk> Committer<D> {
         Ok(())
     }
 
-    /// Records the fragments of `group` in the fragment map, then answers
-    /// their writers.
-    fn acknowledge(&self, group: &mut Vec<Request>, placed: &[(FragmentId, Located)]) {
-        self.shared.insert(placed.iter().copied());
-        for (request, (id, _)) in group.drain(..).zip(placed) {
-            // The writer may have stopped waiting; the fragment is durable
+    /// Records the fragments of `group` in the fragment map, and moves the
+    /// copied ones that are still where compaction found them, then
+    /// answers their writers.
+    fn acknowledge(&self, group: &mut Vec<Request>, placed: &[Placed]) {
+        for (request, placed) in group.drain(..).zip(placed) {
+            let id = match *placed {
+                Placed::Fragment(id, located) => {
+                    self.shared.insert([(id, located)]);
+                    id
+                }
+                Placed::Copy { id, from, to } => {
+                    self.shared.relocate(id, from, to);
+                    id
+                }
+            };
+            // The writer may have stopped waiting; the record is durable
             // either way.
-            let _ = request.reply.send(Ok(*id));
+            let _ = request.reply.send(Ok(id));
         }
     }
 

@@ -63,7 +63,7 @@
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
 //! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], [`EcRelocate`],
-//! `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the
+//! [`EcRelease`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the
 //! bucket, shard, and epoch the fixed header holds, `TRUNCATE`, which has
 //! no fields, and [`ImportProgress`]):
 //!
@@ -126,7 +126,9 @@ pub use body::{
     MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
     Tags, UploadBegin,
 };
-pub use coding::{EcPublish, EcRelocate, FragmentMove, MAX_MOVES, MAX_STRIPES};
+pub use coding::{
+    EcPublish, EcRelease, EcRelocate, FragmentMove, MAX_MOVES, MAX_RELEASED, MAX_STRIPES,
+};
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
 pub use multipart::{

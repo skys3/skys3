@@ -1,12 +1,13 @@
 //! Coded versions in the index (§8.4): their layouts, the per-shard index
 //! from node to fragments, what names their replicated bytes, and attempt
-//! numbers.
+//! numbers, and the index of released fragments (§8.7).
 
 use std::collections::BTreeMap;
 
 use skys3_index::codec::{self, FragmentKey};
 use skys3_index::{
-    Coded, Entry, EntryState, Holder, Index, IndexConfig, ObjectVersion, Payload, ShardTable,
+    Coded, Entry, EntryState, Holder, Index, IndexConfig, ObjectVersion, Payload, Released,
+    ShardTable,
 };
 use skys3_io::SimDisk;
 use skys3_log::record::{ExtentRef, ShardRef};
@@ -304,4 +305,141 @@ fn attempt_numbers_are_never_reserved_twice() {
     assert_eq!(index.reserve_attempts(&shard(1), 1).unwrap(), 32..33);
     assert!(index.reserve_attempts(&shard(1), u64::MAX).is_err());
     assert_eq!(index.reserve_attempts(&shard(1), 1).unwrap(), 33..34);
+}
+
+#[test]
+fn released_rows_round_trip_and_sort_by_node_and_id() {
+    let id = FragmentId::new(1 << 70 | 5);
+    let key = codec::released_key(&shard(2), &node(7), id);
+    assert!(key.starts_with(&codec::fragment_node_prefix(&shard(2), &node(7))));
+    let location = FragmentLocation {
+        node: node(7),
+        fragment: id,
+    };
+    assert_eq!(
+        codec::decode_released_key(&key).unwrap(),
+        (shard(2), location)
+    );
+    // Big-endian IDs sort numerically.
+    assert!(
+        codec::released_key(&shard(2), &node(7), FragmentId::new(255))
+            < codec::released_key(&shard(2), &node(7), FragmentId::new(256))
+    );
+    let released = Released {
+        key: "a/b".into(),
+        version: position(3),
+        stripe: 70_000,
+        index: 4,
+    };
+    let value = codec::encode_released(&released).unwrap();
+    assert_eq!(value[0], codec::VALUE_FORMAT);
+    assert_eq!(codec::decode_released(&value).unwrap(), released);
+
+    // Malformed keys and values are refused.
+    for bad in [
+        Vec::new(),
+        key[..key.len() - 1].to_vec(),
+        [key.as_slice(), &[0]].concat(),
+    ] {
+        assert!(codec::decode_released_key(&bad).is_err(), "{bad:?}");
+    }
+    let empty = Released {
+        key: String::new(),
+        ..released.clone()
+    };
+    assert!(codec::encode_released(&empty).is_err());
+    let mut no_key = vec![codec::VALUE_FORMAT, 0, 0];
+    no_key.extend_from_slice(&[0; 16]);
+    assert!(codec::decode_released(&no_key).is_err());
+    assert!(codec::decode_released(&value[..10]).is_err());
+    assert!(codec::decode_released(&[[3].as_slice(), &value[1..]].concat()).is_err());
+    assert!(codec::decode_released(&[value.as_slice(), &[0]].concat()).is_err());
+}
+
+#[test]
+fn released_fragments_wait_until_an_ec_release_removes_them() {
+    let disk = SimDisk::new(4);
+    let index = open(&disk);
+    let (one, two) = (shard(1), shard(2));
+    let moved = FragmentLocation {
+        node: node(9),
+        fragment: FragmentId::new(7),
+    };
+    index
+        .update_durable(|writer| {
+            writer.release_fragments(&one, "k", &coded(100))?;
+            let other = Released {
+                key: "other".into(),
+                version: position(5),
+                stripe: 1,
+                index: 2,
+            };
+            writer.release_fragment(&one, &other, &moved)?;
+            writer.release_fragments(&two, "k", &coded(200))
+        })
+        .unwrap();
+    let reader = index.read().unwrap();
+    let all = reader.released(&one, None, usize::MAX).unwrap();
+    assert_eq!(all.len(), 7);
+    // In node and then ID order, each with the key and version it names.
+    let order: Vec<(String, u128)> = all
+        .iter()
+        .map(|(location, _)| (location.node.to_string(), location.fragment.get()))
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted);
+    let named = |key: &str, seq, stripe, index| Released {
+        key: key.into(),
+        version: position(seq),
+        stripe,
+        index,
+    };
+    assert_eq!(all[0].1, named("k", 3, 0, 0));
+    assert_eq!(all[6], (moved.clone(), named("other", 5, 1, 2)));
+    // Pages follow on from where the last ended.
+    let first = reader.released(&one, None, 3).unwrap();
+    let rest = reader.released(&one, Some(&first[2].0), 10).unwrap();
+    assert_eq!([first, rest].concat(), all);
+    assert_eq!(reader.dump().unwrap().released.len(), 13);
+
+    // A snapshot carries them, and a learner checks their shard.
+    let rows = reader
+        .shard_rows(ShardTable::Released, &one, None, usize::MAX)
+        .unwrap();
+    assert_eq!(rows.len(), 7);
+    assert_eq!(
+        ShardTable::from_code(ShardTable::Released.code()),
+        Some(ShardTable::Released)
+    );
+    let learner = open(&SimDisk::new(5));
+    learner
+        .install_rows(&one, ShardTable::Released, &rows)
+        .unwrap();
+    assert_eq!(
+        learner.read().unwrap().released(&one, None, 100).unwrap(),
+        all
+    );
+    assert!(
+        learner
+            .install_rows(&two, ShardTable::Released, &rows)
+            .is_err()
+    );
+    drop(reader);
+
+    // An EC_RELEASE removes only what the index holds for its key.
+    let locations: Vec<FragmentLocation> =
+        all.iter().map(|(location, _)| location.clone()).collect();
+    let removed = index
+        .update_durable(|writer| writer.unrelease(&one, "k", &locations))
+        .unwrap();
+    assert_eq!(removed, 6);
+    let left = index.read().unwrap().released(&one, None, 100).unwrap();
+    assert_eq!(left, vec![(moved, named("other", 5, 1, 2))]);
+    let again = index
+        .update_durable(|writer| writer.unrelease(&one, "k", &locations))
+        .unwrap();
+    assert_eq!(again, 0);
+    index.remove_shard(&two).unwrap();
+    assert_eq!(index.read().unwrap().dump().unwrap().released.len(), 1);
 }

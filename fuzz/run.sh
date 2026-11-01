@@ -80,6 +80,11 @@ case "$target" in
   # A peer descriptor with its certificate chain of up to four certificates.
   peer_descriptor)
     max_len=16384 ;;
+  # A fragment release of 256 fragments with one-byte keys is about 7 KiB,
+  # so the fuzzer reaches both sides of `MAX_RELEASES`. A hold over
+  # `MAX_HOLDS` (4,096 IDs, about 74 KiB) is left to the unit tests.
+  ec_release)
+    max_len=8192 ;;
 esac
 
 corpus="corpus/$target"

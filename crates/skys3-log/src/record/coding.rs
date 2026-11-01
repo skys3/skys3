@@ -1,6 +1,8 @@
 //! The bodies of `EC_PUBLISH`, which publishes an object version's
-//! erasure-coded layout (§8.4), and `EC_RELOCATE`, which moves fragments
-//! of that layout to new locations (§8.6).
+//! erasure-coded layout (§8.4), `EC_RELOCATE`, which moves fragments of
+//! that layout to new locations (§8.6), and `EC_RELEASE`, which records
+//! that the nodes holding fragments a write or a relocation replaced were
+//! told to release them (§8.7).
 //!
 //! `EC_PUBLISH` names the version it encodes by the position of the record
 //! that committed it and its ETag, the attempt that wrote the fragments,
@@ -16,6 +18,10 @@
 //! wrote the new fragments, then each move, in order of stripe and index:
 //! the stripe's number (`u32`), the fragment's index (`u8`), and the old
 //! and the new location, each encoded as a stripe's fragments are.
+//!
+//! `EC_RELEASE` names the key whose fragments it releases, then a `u32`
+//! count and each fragment's location, encoded as a stripe's fragments
+//! are, in strictly increasing order of node and then fragment ID.
 
 use skys3_types::{
     AttemptId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, Geometry,
@@ -34,6 +40,9 @@ pub const MAX_STRIPES: usize = 1 << 16;
 
 /// The most fragments one `EC_RELOCATE` moves.
 pub const MAX_MOVES: usize = 1 << 16;
+
+/// The most fragments one `EC_RELEASE` releases.
+pub const MAX_RELEASED: usize = 1 << 16;
 
 /// The fewest bytes an encoded stripe takes: its length, geometry, and
 /// codec, and two fragments with one-byte node IDs.
@@ -221,6 +230,65 @@ impl EcRelocate {
             attempt,
             moves,
         })
+    }
+}
+
+/// Records that the nodes holding fragments of `key` that a write or an
+/// `EC_RELOCATE` replaced were told to release them: `EC_RELEASE` (§8.7).
+///
+/// Applying a write that replaces a coded version, or an `EC_RELOCATE`,
+/// keeps the fragments it leaves behind in the shard's index of released
+/// fragments. The primary tells each node to release them, and once a
+/// node has answered, or is gone from the cluster, commits this record,
+/// which removes them from that index. A record naming a fragment the
+/// index does not hold for the key changes nothing for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcRelease {
+    /// The object key whose fragments are released.
+    pub key: String,
+    /// The fragments, by node and ID, in strictly increasing order.
+    pub fragments: Vec<FragmentLocation>,
+}
+
+impl EcRelease {
+    pub(super) fn encode(&self, w: &mut Writer<'_>) -> Result<(), FieldError> {
+        w.str16("ec_release.key", &self.key, 1, MAX_KEY_LEN)?;
+        w.len32(
+            "ec_release.fragments",
+            self.fragments.len(),
+            1,
+            MAX_RELEASED,
+        )?;
+        check_ascending(&self.fragments)?;
+        for location in &self.fragments {
+            write_location(w, "ec_release.node", location)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn decode(r: &mut Reader<'_>) -> Result<Self, FieldError> {
+        let key = r.str16("ec_release.key", 1, MAX_KEY_LEN)?;
+        let count = r.len32("ec_release.fragments", 1, MAX_RELEASED)?;
+        r.check_count("ec_release.fragments", count, LOCATION_MIN_LEN)?;
+        let mut fragments = Vec::with_capacity(count);
+        for _ in 0..count {
+            fragments.push(read_location(r, "ec_release.node", "ec_release.fragment")?);
+        }
+        check_ascending(&fragments)?;
+        Ok(Self { key, fragments })
+    }
+}
+
+/// Checks that `fragments` are in strictly increasing order, so each is
+/// named once and the record has one encoding.
+fn check_ascending(fragments: &[FragmentLocation]) -> Result<(), FieldError> {
+    if fragments.windows(2).all(|pair| pair[0] < pair[1]) {
+        Ok(())
+    } else {
+        Err(FieldError::new(
+            "ec_release.fragments",
+            Problem::Inconsistent("fragments are not in increasing order, once each"),
+        ))
     }
 }
 

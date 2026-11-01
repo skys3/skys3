@@ -61,6 +61,16 @@ pub enum MessageKind {
     /// [`MessageKind::FragmentRead`] with their CRC32C, or why the node
     /// does not serve them.
     FragmentData = 12,
+    /// Shard primary to fragment node: fragments that writes or
+    /// relocations replaced, which the node keeps for the release delay
+    /// and while reads hold them, then reclaims (§8.7).
+    FragmentRelease = 13,
+    /// Gateway to fragment node: register, renew, or end a read's hold on
+    /// the fragments its plan names, so they stay while it streams (§8.7).
+    FragmentHold = 14,
+    /// Fragment node to shard primary or gateway: the answer to a
+    /// [`MessageKind::FragmentRelease`] or [`MessageKind::FragmentHold`].
+    FragmentNoted = 15,
 
     /// Primary to member or learner: a lease beacon sent at a primary-local
     /// time, carrying the commit watermark as a heartbeat (§5.4).
@@ -95,8 +105,8 @@ pub enum MessageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageClass {
     /// Log replication, reconciliation, and backfill (§5.1, §6.4, §6.6),
-    /// and the fragment writes, orphan queries, and fragment reads of
-    /// erasure coding (§8.4, §8.5).
+    /// and the fragment writes, orphan queries, fragment reads, releases,
+    /// and holds of erasure coding (§8.4, §8.5, §8.7).
     Replication,
     /// Leases and planned handoff (§5.4).
     Lease,
@@ -124,7 +134,10 @@ impl MessageKind {
             | Self::OrphanQuery
             | Self::OrphanVerdicts
             | Self::FragmentRead
-            | Self::FragmentData => MessageClass::Replication,
+            | Self::FragmentData
+            | Self::FragmentRelease
+            | Self::FragmentHold
+            | Self::FragmentNoted => MessageClass::Replication,
             Self::Beacon | Self::BeaconAck | Self::StepDown => MessageClass::Lease,
             Self::Forward | Self::ForwardReply => MessageClass::Request,
             Self::NodeHeartbeat | Self::ControlChanged | Self::Handoff | Self::AdminReply => {
@@ -163,7 +176,7 @@ impl Role {
 mod tests {
     use super::*;
 
-    const ALL: [MessageKind; 22] = [
+    const ALL: [MessageKind; 25] = [
         MessageKind::Unspecified,
         MessageKind::Append,
         MessageKind::AppendAck,
@@ -177,6 +190,9 @@ mod tests {
         MessageKind::OrphanVerdicts,
         MessageKind::FragmentRead,
         MessageKind::FragmentData,
+        MessageKind::FragmentRelease,
+        MessageKind::FragmentHold,
+        MessageKind::FragmentNoted,
         MessageKind::Beacon,
         MessageKind::BeaconAck,
         MessageKind::StepDown,
@@ -203,7 +219,7 @@ mod tests {
             assert_eq!(kind.class(), expected, "{kind:?}");
             assert_eq!(MessageKind::try_from(kind as i32), Ok(kind));
         }
-        assert!(MessageKind::try_from(13).is_err());
+        assert!(MessageKind::try_from(19).is_err());
     }
 
     #[test]

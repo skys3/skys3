@@ -12,7 +12,7 @@ use skys3_types::{FragmentId, NodeId};
 
 use super::wire::MAX_SUSPECTS;
 use super::{OrphanConfirmer, Suspect, Verdict};
-use crate::FragmentStore;
+use crate::{FragmentHolds, FragmentStore};
 
 /// A fragment the reclaimer reclaimed, as an observer sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,8 @@ pub type ReclaimObserver = Arc<dyn Fn(&Reclaimed) + Send + Sync>;
 pub struct SweepReport {
     /// Fragments asked about.
     pub asked: usize,
-    /// Fragments reclaimed as orphans.
+    /// Fragments reclaimed as orphans, or released to the node's holds,
+    /// which reclaim them once no read needs them.
     pub reclaimed: usize,
     /// Fragments a committed layout references, kept for this life.
     pub referenced: usize,
@@ -55,6 +56,13 @@ enum Seen {
     Referenced,
 }
 
+/// What the reclaimer does with an orphan: reclaim it at once, or release
+/// it to the node's holds (§8.7).
+enum Reclaim {
+    Now,
+    Release(FragmentHolds),
+}
+
 /// A fragment node's orphan reclamation (§8.4): it sweeps the node's
 /// fragment stores, asks the primaries of the fragments' shards about
 /// those it has held for `orphan_after`, and reclaims the orphans.
@@ -70,6 +78,7 @@ pub struct OrphanReclaimer<D: Disk, C: OrphanConfirmer> {
     orphan_after: Duration,
     seen: Mutex<HashMap<FragmentId, Seen>>,
     observer: Option<ReclaimObserver>,
+    reclaim: Reclaim,
 }
 
 impl<D: Disk, C: OrphanConfirmer> OrphanReclaimer<D, C> {
@@ -92,7 +101,18 @@ impl<D: Disk, C: OrphanConfirmer> OrphanReclaimer<D, C> {
             orphan_after,
             seen: Mutex::default(),
             observer: None,
+            reclaim: Reclaim::Now,
         }
+    }
+
+    /// Releases orphans to `holds`, the node's released fragments,
+    /// instead of reclaiming them at once, so a read that still holds one
+    /// keeps it, as for a fragment its primary released (§8.7). The
+    /// reclaimer then no longer asks about fragments `holds` has released.
+    #[must_use]
+    pub fn with_holds(mut self, holds: FragmentHolds) -> Self {
+        self.reclaim = Reclaim::Release(holds);
+        self
     }
 
     /// Reports every fragment reclaimed to `observer`.
@@ -145,8 +165,15 @@ impl<D: Disk, C: OrphanConfirmer> OrphanReclaimer<D, C> {
         let mut seen = self.seen();
         let mut held = HashMap::with_capacity(seen.len());
         let mut due = Vec::new();
+        let released = |id| match &self.reclaim {
+            Reclaim::Release(holds) => holds.is_released(id),
+            Reclaim::Now => false,
+        };
         for (store, fragments) in self.stores.iter().enumerate() {
             for id in fragments.ids() {
+                if released(id) {
+                    continue;
+                }
                 let state = *seen.entry(id).or_insert(Seen::Since(now));
                 if let Seen::Since(since) = state
                     && now.saturating_duration_since(since) >= self.orphan_after
@@ -184,10 +211,19 @@ impl<D: Disk, C: OrphanConfirmer> OrphanReclaimer<D, C> {
                     self.seen().insert(suspect.id, Seen::Since(now));
                 }
                 Verdict::Orphan => {
-                    // An error leaves a removable segment behind, and the
-                    // fragment reclaimed all the same.
-                    if let Err(error) = self.stores[*store].reclaim(suspect.id).await {
-                        tracing::warn!(id = %suspect.id, %error, "a reclaimed segment stays");
+                    let store = &self.stores[*store];
+                    match &self.reclaim {
+                        Reclaim::Release(holds) => {
+                            let bytes = store.len(suspect.id).unwrap_or(0);
+                            holds.release(suspect.id, bytes);
+                        }
+                        // An error leaves a removable segment behind, and
+                        // the fragment reclaimed all the same.
+                        Reclaim::Now => {
+                            if let Err(error) = store.reclaim(suspect.id).await {
+                                tracing::warn!(id = %suspect.id, %error, "a reclaimed segment stays");
+                            }
+                        }
                     }
                     report.reclaimed += 1;
                     self.seen().remove(&suspect.id);

@@ -4,16 +4,20 @@
 //! gateway                                            fragment node
 //!   FragmentRead(fragment, identity, range)      ->
 //!                                                <-  FragmentData(crc32c | failure) + bytes
+//!   FragmentHold(registration, fragments)        ->
+//!                                                <-  FragmentNoted(counts | error)
 //!   FragmentRead ...                             ->
 //! ```
 //!
-//! The request is a `prost` body in the frame header; the answer's body
-//! carries the CRC32C of the bytes, which are its payload, or why the node
-//! does not serve them. Requests and answers pair by the header's request
-//! ID. A connection carries one read at a time, and the client keeps
-//! connections open for its next reads of the node. Mutual TLS names
-//! both ends, as for fragment writes, so an admin certificate cannot read
-//! fragments.
+//! A read's request is a `prost` body in the frame header; the answer's
+//! body carries the CRC32C of the bytes, which are its payload, or why the
+//! node does not serve them. A read's hold on the fragments it may fetch
+//! (§8.7, [`release`](crate::release)) travels on the same connections,
+//! its bodies in the payloads. Requests and answers pair by the header's
+//! request ID. A connection carries one request at a time, and the client
+//! keeps connections open for its next requests to the node. Mutual TLS
+//! names both ends, as for fragment writes, so an admin certificate cannot
+//! read or hold fragments.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -35,9 +39,11 @@ use skys3_types::{
 use tokio::time::Instant;
 
 use super::{
-    FragmentBytes, FragmentIdentity, FragmentReadError, FragmentRequest, FragmentSource, ReadFuture,
+    FragmentBytes, FragmentIdentity, FragmentReadError, FragmentRequest, FragmentSource,
+    HoldFuture, ReadFuture,
 };
 use crate::fragment::StripeInfo;
+use crate::release::{FragmentHold, FragmentNoted, MAX_HOLDS};
 use crate::{FragmentError, FragmentServer, FragmentStore};
 
 /// The most bytes one fragment read asks for.
@@ -276,6 +282,9 @@ struct ClientInner<N: Network, D: Disk> {
     local: Option<FragmentServer<D>>,
     idle: Mutex<Idle<N::Stream>>,
     next_request: AtomicU64,
+    /// How often a read renews its hold, if reads take holds.
+    renew: Option<Duration>,
+    next_registration: AtomicU64,
 }
 
 impl<N: Network, D: Disk> Clone for FragmentReadClient<N, D> {
@@ -311,8 +320,25 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
                 local: None,
                 idle: Mutex::default(),
                 next_request: AtomicU64::new(1),
+                renew: None,
+                next_registration: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// Makes every coded read through the client hold the fragments it may
+    /// fetch, renewing the hold every `renew`
+    /// (`read_registration_renew_interval_seconds`) while it streams (§8.7).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a clone of the client exists already.
+    #[must_use]
+    pub fn with_holds(mut self, renew: Duration) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the client is not shared yet")
+            .renew = Some(renew);
+        self
     }
 
     /// Reads this node's own fragments from `server` without a connection.
@@ -335,20 +361,65 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
             node: node.clone(),
             reason,
         };
-        let mut connection = self.connection(node).await.map_err(unreachable)?;
-        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
         let head = Header::new(MessageKind::FragmentRead)
-            .with_request_id(id)
             .with_body(FragmentRead::new(request).encode_to_vec());
+        let answer = self
+            .exchange(node, head, Bytes::new(), MessageKind::FragmentData)
+            .await
+            .map_err(unreachable)?;
+        let data = FragmentData::decode(answer.header.body.as_ref())
+            .map_err(|e| unreachable(format!("a malformed answer: {e}")))?;
+        data.parse(node, answer.payload)
+    }
+
+    /// Sends `node` the hold of read `registration` on `fragments`, or its
+    /// end, over the transport.
+    async fn ask_hold(
+        &self,
+        node: &NodeId,
+        registration: u64,
+        fragments: &[FragmentId],
+        end: bool,
+    ) -> Result<(), String> {
+        let chunks: Vec<&[FragmentId]> = if end || fragments.is_empty() {
+            vec![&[]]
+        } else {
+            fragments.chunks(MAX_HOLDS).collect()
+        };
+        for chunk in chunks {
+            let body = FragmentHold::new(registration, chunk, end).encode_to_vec();
+            let head = Header::new(MessageKind::FragmentHold);
+            let answer = self
+                .exchange(node, head, body.into(), MessageKind::FragmentNoted)
+                .await?;
+            FragmentNoted::decode(answer.payload.as_ref())
+                .map_err(|e| format!("a malformed answer: {e}"))?
+                .parse()?;
+        }
+        Ok(())
+    }
+
+    /// Sends `node` a request with header `head`, given a request ID here,
+    /// and `payload`, and returns its answer, which must be of `kind`. The
+    /// connection is kept for the next request once the answer came.
+    async fn exchange(
+        &self,
+        node: &NodeId,
+        head: Header,
+        payload: Bytes,
+        kind: MessageKind,
+    ) -> Result<Frame, String> {
+        let mut connection = self.connection(node).await?;
+        let id = self.inner.next_request.fetch_add(1, Ordering::Relaxed);
+        let head = head.with_request_id(id);
         let exchange = async {
             connection
-                .send(&Frame::new(head, Bytes::new()))
+                .send(&Frame::new(head, payload))
                 .await
                 .map_err(|e| e.to_string())?;
             match connection.recv().await {
                 Ok(Some(answer))
-                    if answer.header.kind == MessageKind::FragmentData
-                        && answer.header.request_id == id =>
+                    if answer.header.kind == kind && answer.header.request_id == id =>
                 {
                     Ok(answer)
                 }
@@ -358,14 +429,11 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
             }
         };
         let answer = match tokio::time::timeout(ANSWER_TIMEOUT, exchange).await {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(reason)) => return Err(unreachable(reason)),
-            Err(_) => return Err(unreachable("no answer in time".to_owned())),
+            Ok(result) => result?,
+            Err(_) => return Err("no answer in time".to_owned()),
         };
-        let data = FragmentData::decode(answer.header.body.as_ref())
-            .map_err(|e| unreachable(format!("a malformed answer: {e}")))?;
         self.idle(node, connection);
-        data.parse(node, answer.payload)
+        Ok(answer)
     }
 
     /// An idle connection to `node`, or a new one.
@@ -420,6 +488,31 @@ impl<N: Network, D: Disk> FragmentSource for FragmentReadClient<N, D> {
                 };
             }
             self.ask(&request).await
+        })
+    }
+
+    fn register(&self) -> Option<(u64, Duration)> {
+        let renew = self.inner.renew?;
+        let registration = self.inner.next_registration.fetch_add(1, Ordering::Relaxed);
+        Some((registration, renew))
+    }
+
+    fn hold(
+        &self,
+        node: NodeId,
+        registration: u64,
+        fragments: Vec<FragmentId>,
+        end: bool,
+    ) -> HoldFuture<'_> {
+        Box::pin(async move {
+            if node == self.inner.node
+                && let Some(local) = &self.inner.local
+            {
+                return local
+                    .hold(&self.inner.node, registration, &fragments, end)
+                    .map(drop);
+            }
+            self.ask_hold(&node, registration, &fragments, end).await
         })
     }
 }
@@ -490,29 +583,60 @@ impl<D: Disk> FragmentServer<D> {
         })
     }
 
-    /// Serves the fragment reads of one connection, starting with its
-    /// first frame `first`, until the connection fails, sends something
-    /// else, or stays idle for long.
+    /// Reads `request` from this node's stores, as the node serves a read
+    /// from another node: only if the fragment's header is the one the
+    /// request names.
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentReadError::NotHeld`] or [`FragmentReadError::Damaged`],
+    /// naming the request's node.
+    pub async fn read_fragment(
+        &self,
+        request: &FragmentRequest,
+    ) -> Result<FragmentBytes, FragmentReadError> {
+        self.read(request.fragment, &request.identity, request.range.clone())
+            .await
+            .map_err(|error| error.on(&request.node))
+    }
+
+    /// The answer to a `FragmentRead` frame.
+    async fn answer_read(&self, frame: &Frame) -> Frame {
+        let result = match FragmentRead::decode(frame.header.body.as_ref())
+            .map_err(|error| error.to_string())
+            .and_then(|body| body.parse())
+        {
+            Ok((id, identity, range)) => self.read(id, &identity, range).await,
+            Err(reason) => Err(NotServed::NotHeld(format!("a malformed read: {reason}"))),
+        };
+        let head = Header::new(MessageKind::FragmentData)
+            .with_request_id(frame.header.request_id)
+            .with_body(FragmentData::of(&result).encode_to_vec());
+        let payload = result.map(|bytes| bytes.data).unwrap_or_default();
+        Frame::new(head, payload)
+    }
+
+    /// Serves the fragment reads and holds of one connection, starting
+    /// with its first frame `first`, until the connection fails, sends
+    /// something else, or stays idle for long. Only nodes read fragments.
     pub async fn serve_reads<S>(&self, link: (Receiver<S>, Sender<S>), first: Frame)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         let (mut receiver, mut sender) = link;
-        let node = receiver.peer().node_id().cloned();
+        let Some(node) = receiver.peer().node_id().cloned() else {
+            return;
+        };
         let mut frame = first;
-        while frame.header.kind == MessageKind::FragmentRead && node.is_some() {
-            let result = match FragmentRead::decode(frame.header.body.as_ref())
-                .map_err(|error| error.to_string())
-                .and_then(|body| body.parse())
-            {
-                Ok((id, identity, range)) => self.read(id, &identity, range).await,
-                Err(reason) => Err(NotServed::NotHeld(format!("a malformed read: {reason}"))),
+        loop {
+            let answer = match frame.header.kind {
+                MessageKind::FragmentRead => self.answer_read(&frame).await,
+                MessageKind::FragmentHold => self
+                    .answer_hold(&node, &frame)
+                    .frame(frame.header.request_id),
+                _ => return,
             };
-            let head = Header::new(MessageKind::FragmentData)
-                .with_request_id(frame.header.request_id)
-                .with_body(FragmentData::of(&result).encode_to_vec());
-            let payload = result.map(|bytes| bytes.data).unwrap_or_default();
-            if let Err(error) = sender.send(&Frame::new(head, payload)).await {
+            if let Err(error) = sender.send(&answer).await {
                 tracing::debug!(%error, "a fragment read's answer was not sent");
                 return;
             }

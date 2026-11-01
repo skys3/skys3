@@ -89,6 +89,14 @@ fn check(data: &[u8]) {
         let encoded = codec::encode_remote_part(&part).expect("a decoded remote part encodes");
         same(data, &encoded, &part, |b| codec::decode_remote_part(b).ok());
     }
+    if let Ok(released) = codec::decode_released(data) {
+        let encoded = codec::encode_released(&released).expect("a decoded release encodes");
+        same(data, &encoded, &released, |b| codec::decode_released(b).ok());
+    }
+    if let Ok((shard, location)) = codec::decode_released_key(data) {
+        let key = codec::released_key(&shard, &location.node, location.fragment);
+        assert_eq!(key, data);
+    }
     if let Ok((shard, upload)) = codec::decode_remote_upload_key(data) {
         assert_eq!(codec::remote_upload_key(&shard, upload), data);
     }

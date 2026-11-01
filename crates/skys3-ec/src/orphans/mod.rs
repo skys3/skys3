@@ -16,8 +16,10 @@
 //! 2. The shard primary's [`OrphanJudge`] gives each fragment a
 //!    [`Verdict`]: referenced by the key's committed layout, written by an
 //!    attempt still in progress, or an orphan.
-//! 3. The reclaimer reclaims the orphans ([`FragmentStore::reclaim`]),
-//!    keeps the referenced ones without asking again in this life, and
+//! 3. The reclaimer reclaims the orphans ([`FragmentStore::reclaim`]), or,
+//!    given the node's [`FragmentHolds`](crate::FragmentHolds), releases
+//!    them so reads that hold them keep them (§8.7), keeps the referenced
+//!    ones without asking again in this life, and
 //!    asks about the others again after another
 //!    `fragment_orphan_after_seconds`.
 //!

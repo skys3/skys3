@@ -14,7 +14,7 @@ use skys3_types::{
     BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity, WriteIdentity,
 };
 
-use super::coding::{EcPublish, EcRelocate};
+use super::coding::{EcPublish, EcRelease, EcRelocate};
 use super::error::{FieldError, Problem};
 use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed};
 use super::wire::{Reader, Writer};
@@ -329,6 +329,8 @@ pub enum RecordBody {
     EcPublish(EcPublish),
     /// `EC_RELOCATE`.
     EcRelocate(EcRelocate),
+    /// `EC_RELEASE`.
+    EcRelease(EcRelease),
     /// `CONFIG`: the replica's full shard configuration (§6.2). Its bucket,
     /// shard, and epoch are the record's.
     Config(ShardConfig),
@@ -362,6 +364,7 @@ impl RecordBody {
             Self::Adopt(_) => RecordKind::Adopt,
             Self::EcPublish(_) => RecordKind::EcPublish,
             Self::EcRelocate(_) => RecordKind::EcRelocate,
+            Self::EcRelease(_) => RecordKind::EcRelease,
             Self::Config(_) => RecordKind::Config,
             Self::Truncate => RecordKind::Truncate,
             Self::ImportProgress(_) => RecordKind::ImportProgress,
@@ -386,7 +389,8 @@ impl RecordBody {
             | Self::Import(Import { key, .. })
             | Self::Adopt(Adopt { key, .. })
             | Self::EcPublish(EcPublish { key, .. })
-            | Self::EcRelocate(EcRelocate { key, .. }) => Some(key),
+            | Self::EcRelocate(EcRelocate { key, .. })
+            | Self::EcRelease(EcRelease { key, .. }) => Some(key),
             Self::Config(_) | Self::Truncate | Self::ImportProgress(_) => None,
         }
     }
@@ -429,6 +433,7 @@ impl RecordBody {
             Self::Adopt(adopt) => adopt.encode(w),
             Self::EcPublish(publish) => publish.encode(w, position),
             Self::EcRelocate(relocate) => relocate.encode(w, position),
+            Self::EcRelease(release) => release.encode(w),
             Self::Config(config) => encode_config(w, config, shard, position),
             Self::Truncate => Ok(()),
             Self::ImportProgress(progress) => progress.encode(w),
@@ -469,16 +474,10 @@ impl RecordBody {
             RecordKind::Adopt => Self::Adopt(Adopt::decode(&mut r)?),
             RecordKind::EcPublish => Self::EcPublish(EcPublish::decode(&mut r, position)?),
             RecordKind::EcRelocate => Self::EcRelocate(EcRelocate::decode(&mut r, position)?),
+            RecordKind::EcRelease => Self::EcRelease(EcRelease::decode(&mut r)?),
             RecordKind::Config => Self::Config(decode_config(&mut r, shard, position)?),
             RecordKind::Truncate => Self::Truncate,
             RecordKind::ImportProgress => Self::ImportProgress(ImportProgress::decode(&mut r)?),
-            // `RecordHeader::decode` admits only defined kinds.
-            _ => {
-                return Err(FieldError::new(
-                    "header.kind",
-                    Problem::Inconsistent("not a defined kind"),
-                ));
-            }
         };
         r.finish("body")?;
         let expected = body.payload().len();

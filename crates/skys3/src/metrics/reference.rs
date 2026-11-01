@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use skys3_coord::CoordinatorMetrics;
-use skys3_ec::RepairMetrics;
+use skys3_ec::{ReleaseMetrics, RepairMetrics};
 use skys3_flush::{DirtyBudget, FlushMetrics};
 use skys3_gateway::HotCacheMetrics;
 use skys3_obs::{AdminConfig, AdminListener, Health, MetricsRegistry};
@@ -67,6 +67,7 @@ async fn catalog() -> MetricsRegistry {
     drop(HotCacheMetrics::register(&registry));
     drop(LifecycleMetrics::register(&registry));
     drop(RepairMetrics::register(&registry));
+    drop(ReleaseMetrics::register(&registry));
     drop(CoordinatorMetrics::register(&registry));
     registry
 }
