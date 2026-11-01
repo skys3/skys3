@@ -35,7 +35,8 @@ jobs:
 
   # Every simulation target (crates/skys3-sim/src/lib.rs) with seeds that
   # change every night and longer runs (SKYS3_SIM_SCALE), in release mode
-  # with debug assertions and overflow checks kept. A failing seed prints
+  # with debug assertions and overflow checks kept, each test in a process
+  # of its own (scripts/ci/simulation.sh). A failing seed prints
   # the command that replays it; it then becomes a regression test that
   # runs that seed with `Runner::with_seeds` (plan section 5).
   simulation:
@@ -60,7 +61,7 @@ jobs:
           echo "SKYS3_SIM_FIRST_SEED=$first" >> "$GITHUB_ENV"
 
       - name: Run simulation scenarios
-        run: cargo test --release --workspace --all-features --test simulation
+        run: sh scripts/ci/simulation.sh --release
         env:
           SKYS3_SIM_SEEDS: 1024
           SKYS3_SIM_SCALE: 4

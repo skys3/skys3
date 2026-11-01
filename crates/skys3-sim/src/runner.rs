@@ -18,6 +18,10 @@
 //! - `SKYS3_SIM_SCALE=<factor>` asks scenarios that support it for longer
 //!   runs, such as more operations per client ([`SimContext::scale`]). The
 //!   replay command repeats it.
+//! - `SKYS3_SIM_TASK_SHIFT=<0..3>` sets the list Tokio's next task ID falls
+//!   in before each seed and each simulation, instead of `seed % 4`
+//!   ([`crate::tasks`]): it picks the order a crashed host's tasks are
+//!   dropped in. The replay command repeats it.
 
 use std::any::Any;
 use std::env;
@@ -32,6 +36,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use skys3_io::{Drift, MonoTime, MonotonicClock, SimDisk, SimDiskFaults};
 
 use crate::s3::{SimS3, SimS3Config};
+use crate::tasks::{self, TASK_SHIFT_ENV};
 
 /// The variable that selects a single seed to replay.
 pub const SEED_ENV: &str = "SKYS3_SIM_SEED";
@@ -204,8 +209,11 @@ impl SimContext {
     }
 
     /// Returns a `turmoil` builder whose network and scheduling randomness is
-    /// seeded from this context.
+    /// seeded from this context. It first aligns Tokio's task IDs to the
+    /// seed ([`tasks::align`]), so that a host the simulation crashes drops
+    /// its tasks in the same order on every run of the seed.
     pub fn builder(&mut self) -> turmoil::Builder {
+        tasks::align(tasks::task_shift(self.seed));
         let mut builder = turmoil::Builder::new();
         builder.rng_seed(self.fork_seed());
         builder
@@ -331,7 +339,9 @@ impl Runner {
     }
 
     /// Runs `scenario` once per seed, in order, stopping at the first seed
-    /// that returns an error or panics.
+    /// that returns an error or panics. Before each seed it aligns Tokio's
+    /// task IDs to the seed ([`tasks::align`]), so that the seeds before it
+    /// do not change its run.
     ///
     /// # Panics
     ///
@@ -342,6 +352,7 @@ impl Runner {
         F: FnMut(&mut SimContext) -> turmoil::Result,
     {
         for seed in self.seeds.seeds() {
+            tasks::align(tasks::task_shift(seed));
             let mut context = SimContext::with_scale(seed, self.scale);
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| scenario(&mut context)));
             let failure = match outcome {
@@ -407,7 +418,14 @@ pub fn replay_command(seed: u64) -> String {
         .and_then(|value| scale_from(Some(&value)).ok())
         .filter(|&scale| scale > 1)
         .map(|scale| format!("{SCALE_ENV}={scale} "));
-    let mut command = format!("{}{SEED_ENV}={seed} cargo test", scale.unwrap_or_default());
+    let shift = env::var(TASK_SHIFT_ENV)
+        .ok()
+        .map(|value| format!("{TASK_SHIFT_ENV}={} ", value.trim()));
+    let mut command = format!(
+        "{}{}{SEED_ENV}={seed} cargo test",
+        scale.unwrap_or_default(),
+        shift.unwrap_or_default()
+    );
     if let Some(package) = &package {
         command.push_str(&format!(" -p {package}"));
     }
