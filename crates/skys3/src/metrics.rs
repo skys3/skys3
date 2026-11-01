@@ -115,6 +115,9 @@ impl ControlMetrics {
 mod reference;
 
 #[cfg(test)]
+mod runbooks;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
