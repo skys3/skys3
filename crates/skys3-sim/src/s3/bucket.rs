@@ -37,7 +37,7 @@ struct Stored {
 }
 
 /// One entry in a key's version history: an object, or a delete marker.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Version {
     /// `None` on an unversioned bucket.
     id: Option<VersionId>,
@@ -45,14 +45,14 @@ struct Version {
     object: Option<Arc<Stored>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Part {
     body: Bytes,
     md5: [u8; 16],
     etag: ETag,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Upload {
     key: String,
     metadata: UserMetadata,
@@ -62,7 +62,7 @@ struct Upload {
 }
 
 /// The objects and uploads of one simulated bucket.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Bucket {
     config: SimS3Config,
     /// Each key's versions, oldest first. On an unversioned bucket a key

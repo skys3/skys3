@@ -12,6 +12,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
+use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, HotCache,
@@ -76,6 +77,9 @@ type NodeAuth = SigV4Authenticator<NodeCredentials<Sessions>>;
 type NodeGateway = Gateway<NodeAuth>;
 /// The flushers of `write_back` buckets.
 pub(crate) type NodeFlush = FlushService<AwsS3, RealDisk>;
+
+/// The node's index snapshots (§8.9).
+type NodeSnapshots = SnapshotService<AwsS3, RealDisk>;
 
 /// Read-through fill on this node (§9.2): the gateway's [`Fills`] over
 /// each `write_back` bucket's [`skys3_flush::Filler`], into the bucket's
@@ -254,6 +258,7 @@ struct Shared {
     control: Arc<Mutex<ControlState>>,
     control_live: Gauge,
     flush: Arc<NodeFlush>,
+    snapshots: NodeSnapshots,
 }
 
 impl Shared {
@@ -390,8 +395,9 @@ impl Shared {
     }
 
     /// Keeps a flusher on every `write_back` bucket shard open on the node
-    /// (§7.1), refreshes the flush gauges, and gives the clean cache each
-    /// bucket's `clean_copies` (§9.3).
+    /// (§7.1) and an index snapshot writer on every shard it leads of a
+    /// bucket with a snapshot target (§8.9), refreshes the flush gauges, and
+    /// gives the clean cache each bucket's `clean_copies` (§9.3).
     async fn follow_flushes(self: Arc<Self>) {
         let mut warned = BTreeSet::new();
         loop {
@@ -411,6 +417,7 @@ impl Shared {
             // round may already have clean entries.
             self.install_clean_copies(&buckets);
             self.flush.reconcile(&buckets, self.shards.set()).await;
+            self.snapshots.reconcile(&buckets, self.shards.set()).await;
             self.flush.refresh_metrics();
             tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
         }
@@ -792,11 +799,12 @@ struct Opened {
 ///    control-store polling, session expiry, disk fencing, free-space
 ///    checks, the flushers of `write_back` buckets, which track their
 ///    dirty keys at once and flush them once each target's probe succeeds
-///    (`skys3_flush`), and the lifecycle passes of `local` buckets
-///    (`skys3_shard::lifecycle`).
+///    (`skys3_flush`), the index snapshots of the shards it leads
+///    (`skys3_flush::snapshot`), and the lifecycle passes of `local`
+///    buckets (`skys3_shard::lifecycle`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
-/// stops the flushers, stops every shard once its sequenced records are
+/// stops the flushers and snapshot writers, stops every shard once its sequenced records are
 /// applied, and takes a final checkpoint, so the next start replays
 /// little.
 pub struct Node {
@@ -1006,14 +1014,16 @@ impl Node {
             disk_of,
             &metrics.registry,
         );
+        let region = config.flush().target_region.clone();
+        let credentials = default_credentials(&region).await;
+        let connect = move |target: &skys3_types::RemoteTarget| {
+            AwsS3::builder(target, region.clone(), credentials.clone())
+                .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                .build()
+        };
+        let snapshots = SnapshotService::new(Box::new(connect.clone()), config.buckets().clone())
+            .with_wall_clock(Arc::clone(&wall));
         let flush = {
-            let region = config.flush().target_region.clone();
-            let credentials = default_credentials(&region).await;
-            let connect = move |target: &skys3_types::RemoteTarget| {
-                AwsS3::builder(target, region.clone(), credentials.clone())
-                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
-                    .build()
-            };
             let settings = FlushSettings {
                 extent_bytes: config.storage().extent_bytes,
                 // A body the gateway streams for at most half the TTL.
@@ -1073,6 +1083,7 @@ impl Node {
             control: Arc::clone(&control),
             control_live: metrics.control_store_live.clone(),
             flush: Arc::clone(&flush),
+            snapshots,
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -1238,6 +1249,7 @@ impl Node {
         checkpoints.abort();
         let _ = checkpoints.await;
         shared.flush.shutdown().await;
+        shared.snapshots.shutdown().await;
         if let Err(error) = shared.shards.set().close_all().await {
             tracing::warn!(%error, "a shard stopped with an error");
         }
