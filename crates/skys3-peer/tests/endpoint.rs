@@ -642,3 +642,82 @@ async fn zero_rtt_attempts_are_rejected() {
     drop(server);
     serve.abort();
 }
+
+/// An endpoint over a socket of the caller's, seeded, serves peers as a
+/// bound one does, and loses a connection once it heard nothing for its
+/// idle timeout.
+#[tokio::test]
+async fn a_seeded_endpoint_over_any_socket_serves_peers() {
+    let us = Cluster::new(US);
+    let eu = Cluster::new(EU);
+    let mut destination_trust = PeerTrust::new();
+    us.trusted(
+        &mut destination_trust,
+        &[pair(SOURCE_BUCKET, DESTINATION_BUCKET)],
+    );
+    let mut source_trust = PeerTrust::new();
+    eu.trusted(&mut source_trust, &[]);
+    let idle = Duration::from_millis(600);
+    let short = skys3_peer::EndpointSettings {
+        idle_timeout: idle,
+        ..settings()
+    };
+    let socket = |address| {
+        let socket = std::net::UdpSocket::bind(address).unwrap();
+        quinn::default_runtime()
+            .unwrap()
+            .wrap_udp_socket(socket)
+            .unwrap()
+    };
+    let destination = skys3_peer::PeerEndpoint::with_socket(
+        socket(loopback()),
+        &eu.tls("eu-1", destination_trust),
+        short.clone(),
+        Some(7),
+    )
+    .unwrap();
+    let source = skys3_peer::PeerEndpoint::with_socket(
+        socket(loopback()),
+        &us.tls("us-1", source_trust),
+        short,
+        Some(8),
+    )
+    .unwrap();
+    let to = skys3_peer::Destination {
+        cluster: id(EU),
+        address: destination.local_addr().unwrap(),
+    };
+    for _ in 0..2 {
+        let (client, server) = async { tokio::join!(source.connect(&to), accept(&destination)) }
+            .bounded()
+            .await;
+        let (client, server) = (client.unwrap(), server.unwrap());
+        assert_eq!(client.peer().as_str(), EU);
+        assert_eq!(server.peer().as_str(), US);
+        let (sent, received) = async {
+            tokio::join!(
+                async {
+                    let mut stream = client.open_stream().await.unwrap();
+                    stream
+                        .send(&begin(identity(US, SOURCE_BUCKET, 1), DESTINATION_BUCKET))
+                        .await
+                },
+                async { server.accept_stream().await.unwrap().recv().await }
+            )
+        }
+        .bounded()
+        .await;
+        sent.unwrap();
+        assert!(matches!(received, Ok(Some(Message::Begin(_)))));
+        // Keep-alives hold the connection open past its idle timeout...
+        tokio::time::sleep(idle * 2).await;
+        assert!(client.close_reason().is_none());
+        // ...until the peer goes silent.
+        server.close();
+        let reason = client.closed().bounded().await;
+        assert!(
+            matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
+            "{reason:?}"
+        );
+    }
+}

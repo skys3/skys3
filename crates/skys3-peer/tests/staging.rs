@@ -32,6 +32,12 @@ const FRAME: u64 = 64 << 10;
 /// A key whose appends the sink refuses, as for a bucket being deleted.
 const REFUSED_KEY: &str = "refused";
 
+/// A key whose appends the sink holds until [`TestSink::release`].
+const HELD_KEY: &str = "held";
+
+/// A key whose appends panic, as a sink with a bug might.
+const PANICKING_KEY: &str = "panicking";
+
 fn identity(seq: u64) -> WriteIdentity {
     format!("{US}/{SOURCE_BUCKET}/5/42.{seq}").parse().unwrap()
 }
@@ -67,11 +73,14 @@ struct Appended {
 }
 
 /// Stands in for the shard primaries: stores each extent at the next
-/// position, fails the first append at each offset in `fail_once`, and
-/// refuses every append of [`REFUSED_KEY`].
+/// position, fails the first append at each offset in `fail_once`,
+/// refuses every append of [`REFUSED_KEY`], holds each append of
+/// [`HELD_KEY`] until it is released, and panics in each append of
+/// [`PANICKING_KEY`].
 #[derive(Debug, Clone, Default)]
 struct TestSink {
     state: Arc<Mutex<SinkState>>,
+    held: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -79,6 +88,10 @@ struct SinkState {
     fail_once: BTreeSet<u64>,
     appended: Vec<Appended>,
     attempts: usize,
+    /// Appends of [`HELD_KEY`] that started.
+    holding: usize,
+    /// Appends of [`PANICKING_KEY`] that started.
+    panicking: usize,
 }
 
 impl TestSink {
@@ -95,6 +108,19 @@ impl TestSink {
     fn attempts(&self) -> usize {
         self.state.lock().unwrap().attempts
     }
+
+    fn holding(&self) -> usize {
+        self.state.lock().unwrap().holding
+    }
+
+    fn panicking(&self) -> usize {
+        self.state.lock().unwrap().panicking
+    }
+
+    /// Lets one held append go on.
+    fn release(&self) {
+        self.held.notify_one();
+    }
 }
 
 impl ExtentSink for TestSink {
@@ -106,6 +132,14 @@ impl ExtentSink for TestSink {
         data: Bytes,
     ) -> Result<ExtentRef, SinkError> {
         assert_eq!(bucket.as_str(), DESTINATION_BUCKET);
+        if key == HELD_KEY {
+            self.state.lock().unwrap().holding += 1;
+            self.held.notified().await;
+        }
+        if key == PANICKING_KEY {
+            self.state.lock().unwrap().panicking += 1;
+            panic!("the sink failed to stage an extent");
+        }
         // Let other appends and messages interleave.
         tokio::task::yield_now().await;
         let mut state = self.state.lock().unwrap();
@@ -767,4 +801,142 @@ async fn a_commit_publishes_what_is_staged_and_consumes_it() {
     stream.finish().unwrap();
     assert_eq!(stream.recv().bounded().await.unwrap(), None);
     connection.close();
+}
+
+/// A source that gave up waiting on a stream, as after its answer timeout,
+/// stages the object again on a new connection while the old stream's
+/// frames are still in flight: the new stream's frames are trimmed against
+/// them, so its `COMMIT` waits for them to land and finds the object
+/// staged whole, not `incomplete`.
+#[tokio::test]
+async fn a_commit_waits_for_frames_another_stream_has_in_flight() {
+    let sink = TestSink::default();
+    let commits = TestCommits::default();
+    let setup = setup_with(sink.clone(), LIMITS, commits.clone());
+    let body = body(FRAME);
+    let id = identity(1);
+
+    // The first stream's frame is in flight, and the connection is lost.
+    let (first, mut stream) = setup.stream().await;
+    stream.send(&begin(&id, HELD_KEY)).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    async {
+        while sink.holding() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    .bounded()
+    .await;
+    first.close();
+
+    // The second stream is told nothing is durable, sends the frame again,
+    // which is trimmed to nothing, and commits.
+    let (second, mut stream) = setup.stream().await;
+    stream.send(&begin(&id, HELD_KEY)).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    stream
+        .send(&staged_commit(&id, HELD_KEY, FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        commits.seen().is_empty(),
+        "the COMMIT was applied while a frame of its staging was in flight"
+    );
+    sink.release();
+    let answer = applied(&mut stream).await;
+    assert_eq!(answer.outcome, Outcome::Committed { etag: None });
+    let (seen, staged) = commits.seen().pop().unwrap();
+    assert_eq!(seen, id);
+    assert_eq!(staged.unwrap().extents(1, FRAME).unwrap().len(), 1);
+    assert_eq!(sink.appended().len(), 1);
+    assert_eq!(sink.holding(), 1);
+    second.close();
+}
+
+/// An append whose task panics still settles what it admitted, as failed:
+/// a `COMMIT` on another stream, which waits for every frame in flight of
+/// its staging, is answered at once with what is staged, and the staging
+/// expires once nothing more comes for it.
+#[tokio::test]
+async fn a_panicking_append_neither_holds_a_commit_nor_keeps_its_staging() {
+    let sink = TestSink::default();
+    let commits = TestCommits::default();
+    let setup = setup_with(sink.clone(), LIMITS, commits.clone());
+    let body = body(FRAME);
+    let id = identity(1);
+    commits.answer(
+        &id,
+        Outcome::Failed {
+            error: ApplyError::Incomplete,
+            reason: "piece 1 has a gap".into(),
+        },
+    );
+
+    // The first stream's append panics.
+    let (first, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, PANICKING_KEY))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    async {
+        while sink.panicking() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    .bounded()
+    .await;
+
+    // The second stream commits without resending the frame.
+    let (second, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, PANICKING_KEY))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&staged_commit(&id, PANICKING_KEY, FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(5), applied(&mut stream))
+        .await
+        .expect("the COMMIT waited on the panicked append");
+    assert!(matches!(
+        answer.outcome,
+        Outcome::Failed {
+            error: ApplyError::Incomplete,
+            ..
+        }
+    ));
+    let (seen, staged) = commits.seen().pop().unwrap();
+    assert_eq!(seen, id);
+    assert_eq!(staged.unwrap().extents(1, FRAME), None);
+
+    // Unpinned, the staging expires, and its source's quota is released.
+    let later = tokio::time::Instant::now() + LIMITS.ttl;
+    assert_eq!(setup.staging.expire(later), [id]);
+    assert!(setup.staging.is_empty());
+    assert_eq!(setup.staging.used(&common::id(US)), 0);
+    first.close();
+    second.close();
 }

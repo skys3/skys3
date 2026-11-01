@@ -108,6 +108,13 @@
 //!   restarts of the peer: no key recorded flushed and no write-through
 //!   write acknowledged before the peer applied it, and every committed
 //!   change applied there once, with seeded bugs caught.
+//! - [`peer_protocol`]: the native protocol over QUIC under its own
+//!   faults: lost messages either way, connections dropped mid-transfer,
+//!   duplicate `COMMIT`s from replays and deposed primaries, staging that
+//!   expires before its `COMMIT`, and `COMMIT`s that arrive past their
+//!   commit window: no durable range sent again, every copy of a `COMMIT`
+//!   answered alike and applied once, none applied past its window, and
+//!   seeded bugs caught.
 //! - [`discovery`]: the same peer reached with `target_transport =
 //!   "auto"`, with UDP blocked between every node and the peer mid-run:
 //!   flushing falls back to S3 REST through the peer's gateway and returns
@@ -160,6 +167,7 @@ mod leases;
 mod lifecycle;
 mod origin;
 mod peer;
+mod peer_protocol;
 mod reads;
 mod rebalancing;
 mod rebuild;

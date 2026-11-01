@@ -93,6 +93,10 @@ pub const CLOCK_TOLERANCE: Duration = Duration::from_secs(30);
 /// publishes them carries the apply-by time.
 pub const MAX_BOUNDED_BYTES: u64 = 1 << 20;
 
+/// How far past the commit window [`PeerBug::NoCommitWindow`] stamps a
+/// `COMMIT`'s apply-by time: a day.
+const BUGGY_EXTRA_WINDOW_MS: u64 = 24 * 3600 * 1000;
+
 /// How a target's peer writes are stamped with their apply-by time: the
 /// source's wall clock as each is sent, plus the commit window (§7.8).
 #[derive(Clone)]
@@ -121,8 +125,12 @@ impl Stamp {
 
     /// `commit` as it is sent now, with its apply-by time.
     pub(crate) fn commit(&self, commit: &Commit) -> Commit {
+        let mut apply_by_ms = self.apply_by_ms();
+        if hooks::peer_bug() == PeerBug::NoCommitWindow {
+            apply_by_ms = apply_by_ms.saturating_add(BUGGY_EXTRA_WINDOW_MS);
+        }
         Commit {
-            apply_by_ms: Some(self.apply_by_ms()),
+            apply_by_ms: Some(apply_by_ms),
             ..commit.clone()
         }
     }
@@ -349,6 +357,17 @@ pub enum PeerBug {
     /// A shard flusher that starts on QUIC commits at once, while S3
     /// writes sent to the peer before it started may still apply.
     NoReturnQuarantine,
+    /// Staging ignores the `RESUME`: every byte of the object is sent
+    /// again, durable ranges included.
+    ResendDurable,
+    /// A `COMMIT` answered `incomplete`, or staging the destination
+    /// reports expired, counts as committed: the key is recorded flushed
+    /// although the destination never applied it.
+    ExpiredAsCommitted,
+    /// A `COMMIT`'s apply-by time ignores the commit window, a day past
+    /// it: one delayed past its window still applies, after its source
+    /// may have given it up and flushed the key over S3.
+    NoCommitWindow,
 }
 
 /// What a flusher records as flushed to a native target, as the
