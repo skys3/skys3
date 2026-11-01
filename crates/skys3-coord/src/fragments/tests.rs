@@ -5,10 +5,10 @@ use proptest::prelude::*;
 use super::*;
 use crate::NodeState;
 
-const TB: u64 = 1 << 40;
-const MIB: u64 = 1 << 20;
+pub(super) const TB: u64 = 1 << 40;
+pub(super) const MIB: u64 = 1 << 20;
 
-fn node(n: usize) -> NodeId {
+pub(super) fn node(n: usize) -> NodeId {
     NodeId::new(format!("node-{n}")).unwrap()
 }
 
@@ -16,11 +16,11 @@ fn label(text: String) -> skys3_types::Label {
     skys3_types::Label::new(text).unwrap()
 }
 
-fn bucket() -> BucketId {
+pub(super) fn bucket() -> BucketId {
     BucketId::new("b-1").unwrap()
 }
 
-fn defaults() -> GeometryPolicy {
+pub(super) fn defaults() -> GeometryPolicy {
     GeometryPolicy::from_config(&EcConfig::default()).unwrap()
 }
 
@@ -29,7 +29,7 @@ fn geometry(k: usize, m: usize) -> Geometry {
 }
 
 /// A live node `n` with one terabyte, in `rack` and `zone`.
-fn candidate(n: usize, zone: Option<usize>, rack: Option<usize>) -> Candidate {
+pub(super) fn candidate(n: usize, zone: Option<usize>, rack: Option<usize>) -> Candidate {
     Candidate {
         node: node(n),
         zone: zone.map(|z| label(format!("zone-{z}"))),
@@ -42,7 +42,7 @@ fn candidate(n: usize, zone: Option<usize>, rack: Option<usize>) -> Candidate {
 }
 
 /// Live nodes, `sizes[r]` of them in rack `r`.
-fn racks(sizes: &[usize]) -> Vec<Candidate> {
+pub(super) fn racks(sizes: &[usize]) -> Vec<Candidate> {
     let mut nodes = Vec::new();
     for (rack, &size) in sizes.iter().enumerate() {
         for _ in 0..size {
@@ -54,11 +54,11 @@ fn racks(sizes: &[usize]) -> Vec<Candidate> {
 
 /// `n` live nodes without labels, so no soft spread below the `node`
 /// level steers their choice.
-fn flat(n: usize) -> Vec<Candidate> {
+pub(super) fn flat(n: usize) -> Vec<Candidate> {
     (0..n).map(|i| candidate(i, None, None)).collect()
 }
 
-fn planner_for(level: FailureDomain, nodes: Vec<Candidate>) -> FragmentPlanner {
+pub(super) fn planner_for(level: FailureDomain, nodes: Vec<Candidate>) -> FragmentPlanner {
     FragmentPlanner::new(Topology::new(level, nodes), defaults())
 }
 
@@ -426,7 +426,7 @@ fn node_level_errors_name_the_level() {
     );
 }
 
-fn arb_state() -> impl Strategy<Value = NodeState> {
+pub(super) fn arb_state() -> impl Strategy<Value = NodeState> {
     prop_oneof![
         6 => Just(NodeState::Live),
         2 => Just(NodeState::Suspect),
@@ -434,7 +434,7 @@ fn arb_state() -> impl Strategy<Value = NodeState> {
     ]
 }
 
-fn arb_level() -> impl Strategy<Value = FailureDomain> {
+pub(super) fn arb_level() -> impl Strategy<Value = FailureDomain> {
     prop_oneof![
         Just(FailureDomain::Node),
         Just(FailureDomain::Rack),

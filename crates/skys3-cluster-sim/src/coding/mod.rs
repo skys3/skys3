@@ -58,6 +58,9 @@
 //! see [`ReadConfig`]. And they may lose holders once every object is
 //! coded, for the shard primary's repairer to make every stripe whole
 //! again ([`CodingConfig::repair`], plan M5-08): see [`RepairConfig`].
+//! With those losses, nodes may join or be drained, for the repairers to
+//! move fragments onto and off them ([`CodingConfig::rebalance`], plan
+//! M5-09): see [`RebalanceConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -70,9 +73,9 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use skys3::storage::{self, Storage};
-use skys3_config::{EcConfig, FailureDomain};
+use skys3_config::EcConfig;
 use skys3_control::{ControlError, ProposalIds};
-use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topology};
+use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, Topology};
 use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::orphans::{JudgeBug, PrimariesOf, Reclaimed};
 use skys3_ec::{
@@ -103,9 +106,11 @@ use skys3_types::{
 use crate::node::{BoxError, TRANSPORT_PORT};
 use crate::pki::Pki;
 
+mod moves;
 mod reads;
 mod repair;
 
+pub use moves::{MoveCrash, MoveOutcome, MovePoint, MoveTarget, RebalanceBug, RebalanceConfig};
 pub use reads::{ReadConfig, ReadFault, ReadReport};
 pub use repair::{Loss, RepairConfig, RepairCrash, RepairOutcome, RepairPoint, RepairTarget};
 
@@ -240,6 +245,10 @@ pub struct CodingConfig {
     pub ec: EcConfig,
     /// Holders lost once every object is coded, and repaired (plan M5-08).
     pub repair: Option<RepairConfig>,
+    /// Nodes that join or are drained once every object is coded, while
+    /// the repairers move fragments (plan M5-09). Needs `repair`, whose
+    /// repairers make the moves and whose losses strike at the same time.
+    pub rebalance: Option<RebalanceConfig>,
 }
 
 impl Default for CodingConfig {
@@ -257,6 +266,7 @@ impl Default for CodingConfig {
             reads: None,
             ec: EcConfig::default(),
             repair: None,
+            rebalance: None,
         }
     }
 }
@@ -297,8 +307,11 @@ pub struct CodingReport {
     pub reads: Option<ReadReport>,
     /// What the repairs did, in a run that loses holders.
     pub repair: Option<RepairOutcome>,
+    /// What the moves did, in a run that rebalances.
+    pub moves: Option<MoveOutcome>,
 }
 
+/// The nodes a run starts with; those that join come after them.
 const NODES: usize = 6;
 const MEMBERS: usize = 3;
 const CHECK_INTERVAL: Duration = Duration::from_millis(10);
@@ -383,6 +396,11 @@ struct World {
     cut_at_repair_write: Vec<AtomicBool>,
     /// What the repairers did.
     repair: repair::RepairLog,
+    /// The nodes placement knows, as it judges them: those that joined,
+    /// with the drained ones departing.
+    topology: Mutex<Vec<Candidate>>,
+    /// What the moves did.
+    moves: moves::MoveLog,
 }
 
 /// A fragment on one of a node's disks: the node, the disk's generation,
@@ -421,7 +439,7 @@ impl World {
     /// The positions of the nodes the register names as members.
     fn members(&self) -> Vec<usize> {
         let register = lock(&self.register);
-        (0..NODES)
+        (0..self.nodes.len())
             .filter(|&n| register.is_member(&self.nodes[n].id))
             .collect()
     }
@@ -486,9 +504,9 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     }
     let mut driver = Driver {
         world: &world,
-        down: vec![None; NODES],
-        isolated: vec![None; NODES],
-        cut: vec![false; NODES],
+        down: vec![None; world.nodes.len()],
+        isolated: vec![None; world.nodes.len()],
+        cut: vec![false; world.nodes.len()],
         crashes: config.crashes.clone(),
         seen: 0,
         due: Vec::new(),
@@ -498,7 +516,13 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         read_faults: Vec::new(),
         healing: Vec::new(),
         repair: repair::Phase::default(),
+        moves: moves::Phase::default(),
     };
+    for n in NODES..world.nodes.len() {
+        // Held back until it joins: its software never ran.
+        sim.crash(world.nodes[n].id.as_str());
+        driver.down[n] = Some(repair::FOREVER);
+    }
     let mut next_check = CHECK_INTERVAL;
     loop {
         sim.step()
@@ -507,6 +531,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         driver.advance(&mut sim, now);
         driver.read_faults(&mut sim, now);
         driver.repair_crash(now);
+        driver.advance_moves(now);
         if now >= next_check {
             next_check = now + CHECK_INTERVAL;
             driver.check()?;
@@ -557,6 +582,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         driver.report.reads = Some(reads.report()?);
     }
     driver.report.repair = driver.repair_outcome()?;
+    driver.report.moves = driver.move_outcome()?;
     let report = driver.report.clone();
     drop(sim);
     final_check(&world)?;
@@ -567,7 +593,8 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
     let cluster = ClusterId::new("coding")?;
     let pki = Pki::new()?;
     let mut nodes = Vec::new();
-    for n in 0..NODES {
+    let count = NODES + config.rebalance.as_ref().map_or(0, |r| r.joins);
+    for n in 0..count {
         let id: NodeId = format!("n{n}").parse()?;
         let power = SimPower::new();
         let (log_disk, fragment_disk) = (context.disk(), context.disk());
@@ -606,7 +633,10 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
     };
     let reads = config
         .reads
-        .map(|reads| reads::Reads::new(reads, cluster.clone(), &shard_config, context.fork_seed()))
+        .map(|reads| {
+            let seed = context.fork_seed();
+            reads::Reads::new(reads, cluster.clone(), &shard_config, seed, count)
+        })
         .transpose()?;
     let sizes = (0..config.objects)
         .map(|_| context.rng().random_range(config.object_bytes.clone()))
@@ -616,17 +646,20 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         peers,
         shard,
         register: Mutex::new(shard_config.clone()),
-        cut_off: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        cut_off: (0..count).map(|_| AtomicBool::new(false)).collect(),
         reclaimed: Mutex::default(),
         fragments: Mutex::default(),
         reads,
-        lost: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
-        lose_disk: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
-        disk_gone: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
-        generation: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
-        lives: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
-        cut_at_repair_write: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        // A node that is still to join counts as lost until it does.
+        lost: (0..count).map(|n| AtomicBool::new(n >= NODES)).collect(),
+        topology: Mutex::new(moves::initial_topology(config)),
+        lose_disk: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        disk_gone: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        generation: (0..count).map(|_| AtomicU64::new(0)).collect(),
+        lives: (0..count).map(|_| AtomicU64::new(0)).collect(),
+        cut_at_repair_write: (0..count).map(|_| AtomicBool::new(false)).collect(),
         repair: repair::RepairLog::default(),
+        moves: moves::MoveLog::default(),
         config: shard_config,
         run: config.clone(),
         sizes,
@@ -666,20 +699,15 @@ fn replication_config() -> ReplicationConfig {
     ReplicationConfig::default()
 }
 
-/// The fixed topology of the six nodes, each a domain of its own, under
-/// the `[ec]` policy `ec`.
-fn planner(ec: &EcConfig) -> FragmentPlanner {
-    let candidates = (0..NODES).map(|n| Candidate {
-        node: format!("n{n}").parse().expect("a valid node ID"),
-        zone: None,
-        rack: None,
-        capacity_bytes: 1 << 40,
-        state: NodeState::Live,
-        shards: 0,
-        primaries: 0,
-    });
-    let policy = GeometryPolicy::from_config(ec).expect("a valid policy");
-    FragmentPlanner::new(Topology::new(FailureDomain::Node, candidates), policy)
+/// The nodes placement knows now, as it judges them, under the run's
+/// `[ec]` policy: the six first nodes, each a domain of its own unless the
+/// run keeps fragments apart by rack, then those that joined, with the
+/// drained ones departing.
+fn planner(world: &World) -> FragmentPlanner {
+    let candidates = lock(&world.topology).clone();
+    let level = moves::level(&world.run);
+    let policy = GeometryPolicy::from_config(&world.run.ec).expect("a valid policy");
+    FragmentPlanner::new(Topology::new(level, candidates), policy)
 }
 
 /// The simulated time of day.
@@ -1063,11 +1091,11 @@ async fn primary(
         world.written.store(true, Ordering::SeqCst);
     }
     let events = Arc::clone(&world);
-    let ec = world.run.ec.clone();
+    let planned = Arc::clone(&world);
     let encoder = Encoder::new(
         shard.clone(),
         Arc::new(writer),
-        Arc::new(move || planner(&ec)),
+        Arc::new(move || planner(&planned)),
         Arc::new(SimWallClock),
         EncoderSettings {
             min_object_bytes: 1,
@@ -1222,6 +1250,8 @@ struct Driver<'a> {
     healing: Vec<(Duration, usize)>,
     /// The repair phase.
     repair: repair::Phase,
+    /// The rebalancing phase.
+    moves: moves::Phase,
 }
 
 impl Driver<'_> {
@@ -1266,7 +1296,7 @@ impl Driver<'_> {
                 CrashKind::Isolate => self.isolate(sim, now, node, crash.downtime),
             }
         }
-        for node in 0..NODES {
+        for node in 0..self.world.nodes.len() {
             let slot = &self.world.nodes[node];
             if self.isolated[node].is_some_and(|at| at <= now) {
                 self.isolated[node] = None;
@@ -1441,7 +1471,8 @@ impl Driver<'_> {
                 .map_err(|e| format!("{key}: {e}"))?;
         }
         self.check_reclaimed(&views, &keys)?;
-        self.check_held()
+        self.check_held()?;
+        self.check_domains()
     }
 
     /// Checks one object over every node that was ever a member: one that
@@ -1551,7 +1582,7 @@ impl Driver<'_> {
             return Err("crashes are pending".to_owned());
         }
         let views = self.views();
-        if let Some(n) = (0..NODES).find(|&n| views[n].is_none() && !lost(n)) {
+        if let Some(n) = (0..views.len()).find(|&n| views[n].is_none() && !lost(n)) {
             return Err(format!("n{n} has not recovered"));
         }
         let shard = &self.world.shard;

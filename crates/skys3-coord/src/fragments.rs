@@ -33,7 +33,9 @@
 //! when the cluster grows or shrinks, and only new stripes see the change.
 //! Repair (M5-08) and fragment moves (M5-09) keep the same two rules:
 //! [`FragmentPlanner::replace`] places fragments of a stripe again around
-//! the ones it keeps.
+//! the ones it keeps, and [`FragmentPlanner::moves`] plans which fragments
+//! of a shard's stripes move, to drain a node that is no longer eligible,
+//! bring a stripe back under a domain's cap, or balance the nodes.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,6 +48,10 @@ use skys3_types::{
 };
 
 use crate::place::{Candidate, Domain, Seed, Topology, level_name};
+
+mod moves;
+
+pub use moves::{MoveReason, MoveRequest, PlannedMove, ShardStripe};
 
 /// How new stripes are shaped (design §8.3): the `[ec]` keys
 /// `parity_fragments` (`m`), `max_data_fragments` (the widest `k`), and

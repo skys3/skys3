@@ -41,7 +41,9 @@
 //!   erasure-coded stripes, the widest the counts of eligible nodes and
 //!   domains allow, and the node of each fragment, at most one per node
 //!   and `m` per domain (§8.3). A [`StripePlan`] becomes the stripe layout
-//!   an `EC_PUBLISH` record holds, which is never recomputed.
+//!   an `EC_PUBLISH` record holds, which is never recomputed; its
+//!   fragments are placed again by repair ([`ReplaceRequest`]) and moved
+//!   one at a time by a shard primary ([`MoveRequest`]).
 //! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
 //!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
 //!   through [`PlacementHealth`] for cluster health.
@@ -118,8 +120,8 @@ pub use change::{
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
 pub use fragments::{
-    FragmentPlanner, GeometryPolicy, NoGeometry, ReplaceRequest, StripePlan, StripeRequest,
-    StripeRoom,
+    FragmentPlanner, GeometryPolicy, MoveReason, MoveRequest, NoGeometry, PlannedMove,
+    ReplaceRequest, ShardStripe, StripePlan, StripeRequest, StripeRoom,
 };
 pub use handoff::{
     Handoff, HandoffAck, HandoffClient, HandoffError, HandoffFuture, HandoffSink, RequestHandoff,
