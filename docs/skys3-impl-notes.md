@@ -7365,6 +7365,25 @@ of this file. A task with nothing unexpected keeps "None."
   leave the rack with `m + 1` fragments until the next pass. Once a
   stripe's move fails, is rejected, or is skipped, the pass skips the
   stripe's other moves (`a_stripe_whose_move_fails_moves_no_more_in_the_pass`).
+- **Moves waited for nothing across passes (found in review).** A
+  relocation that is not acknowledged in time under `WaitThrough` keeps
+  its position and commits later, but the next pass plans from the
+  applied index, which does not show it: it could move another fragment
+  of the stripe into the rack the first move filled to `m`, and both
+  apply in order (`relocate_coded` checks the moved fragment's `from` and
+  distinct nodes, not the cap). The repairer now keeps a bound on its
+  unconfirmed relocations, the shard's last sequenced position in the
+  attempt's epoch when `publish` returns `Unconfirmed`, and a pass moves
+  nothing until, before its index read, the shard has applied through it
+  (or a later epoch). Holding off while `applied < last_sequenced` would
+  also do, but on a shard taking writes some record is nearly always in
+  flight, which would starve moves; the attempt tracker's `Publishing`
+  states were no better a test, as a record sequenced with no known
+  position stays `Publishing` for the node's life. A repair's
+  unconfirmed relocation sets the bound too, as a later pass that finds
+  nothing lost may follow it
+  (`moves_wait_for_a_relocation_that_may_still_commit`, on a replicated
+  shard whose members stop acknowledging).
 - **The harness's balance check had to count the readers' copies
   (found).** `CopyObject` copies are coded too, so the shard holds more
   coded objects than the run wrote; a check over the written keys found

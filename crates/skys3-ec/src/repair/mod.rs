@@ -49,6 +49,11 @@
 //! committed layout from then on, and orphan reclamation reclaims it
 //! (§8.4). A move whose fragment cannot be read is abandoned: the
 //! fragment may be lost, which the next pass's checks find.
+//! A pass moves nothing while an `EC_RELOCATE` of an earlier pass may
+//! still commit, its commit unconfirmed (as when the shard's members did
+//! not acknowledge it in time): the index does not show it yet, and moves
+//! planned around the layout it replaces could put a stripe over a failure
+//! domain's cap once both apply.
 //!
 //! Every byte a repair or a move reads or writes first takes its share of
 //! the node's [`RepairBandwidth`] (`repair_bytes_per_second_per_node`).
@@ -333,6 +338,9 @@ struct State {
     nodes: BTreeMap<NodeId, Health>,
     /// When each fragment known lost was first found lost.
     lost: BTreeMap<(NodeId, FragmentId), Instant>,
+    /// A position at or after every `EC_RELOCATE` of this repairer whose
+    /// commit was not confirmed and that may still commit.
+    unconfirmed: Option<EpochSeq>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -464,6 +472,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         }
         let pass = self.passes.fetch_add(1, Ordering::Relaxed) + 1;
         self.attempts.settle(self.shard.applied());
+        // Taken before the inventory, which then holds every record applied
+        // by now.
+        let settled = self.settled();
         let inventory = match self.inventory().await {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -525,12 +536,26 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         }
         // Moves only once the shard has nothing to repair: a pass that
         // found a fragment lost repairs first, and the next pass checks
-        // again.
-        if !moves_first && report.lost == 0 {
+        // again. Nor while a relocation of an earlier pass may still
+        // commit: the inventory does not show it, and moves planned around
+        // the layout it would replace could put a stripe over a failure
+        // domain's cap once both apply.
+        if !moves_first && report.lost == 0 && settled {
             self.rebalance(pass, &inventory, &planner, &silent, &mut report)
                 .await;
         }
         report
+    }
+
+    /// Whether every `EC_RELOCATE` of this repairer whose commit was not
+    /// confirmed is settled: applied or rejected, or cut by a later epoch.
+    fn settled(&self) -> bool {
+        let applied = self.shard.applied();
+        let mut state = self.state();
+        if state.unconfirmed.is_some_and(|at| at <= applied) {
+            state.unconfirmed = None;
+        }
+        state.unconfirmed.is_none()
     }
 
     /// The shard's fragments and their keys' entries, from one index
@@ -841,7 +866,16 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                 emit(RepairStep::Abandoned);
                 return Err(RepairError::Publish(error));
             }
-            Publication::Unconfirmed(error) => return Err(RepairError::Publish(error)),
+            Publication::Unconfirmed(error) => {
+                // The record, if appended, is in the attempt's epoch and
+                // sequenced by now, so at or before this position. Positions
+                // order as the log does: once the shard applies this one,
+                // or one of a later epoch, the record is applied or cut.
+                let bound = EpochSeq::new(attempt.epoch, self.shard.last_sequenced());
+                let mut state = self.state();
+                state.unconfirmed = state.unconfirmed.max(Some(bound));
+                return Err(RepairError::Publish(error));
+            }
         };
         let relocated = committed.outcome == Outcome::Applied(Effect::Relocated);
         emit(RepairStep::Committed {
