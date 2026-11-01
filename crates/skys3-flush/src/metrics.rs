@@ -8,7 +8,10 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Unit;
+use skys3_config::TargetTransport;
 use skys3_obs::MetricsRegistry;
+
+use crate::peer::{Transport, TransportStatus};
 
 /// The label set of every flush metric: `bucket`, the bucket's name.
 type Labels = Vec<(String, String)>;
@@ -120,6 +123,7 @@ pub struct FlushMetrics {
     fills: Family<Labels, Counter>,
     fill_conflicts: Family<Labels, Counter>,
     streaming_overlap: Family<Labels, Histogram, fn() -> Histogram>,
+    transport: Family<Labels, Gauge>,
 }
 
 impl Default for FlushMetrics {
@@ -145,6 +149,7 @@ impl Default for FlushMetrics {
             fills: Family::default(),
             fill_conflicts: Family::default(),
             streaming_overlap: Family::new_with_constructor(overlap_histogram),
+            transport: Family::default(),
         }
     }
 }
@@ -276,6 +281,13 @@ impl FlushMetrics {
             Unit::Other("ratio".to_owned()),
             metrics.streaming_overlap.clone(),
         );
+        registry.register(
+            "flush_transport",
+            "1 for the transport (quic or s3) the flushers of a bucket whose target is a SkyS3 \
+             peer use now, 0 for the other; both 0 while they wait for one. S3 REST means the \
+             QUIC path failed, for example because UDP is blocked.",
+            metrics.transport.clone(),
+        );
         metrics
     }
 
@@ -329,8 +341,40 @@ impl FlushMetrics {
             .set(gauges.base_round_trip);
     }
 
+    /// Sets which transport `bucket`'s flushers use, if its target is a
+    /// SkyS3 peer, or one its `target_transport` says must be; otherwise
+    /// the bucket has no transport series.
+    pub fn set_transport(&self, bucket: &str, status: Option<&TransportStatus>) {
+        let peer = status.filter(|s| s.peer || s.configured == TargetTransport::Native);
+        for transport in [Transport::Quic, Transport::S3] {
+            let labels = transport_labels(bucket, transport);
+            match peer {
+                Some(status) => {
+                    let using = status.in_use == Some(transport);
+                    self.transport.get_or_create(&labels).set(i64::from(using));
+                }
+                None => {
+                    self.transport.remove(&labels);
+                }
+            }
+        }
+    }
+
+    /// The transport `bucket`'s flushers use, as the metric reports it.
+    #[must_use]
+    pub fn transport(&self, bucket: &str) -> Option<Transport> {
+        [Transport::Quic, Transport::S3]
+            .into_iter()
+            .find(|transport| {
+                self.transport
+                    .get(&transport_labels(bucket, *transport))
+                    .is_some_and(|gauge| gauge.get() == 1)
+            })
+    }
+
     /// Forgets `bucket`'s series, once it is no longer flushed here.
     pub fn remove(&self, bucket: &str) {
+        self.set_transport(bucket, None);
         let labels = labels(bucket);
         self.dirty_bytes.remove(&labels);
         self.dirty_budget.remove(&labels);
@@ -346,4 +390,11 @@ impl FlushMetrics {
 
 fn labels(bucket: &str) -> Labels {
     vec![("bucket".to_owned(), bucket.to_owned())]
+}
+
+fn transport_labels(bucket: &str, transport: Transport) -> Labels {
+    vec![
+        ("bucket".to_owned(), bucket.to_owned()),
+        ("transport".to_owned(), transport.as_str().to_owned()),
+    ]
 }

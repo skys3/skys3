@@ -1361,3 +1361,66 @@ fn target_regions_are_names() {
         .unwrap();
     assert_eq!(config.flush().target_region, "auto");
 }
+
+#[test]
+fn discovery_rules() {
+    const TLS: &str = r#"
+[transport]
+tls_cert_file = "/etc/skys3/node.crt"
+tls_key_file = "/etc/skys3/node.key"
+tls_ca_file = "/etc/skys3/ca.crt"
+"#;
+    let config = load(&format!(
+        "{TLS}[peering]\nquic_advertise = [\"peer.example.internal:7443\", \
+         \"[2001:db8::1]:7443\", \"198.51.100.7:7443\"]\n\
+         [peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\"\n\
+         s3_access_key_ids = [\"AKIAEUFLUSHER\"]\n"
+    ))
+    .unwrap();
+    assert_eq!(config.peering().quic_advertise.len(), 3);
+    let eu = &config.peering().peers[&ClusterId::new("skys3-prod-eu").unwrap()];
+    assert_eq!(eu.s3_access_key_ids, ["AKIAEUFLUSHER"]);
+    assert!(load("").unwrap().peering().quic_advertise.is_empty());
+
+    for bad in [
+        "peer.example.internal",
+        "peer.example.internal:0",
+        "peer.example.internal:70000",
+        ":7443",
+        "[not-v6]:7443",
+        "peer_host:7443",
+    ] {
+        assert_violations(
+            &format!("[peering]\nquic_advertise = [\"{bad}\"]"),
+            &["peering.quic_advertise"],
+        );
+    }
+    let many: Vec<String> = (0..17).map(|n| format!("\"h{n}:7443\"")).collect();
+    assert_violations(
+        &format!("[peering]\nquic_advertise = [{}]", many.join(", ")),
+        &["peering.quic_advertise"],
+    );
+    let long = format!("[peering]\nquic_advertise = [\"{}.x:1\"]", "a".repeat(252));
+    assert_violations(&long, &["peering.quic_advertise"]);
+
+    // An access key belongs to one peer, once, and looks like one.
+    let peer = |name: &str, keys: &str| {
+        format!("[peering.peers.{name}]\nca_file = \"/{name}.crt\"\ns3_access_key_ids = {keys}\n")
+    };
+    assert_violations(
+        &format!("{TLS}{}", peer("skys3-prod-eu", r#"["AKIA1", "AKIA1"]"#)),
+        &["peering.peers.skys3-prod-eu.s3_access_key_ids"],
+    );
+    assert_violations(
+        &format!(
+            "{TLS}{}{}",
+            peer("skys3-prod-eu", r#"["AKIA1"]"#),
+            peer("skys3-prod-us", r#"["AKIA1"]"#)
+        ),
+        &["peering.peers.skys3-prod-us.s3_access_key_ids"],
+    );
+    assert_violations(
+        &format!("{TLS}{}", peer("skys3-prod-eu", r#"["AKIA 1"]"#)),
+        &["peering.peers.skys3-prod-eu.s3_access_key_ids"],
+    );
+}

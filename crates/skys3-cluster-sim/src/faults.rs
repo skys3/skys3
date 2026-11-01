@@ -139,6 +139,20 @@ pub enum Fault {
         /// How long the peer stays down.
         downtime: Duration,
     },
+    /// UDP blocked between every node and the SkyS3 peer
+    /// ([`ClusterConfig::peer`](crate::ClusterConfig::peer)), as a
+    /// firewall that blocks it would: the native transport's links are
+    /// cut, or held with `hold`, and the peer's S3 endpoint stays
+    /// reachable. A block holds for `duration` whatever else heals in
+    /// between: a cut or held link between a node and the peer that heals
+    /// within it is blocked again. Blocks that overlap extend each other.
+    UdpBlock {
+        /// Whether the links are held, so that what was on its way arrives
+        /// once the block ends, rather than cut.
+        hold: bool,
+        /// How long UDP stays blocked.
+        duration: Duration,
+    },
 }
 
 impl Fault {
@@ -153,7 +167,8 @@ impl Fault {
             | Fault::ControlOutage { duration }
             | Fault::ControlLatency { duration, .. }
             | Fault::LostCasResponses { duration, .. }
-            | Fault::RemoteLink { duration, .. } => Some(*duration),
+            | Fault::RemoteLink { duration, .. }
+            | Fault::UdpBlock { duration, .. } => Some(*duration),
             Fault::RebuildControlStore { downtime, .. } => Some(*downtime),
             Fault::FailSync { .. } | Fault::Join { .. } | Fault::LoseControlStore => None,
         }
@@ -432,7 +447,8 @@ mod tests {
                     | Fault::PeerRestart { .. }
                     | Fault::LoseControlStore
                     | Fault::RebuildControlStore { .. }
-                    | Fault::RemoteLink { .. } => {
+                    | Fault::RemoteLink { .. }
+                    | Fault::UdpBlock { .. } => {
                         panic!(
                             "a random plan joins no node, loses no store, and drops no remote link"
                         )

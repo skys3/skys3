@@ -119,6 +119,7 @@ async fn multipart_uploads_keep_tags_and_check_content_md5() {
             etag,
         }],
         precondition: WritePrecondition::None,
+        apply_by_ms: None,
     };
     store.complete_multipart_upload(request).await.unwrap();
     assert_eq!(store.tags("m"), Some(tags));
@@ -436,6 +437,7 @@ fn complete(
         upload_id: upload_id.clone(),
         parts,
         precondition,
+        apply_by_ms: None,
     }
 }
 
@@ -2064,6 +2066,7 @@ async fn observers_see_every_request_applied_and_the_key_it_left() {
             etag: part,
         }],
         precondition: WritePrecondition::None,
+        apply_by_ms: None,
     };
     assert!(store.complete_multipart_upload(complete).await.is_err());
     store.delete_object(DeleteObject::new("a")).await.unwrap();

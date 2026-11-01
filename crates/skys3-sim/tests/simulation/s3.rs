@@ -352,6 +352,7 @@ impl Flusher {
             upload_id,
             parts,
             precondition,
+            apply_by_ms: None,
         };
         store.complete_multipart_upload(complete).await
     }

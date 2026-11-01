@@ -72,6 +72,12 @@ impl WriteIdentity {
     /// by this much (§7.2).
     pub const METADATA_RESERVED_BYTES: usize = Self::METADATA_KEY.len() + Self::MAX_LEN;
 
+    /// The header of a peer cluster's S3 write that carries its apply-by
+    /// time, in milliseconds since the Unix epoch: the destination refuses
+    /// to sequence the write later (§7.8). A gateway reads it only from a
+    /// peer's access keys.
+    pub const APPLY_BY_HEADER: &'static str = "x-skys3-apply-by";
+
     /// Assembles an identity.
     #[must_use]
     pub const fn new(

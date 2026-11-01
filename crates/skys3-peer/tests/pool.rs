@@ -160,6 +160,32 @@ async fn pools_connections_per_destination_within_the_limit() {
     server.abort();
 }
 
+#[tokio::test]
+async fn a_shared_lease_stands_for_its_shards() {
+    let (us, eu, source_trust, _) = trusts();
+    let destination_endpoint = eu.endpoint("eu-1", PeerTrust::new());
+    let to = destination(EU, &destination_endpoint);
+    let pool = ConnectionPool::with_meter(us.endpoint("us-1", source_trust), 2, steady());
+
+    // The shard flushers of a target share one lease: it stands for each.
+    let lease = pool.attach(to.clone());
+    lease.set_shards(3);
+    assert_eq!(lease.shards(), 3);
+    assert_eq!(summary(&pool, &to), Some((3, 1, 6, 0)));
+    // Another target's lease to the same destination adds its own.
+    let other = pool.attach(to.clone());
+    assert_eq!(summary(&pool, &to), Some((4, 1, 8, 0)));
+    // Fewer shard flushers lower the ceiling; none still holds one.
+    lease.set_shards(0);
+    assert_eq!(lease.shards(), 1);
+    assert_eq!(summary(&pool, &to), Some((2, 1, 4, 0)));
+    lease.set_shards(2);
+    drop(other);
+    assert_eq!(summary(&pool, &to), Some((2, 1, 4, 0)));
+    drop(lease);
+    assert_eq!(pool.stats(&to), None);
+}
+
 /// Trust between `prod-us` (the source) and `prod-eu` (the destination).
 fn trusts() -> (Cluster, Cluster, PeerTrust, PeerTrust) {
     let us = Cluster::new(US);

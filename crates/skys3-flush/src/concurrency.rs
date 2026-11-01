@@ -58,6 +58,8 @@ use skys3_types::ETag;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
+use crate::peer::Stamp;
+
 /// The rounds over which the base round trip is the smallest round mean.
 /// After a decrease for rising latency, the window grows back past the
 /// knee in about a third of the window's size in rounds, so the base is
@@ -489,15 +491,31 @@ impl Drop for Membership {
 }
 
 /// A target's store, as its flushers send to it: each request through the
-/// target's [`Window`].
+/// target's [`Window`], and each write that publishes or deletes a version
+/// stamped with its apply-by time as it is sent, for a target that may be
+/// a SkyS3 peer (§7.8).
 pub(crate) struct Paced<S> {
-    inner: Arc<S>,
+    inner: Stamping<S>,
     window: Arc<Window>,
 }
 
 impl<S> Paced<S> {
     pub(crate) fn new(inner: Arc<S>, window: Arc<Window>) -> Self {
-        Self { inner, window }
+        Self {
+            inner: Stamping::new(inner, None),
+            window,
+        }
+    }
+
+    /// Stamps every write that publishes or deletes a version with
+    /// `stamp`.
+    pub(crate) fn stamp_with(&mut self, stamp: Stamp) {
+        self.inner.stamp = Some(stamp);
+    }
+
+    /// Whether writes are stamped: the target may be a SkyS3 peer.
+    pub(crate) fn stamped(&self) -> bool {
+        self.inner.stamp.is_some()
     }
 }
 
@@ -506,6 +524,97 @@ impl<S: fmt::Debug> fmt::Debug for Paced<S> {
         f.debug_struct("Paced")
             .field("inner", &self.inner)
             .finish_non_exhaustive()
+    }
+}
+
+/// A store whose writes that publish or delete a version (`PutObject`,
+/// `DeleteObject`, `CopyObject`, `CompleteMultipartUpload`) carry an
+/// apply-by time, stamped as each is sent, if it has a [`Stamp`]: a SkyS3
+/// peer refuses to sequence them later (§7.8). Other requests change no
+/// key and pass as they are.
+#[derive(Debug)]
+pub(crate) struct Stamping<S> {
+    inner: Arc<S>,
+    stamp: Option<Stamp>,
+}
+
+impl<S> Stamping<S> {
+    pub(crate) fn new(inner: Arc<S>, stamp: Option<Stamp>) -> Self {
+        Self { inner, stamp }
+    }
+
+    /// The apply-by time of a write sent now, if writes are stamped.
+    fn apply_by_ms(&self) -> Option<u64> {
+        self.stamp.as_ref().map(Stamp::apply_by_ms)
+    }
+}
+
+impl<S: ObjectStore> ObjectStore for Stamping<S> {
+    async fn put_object(&self, request: PutObject) -> S3Result<WriteOutput> {
+        let apply_by_ms = self.apply_by_ms();
+        let request = PutObject {
+            apply_by_ms,
+            ..request
+        };
+        self.inner.put_object(request).await
+    }
+
+    async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
+        self.inner.get_object(request).await
+    }
+
+    async fn head_object(&self, request: HeadObject) -> S3Result<ObjectInfo> {
+        self.inner.head_object(request).await
+    }
+
+    async fn delete_object(&self, request: DeleteObject) -> S3Result<DeleteOutput> {
+        let apply_by_ms = self.apply_by_ms();
+        let request = DeleteObject {
+            apply_by_ms,
+            ..request
+        };
+        self.inner.delete_object(request).await
+    }
+
+    async fn list_objects_v2(&self, request: ListObjectsV2) -> S3Result<ListObjectsV2Output> {
+        self.inner.list_objects_v2(request).await
+    }
+
+    async fn copy_object(&self, request: CopyObject) -> S3Result<WriteOutput> {
+        let apply_by_ms = self.apply_by_ms();
+        let request = CopyObject {
+            apply_by_ms,
+            ..request
+        };
+        self.inner.copy_object(request).await
+    }
+
+    async fn create_multipart_upload(&self, request: CreateMultipartUpload) -> S3Result<UploadId> {
+        self.inner.create_multipart_upload(request).await
+    }
+
+    async fn upload_part(&self, request: UploadPart) -> S3Result<ETag> {
+        self.inner.upload_part(request).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        request: CompleteMultipartUpload,
+    ) -> S3Result<WriteOutput> {
+        let apply_by_ms = self.apply_by_ms();
+        let request = CompleteMultipartUpload {
+            apply_by_ms,
+            ..request
+        };
+        self.inner.complete_multipart_upload(request).await
+    }
+
+    async fn abort_multipart_upload(&self, request: AbortMultipartUpload) -> S3Result<()> {
+        self.inner.abort_multipart_upload(request).await
+    }
+
+    async fn list_parts(&self, request: ListParts) -> S3Result<ListPartsOutput> {
+        self.inner.list_parts(request).await
     }
 }
 

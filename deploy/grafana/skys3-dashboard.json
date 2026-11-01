@@ -2145,6 +2145,52 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Flush transport",
+      "description": "The transport the flushers of each bucket whose target is a peer SkyS3 cluster use: 1 for QUIC or S3 REST. S3 REST under target_transport = auto means the native transport fell back, for example because UDP is blocked.",
+      "id": 51,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 161
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (bucket, transport) (skys3_flush_transport{instance=~\"$instance\", bucket=~\"$bucket\"})",
+          "legendFormat": "{{bucket}} {{transport}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Admin listener",
       "id": 49,
@@ -2153,7 +2199,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 161
+        "y": 169
       },
       "panels": []
     },
@@ -2170,7 +2216,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 162
+        "y": 170
       },
       "fieldConfig": {
         "defaults": {

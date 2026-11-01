@@ -32,6 +32,7 @@ fn config(peers: &[(&str, std::path::PathBuf)]) -> PeeringConfig {
                     PeerConfig {
                         ca_file: ca_file.clone(),
                         buckets: vec![pair("b-src", "archive")],
+                        s3_access_key_ids: Vec::new(),
                     },
                 )
             })

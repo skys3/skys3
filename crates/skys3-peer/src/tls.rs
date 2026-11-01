@@ -28,6 +28,7 @@ use skys3_net::{Credentials, IdentityError, PeerIdentity, Role, pki_error};
 use skys3_types::{ClusterId, NodeId};
 use webpki::{EndEntityCert, KeyUsage};
 
+use crate::descriptor::{DescriptorSigner, DescriptorVerifier};
 use crate::trust::PeerTrust;
 
 /// The ALPN protocol of peer connections. It names the protocol, not a
@@ -90,11 +91,21 @@ impl PeerTls {
         Some(Self {
             cluster: credentials.cluster().clone(),
             certified: credentials.certified_key(),
-            verifier: Arc::new(PeerVerifier {
-                trust,
-                algorithms: provider().signature_verification_algorithms,
-            }),
+            verifier: Arc::new(PeerVerifier::new(trust)),
         })
+    }
+
+    /// Signs the peer descriptors this node serves (§7.8), with the key of
+    /// the certificate it presents to peers.
+    #[must_use]
+    pub fn descriptor_signer(&self) -> DescriptorSigner {
+        DescriptorSigner::new(Arc::clone(&self.certified))
+    }
+
+    /// Verifies the peer descriptors of the clusters this node trusts.
+    #[must_use]
+    pub fn descriptor_verifier(&self) -> DescriptorVerifier {
+        DescriptorVerifier::from_verifier(Arc::clone(&self.verifier))
     }
 
     /// This node's cluster.
@@ -173,13 +184,28 @@ pub(crate) fn peer_of(leaf: &CertificateDer<'_>) -> Option<(ClusterId, NodeId)> 
 /// Verifies peer certificates against the trust bundle of the cluster
 /// each one names.
 #[derive(Debug)]
-struct PeerVerifier {
+pub(crate) struct PeerVerifier {
     trust: Arc<PeerTrust>,
     algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl PeerVerifier {
-    fn verify(
+    pub(crate) fn new(trust: Arc<PeerTrust>) -> Self {
+        Self {
+            trust,
+            algorithms: crate::descriptor::algorithms(),
+        }
+    }
+
+    /// The signature verification algorithms it accepts.
+    pub(crate) fn algorithms(&self) -> &WebPkiSupportedAlgorithms {
+        &self.algorithms
+    }
+
+    /// Verifies `leaf`'s chain for `usage` at `now`: it must lead to the
+    /// CA bundle of the peer cluster it names (`expected`, if given), and
+    /// name a node.
+    pub(crate) fn verify(
         &self,
         leaf: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],

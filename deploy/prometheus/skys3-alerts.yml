@@ -50,6 +50,15 @@ groups:
           summary: "Flushes of bucket {{ $labels.bucket }} keep failing."
           description: "The oldest change the flushers of bucket {{ $labels.bucket }} work on is {{ $value | humanizeDuration }} old, and their attempts are being retried: the remote target is unreachable, refusing, or throttling (design sections 7.7 and 13)."
           runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#flush-stalled
+      - alert: SkyS3PeerTransportFallback
+        expr: max by (bucket) (skys3_flush_transport{transport="s3"}) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bucket {{ $labels.bucket }} flushes to its peer cluster over S3 REST."
+          description: "The flushers of bucket {{ $labels.bucket }} reach their peer SkyS3 cluster over S3 REST instead of QUIC: no handshake with the addresses its verified descriptor names succeeded within peer_connect_timeout_ms, for example because UDP is blocked (design sections 7.8 and 13). Flushing goes on, more slowly over a long link."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#peer-transport-fallback
       - alert: SkyS3DirtyBudgetNearlyFull
         expr: max by (instance, bucket) (skys3_dirty_bytes / skys3_dirty_budget_bytes) > 0.8
         for: 5m

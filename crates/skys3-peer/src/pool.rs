@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -354,6 +355,7 @@ impl ConnectionPool {
             pool: self.clone(),
             destination,
             destination_pool: pool,
+            shards: AtomicU32::new(1),
         }
     }
 
@@ -416,17 +418,42 @@ impl ConnectionPool {
     }
 }
 
-/// One shard flusher's attachment to a destination. Dropping it lowers the
-/// destination's ceiling, and the last lease of a destination releases its
-/// connections, which close once their streams are done.
+/// One shard flusher's attachment to a destination, or, after
+/// [`ShardLease::set_shards`], that of the shard flushers of a target that
+/// share it. Dropping it lowers the destination's ceiling, and the last
+/// lease of a destination releases its connections, which close once
+/// their streams are done.
 #[derive(Debug)]
 pub struct ShardLease {
     pool: ConnectionPool,
     destination: Destination,
     destination_pool: Arc<DestinationPool>,
+    /// The shards it stands for: at least one.
+    shards: AtomicU32,
 }
 
 impl ShardLease {
+    /// Makes the lease stand for `shards` shard flushers, at least one,
+    /// that share it: the destination's ceiling is
+    /// `peer_connections_per_shard` for each of them, and its limit grows
+    /// by one connection for each.
+    pub fn set_shards(&self, shards: u32) {
+        let shards = shards.max(1);
+        let mut state = lock(&self.destination_pool.state);
+        let before = self.shards.swap(shards, Ordering::Relaxed);
+        state.shards = state.shards - before + shards;
+        let total = state.shards;
+        let max = self.pool.inner.per_shard.saturating_mul(total);
+        state.limit.set_ceiling(max, total);
+        state.trim();
+    }
+
+    /// The shards the lease stands for.
+    #[must_use]
+    pub fn shards(&self) -> u32 {
+        self.shards.load(Ordering::Relaxed)
+    }
+
     /// The destination.
     #[must_use]
     pub fn destination(&self) -> &Destination {
@@ -512,7 +539,7 @@ impl Drop for ShardLease {
     fn drop(&mut self) {
         let mut destinations = lock(&self.pool.inner.destinations);
         let mut state = lock(&self.destination_pool.state);
-        state.shards -= 1;
+        state.shards -= self.shards.load(Ordering::Relaxed);
         let shards = state.shards;
         if shards == 0 {
             drop(state);

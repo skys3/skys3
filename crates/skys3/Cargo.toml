@@ -28,7 +28,9 @@ skys3-gateway.workspace = true
 skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
+skys3-net.workspace = true
 skys3-obs.workspace = true
+skys3-peer.workspace = true
 skys3-remote.workspace = true
 skys3-shard.workspace = true
 skys3-sts.workspace = true
@@ -45,7 +47,11 @@ aws-credential-types.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
 aws-types.workspace = true
+# PEM files of the throwaway peer PKI of the peering tests.
+base64.workspace = true
 md-5.workspace = true
+# The throwaway peer PKI of the peering tests.
+rcgen.workspace = true
 # The coordinator's and repair's metrics, for the metrics reference tests.
 skys3-coord.workspace = true
 skys3-ec.workspace = true

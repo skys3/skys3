@@ -320,6 +320,9 @@ struct State {
     denied: BTreeSet<(String, String)>,
     /// Every write the store applied, in order: its operation and key.
     applied: Vec<(Operation, String)>,
+    /// Every write the store received, in order: its operation, key, and
+    /// apply-by time, which the store records but does not check.
+    stamped: Vec<(Operation, String, Option<u64>)>,
     /// The links of the sources whose link dropped at least once.
     sources: BTreeMap<String, SourceLink>,
     /// What is called after each request the store applied.
@@ -362,6 +365,7 @@ impl State {
             unanswered: HashMap::new(),
             denied: BTreeSet::new(),
             applied: Vec::new(),
+            stamped: Vec::new(),
             sources: BTreeMap::new(),
             observer: None,
             losing: None,
@@ -592,6 +596,22 @@ impl SimS3 {
     /// Returns what the store has done so far.
     pub fn stats(&self) -> SimS3Stats {
         self.state().stats
+    }
+
+    /// Returns the key and apply-by time of every write the store
+    /// received (`PutObject`, `DeleteObject`, `CopyObject`, and
+    /// `CompleteMultipartUpload`), in order, applied or not, by operation.
+    /// The store does not check them, as a SkyS3 peer does (design §7.8).
+    pub fn apply_by_times(&self) -> Vec<(Operation, String, Option<u64>)> {
+        self.state().stamped.clone()
+    }
+
+    /// Records that a write of `operation` to `key` with `apply_by_ms`
+    /// arrived.
+    fn stamped(&self, operation: Operation, key: &str, apply_by_ms: Option<u64>) {
+        self.state()
+            .stamped
+            .push((operation, key.to_owned(), apply_by_ms));
     }
 
     /// Returns the keys of every write of `operation` the store applied,
@@ -974,6 +994,7 @@ async fn sleep_until(at: Instant) {
 
 impl ObjectStore for SimS3 {
     async fn put_object(&self, mut request: PutObject) -> S3Result<WriteOutput> {
+        self.stamped(Operation::PutObject, &request.key, request.apply_by_ms);
         let support = self.shared.config.conditionals.put_object;
         let gated = Self::gate_precondition(support, request.precondition.clone());
         let key = request.key.clone();
@@ -1008,6 +1029,7 @@ impl ObjectStore for SimS3 {
     }
 
     async fn delete_object(&self, mut request: DeleteObject) -> S3Result<DeleteOutput> {
+        self.stamped(Operation::DeleteObject, &request.key, request.apply_by_ms);
         let support = self.shared.config.conditionals.delete_object;
         let gated = Self::gate_etag(support, request.if_match.clone(), "If-Match");
         let key = request.key.clone();
@@ -1031,6 +1053,7 @@ impl ObjectStore for SimS3 {
     }
 
     async fn copy_object(&self, mut request: CopyObject) -> S3Result<WriteOutput> {
+        self.stamped(Operation::CopyObject, &request.key, request.apply_by_ms);
         let conditionals = self.shared.config.conditionals;
         let directives = self.gate_directives(&mut request);
         let gated = directives
@@ -1082,6 +1105,11 @@ impl ObjectStore for SimS3 {
         &self,
         mut request: CompleteMultipartUpload,
     ) -> S3Result<WriteOutput> {
+        self.stamped(
+            Operation::CompleteMultipartUpload,
+            &request.key,
+            request.apply_by_ms,
+        );
         let support = self.shared.config.conditionals.complete_multipart_upload;
         let gated = Self::gate_precondition(support, request.precondition.clone());
         let key = request.key.clone();

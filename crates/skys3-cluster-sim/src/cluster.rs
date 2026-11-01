@@ -10,7 +10,7 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3::storage::Storage;
-use skys3_config::FailureDomain;
+use skys3_config::{FailureDomain, TargetTransport};
 use skys3_control::faults::{FaultRates, FaultyStore};
 use skys3_control::{
     Applied, ControlExport, ControlStore, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
@@ -44,7 +44,8 @@ use crate::node::{
     Shared, TRANSPORT_PORT,
 };
 use crate::origin::{self, Origin, OriginAudit, OriginLog, OriginRoutes};
-use crate::peer::{self, Destination, Peer, PeerAudit};
+use crate::peer::{self, DescriptorKind, Destination, Peer, PeerAudit, TransportAudit};
+use crate::peer_s3;
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
@@ -481,6 +482,11 @@ const FINAL_READ_ATTEMPTS: usize = 120;
 /// flushers to send what they hold (§8.9).
 const BACKUP_DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
+/// How long the driver waits, once every fault healed and the flushers
+/// drained, for every peer target that fell back to S3 REST to return to
+/// QUIC: a re-probe after the longest backoff, and its handshake.
+const QUIC_RETURN_LIMIT: Duration = Duration::from_secs(30);
+
 /// The gateways' `max_body_duration` in a run with large objects: a body
 /// that never commits is given up twice as late (§7.3).
 const LARGE_BODY_DURATION: Duration = Duration::from_secs(3);
@@ -498,6 +504,8 @@ enum Heal {
     Release(Endpoint, Endpoint),
     /// The end of a [`Fault::RemoteLink`] of the node at this position.
     RemoteLink(usize),
+    /// The end of a [`Fault::UdpBlock`], unless a later one extended it.
+    UdpBlock,
     /// The end of a window of [`InForce`].
     End(Window),
     /// Not a heal: the power-loss restart a failed sync needs, for the
@@ -696,6 +704,11 @@ impl<S: NodeServices> Cluster<S> {
                 }
             });
         }
+        if world.destination.is_some() {
+            // The peer's S3 endpoint, which the faults of the links between
+            // the nodes and the peer do not cut.
+            sim.host(peer_s3::RELAY, || peer_s3::relay(peer::HOST));
+        }
         if let Some(destination) = &world.destination {
             let destination = Arc::clone(destination);
             sim.host(peer::HOST, move || {
@@ -711,6 +724,7 @@ impl<S: NodeServices> Cluster<S> {
         if let Some(peer) = self.config.peer {
             for slot in &world.slots {
                 sim.set_link_latency(slot.host.as_str(), peer::HOST, peer.latency);
+                sim.set_link_latency(slot.host.as_str(), peer_s3::RELAY, peer.latency);
             }
         }
         let joining = self.config.nodes.saturating_sub(self.config.joining).max(1);
@@ -737,6 +751,8 @@ impl<S: NodeServices> Cluster<S> {
             failure: None,
             audit: None,
             peer_down: None,
+            transports: self.config.peer.map(|_| TransportAudit::default()),
+            udp_block: None,
             large: None,
             drill: self.config.snapshots.map(|config| {
                 let mut rng = SmallRng::seed_from_u64(context.fork_seed());
@@ -935,6 +951,34 @@ impl<S: NodeServices> Cluster<S> {
             });
             self.drive(&mut sim, &mut driver, &history, true)?;
         }
+        // Every peer target that fell back returns to QUIC, once the
+        // faults healed, if its descriptor verifies.
+        let returned = Arc::new(Mutex::new(None));
+        if let Some(peer) = self.config.peer
+            && peer.transport == TargetTransport::Auto
+            && peer.descriptor == DescriptorKind::Signed
+        {
+            let flushers = Arc::clone(&world.shared.flushers);
+            let buckets = routes.buckets.clone();
+            let lagging = Arc::clone(&returned);
+            sim.client("quic-return", async move {
+                let left = peer::back_on_quic(flushers, buckets, QUIC_RETURN_LIMIT).await;
+                *lagging.lock().unwrap_or_else(PoisonError::into_inner) = left;
+                Ok(())
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        if let Some(lagging) = returned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            return Err(RunError::Check(Violation {
+                key: lagging.clone(),
+                reason: format!("a peer target did not return to QUIC: {lagging}"),
+                operations: Vec::new(),
+            }));
+        }
         // Every version reaches its target and every remote upload a
         // flusher opened ends, once the faults healed.
         let large_drained = Arc::new(Mutex::new(Ok(())));
@@ -1002,7 +1046,11 @@ impl<S: NodeServices> Cluster<S> {
                 destination.stop(true);
                 sim.crash(peer::HOST);
                 let finished = destination.finish()?.map_err(RunError::Check)?;
-                (Some(finished.objects), finished.audit)
+                let audit = match &driver.transports {
+                    Some(transports) => transports.add_to(finished.audit),
+                    None => finished.audit,
+                };
+                (Some(finished.objects), audit)
             }
             None => (None, PeerAudit::default()),
         };
@@ -1209,6 +1257,12 @@ impl<S: NodeServices> Cluster<S> {
         loop {
             driver.advance(sim, heal_all);
             driver.check()?;
+            if let Some(transports) = &mut driver.transports {
+                let world = driver.world;
+                transports
+                    .sample(sim.elapsed(), &world.shared.flushers, &world.routes.buckets)
+                    .map_err(RunError::Check)?;
+            }
             self.check_invariants(sim, driver, history)?;
             if sim.step().map_err(failed)? {
                 return Ok(());
@@ -1349,12 +1403,17 @@ impl<S: NodeServices> World<S> {
                 seed,
             )));
         }
+        // Every bucket may flush to the peer: it receives from each.
+        let sources = (0..config.buckets)
+            .map(|b| BucketId::new(format!("b-sim{b}")))
+            .collect::<Result<Vec<_>, _>>()?;
         let destination = config
             .peer
             .map(|peer| {
                 Destination::new(
                     context.disk_with_faults(config.disk_faults.clone()),
                     &cluster,
+                    &sources,
                     peer,
                     settings.log.clone(),
                     node::index_config(&settings),
@@ -1368,8 +1427,13 @@ impl<S: NodeServices> World<S> {
             .map(|id| Ok((id.clone(), format!("{id}:{TRANSPORT_PORT}").parse()?)))
             .collect::<Result<BTreeMap<NodeId, NodeAddress>, BoxError>>()?;
         let placement = Arc::new(placement);
+        let peer_side = destination
+            .as_ref()
+            .map(|destination| destination.side(&sources))
+            .transpose()?;
         let settings = NodeSettings {
             drift: config.drift,
+            peer_side,
             ..settings
         };
         Ok(Self {
@@ -1836,10 +1900,11 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         "[buckets.defaults]\nshards_per_bucket = {}\nreplicas = {}\nmin_write_replicas = 1\n{}",
         shape.shards_per_bucket,
         shape.replicas.clamp(1, shape.nodes.max(1)),
-        if shape.peer.is_some() {
-            "target_transport = \"native\"\n"
-        } else {
-            ""
+        match shape.peer.map(|peer| peer.transport) {
+            Some(TargetTransport::Native) => "target_transport = \"native\"\n",
+            Some(TargetTransport::Auto) => "target_transport = \"auto\"\n",
+            Some(TargetTransport::S3) => "target_transport = \"s3\"\n",
+            None => "",
         },
     );
     let ack_policy = if shape.write_through.waits() {
@@ -1952,6 +2017,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         snapshots: shape.snapshots.is_some(),
         origin: shape.origin.clone(),
         peer: shape.peer,
+        peer_side: None,
     })
 }
 
@@ -2112,6 +2178,11 @@ struct Driver<'a, S> {
     audit: Option<RemoteAudit>,
     /// When the SkyS3 peer restarts, while it is down.
     peer_down: Option<Duration>,
+    /// The samples of the peer targets' transports, with a peer.
+    transports: Option<TransportAudit>,
+    /// Until when UDP is blocked between the nodes and the peer, and
+    /// whether the links are held rather than cut.
+    udp_block: Option<(Duration, bool)>,
     /// The audit of large objects, which also aims crashes at the steps
     /// of multipart uploads, once the clients run.
     large: Option<Versions>,
@@ -2168,6 +2239,19 @@ impl<S: NodeServices> Driver<'_, S> {
             if !heal_all {
                 self.start(sim, now, fault);
             }
+        }
+        // UDP blocked between every node and the peer as a `COMMIT` is on
+        // its way.
+        let hold = self.world.destination.as_ref().and_then(|d| d.take_aim());
+        if let Some(duration) = hold.filter(|_| !heal_all && self.udp_block.is_none()) {
+            self.start(
+                sim,
+                now,
+                Fault::UdpBlock {
+                    hold: true,
+                    duration,
+                },
+            );
         }
         let aimed = self.large.as_ref().map(Versions::take_crashes);
         for fault in aimed.into_iter().flatten() {
@@ -2283,6 +2367,15 @@ impl<S: NodeServices> Driver<'_, S> {
                 sim.hold(self.host(a).as_str(), self.host(b).as_str());
                 self.heals.push((until, Heal::Release(a, b)));
             }
+            Fault::UdpBlock { hold, .. } => {
+                let block = match self.udp_block {
+                    Some((end, held)) => (end.max(until), held),
+                    None => (until, hold),
+                };
+                self.udp_block = Some(block);
+                self.block_udp(sim);
+                self.heals.push((until, Heal::UdpBlock));
+            }
             Fault::FailSync { node, disk } => {
                 let disks = &self.world.slots[node].disks;
                 disks[disk % disks.len()].1.fail_next_syncs(1);
@@ -2347,8 +2440,28 @@ impl<S: NodeServices> Driver<'_, S> {
 
     fn heal(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, heal: Heal, heal_all: bool) {
         match heal {
-            Heal::Repair(a, b) => sim.repair(self.host(a).as_str(), self.host(b).as_str()),
-            Heal::Release(a, b) => sim.release(self.host(a).as_str(), self.host(b).as_str()),
+            Heal::Repair(a, b) => {
+                sim.repair(self.host(a).as_str(), self.host(b).as_str());
+                self.block_udp(sim);
+            }
+            Heal::Release(a, b) => {
+                sim.release(self.host(a).as_str(), self.host(b).as_str());
+                self.block_udp(sim);
+            }
+            Heal::UdpBlock => match self.udp_block {
+                Some((end, hold)) if heal_all || end <= now => {
+                    self.udp_block = None;
+                    for node in 0..self.world.slots.len() {
+                        let (a, b) = (self.host(Endpoint::Node(node)), self.host(Endpoint::Peer));
+                        if hold {
+                            sim.release(a.as_str(), b.as_str());
+                        } else {
+                            sim.repair(a.as_str(), b.as_str());
+                        }
+                    }
+                }
+                _ => {}
+            },
             Heal::RemoteLink(node) => {
                 let host = &self.world.slots[node].host;
                 self.world.remote.set_source_down(host, false);
@@ -2379,6 +2492,22 @@ impl<S: NodeServices> Driver<'_, S> {
                 };
                 self.fences += 1;
                 self.crash(sim, now, node, true, downtime);
+            }
+        }
+    }
+
+    /// Cuts or holds the links between every node and the peer while UDP
+    /// is blocked.
+    fn block_udp(&self, sim: &mut turmoil::Sim<'_>) {
+        let Some((_, hold)) = self.udp_block else {
+            return;
+        };
+        for node in 0..self.world.slots.len() {
+            let (a, b) = (self.host(Endpoint::Node(node)), self.host(Endpoint::Peer));
+            if hold {
+                sim.hold(a.as_str(), b.as_str());
+            } else {
+                sim.partition(a.as_str(), b.as_str());
             }
         }
     }

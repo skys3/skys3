@@ -858,6 +858,7 @@ impl<S: ObjectStore> Run<'_, S> {
                         etag,
                     }],
                     precondition,
+                    apply_by_ms: None,
                 };
                 let result = self.store.complete_multipart_upload(request).await;
                 self.record_write(key, &result);

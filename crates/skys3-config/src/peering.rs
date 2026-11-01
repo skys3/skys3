@@ -32,6 +32,10 @@ pub enum CongestionControl {
 pub struct PeeringConfig {
     /// `quic_listen`: the UDP address peer clusters connect to.
     pub quic_listen: SocketAddr,
+    /// `quic_advertise`: the addresses, as `host:port`, that this node's
+    /// peer descriptor names for its QUIC endpoint (§7.8). Empty: the
+    /// node serves no descriptor, and sources reach it over S3 REST.
+    pub quic_advertise: Vec<String>,
     /// `congestion_control`.
     pub congestion_control: CongestionControl,
     /// `peer_frame_bytes`: the size of a `DATA` frame, and the largest
@@ -72,7 +76,20 @@ pub struct PeerConfig {
     /// sends to.
     #[serde(default)]
     pub buckets: Vec<BucketPair>,
+    /// `s3_access_key_ids`: the access keys the peer's flushers sign with
+    /// on this cluster's S3 endpoint, when they fall back to S3 REST
+    /// (§7.8). A request signed with one of them is the peer's: it may
+    /// write the buckets whose `peer_source` is the peer, with the peer's
+    /// write identities.
+    #[serde(default)]
+    pub s3_access_key_ids: Vec<String>,
 }
+
+/// The most addresses `quic_advertise` lists.
+pub const MAX_ADVERTISED_ADDRESSES: usize = 16;
+
+/// The longest address `quic_advertise` lists, in bytes.
+pub const MAX_ADVERTISED_ADDRESS_LEN: usize = 255;
 
 /// A source bucket of a peer cluster, and the bucket of this cluster it
 /// replicates into.
@@ -91,6 +108,7 @@ impl Default for PeeringConfig {
     fn default() -> Self {
         Self {
             quic_listen: SocketAddr::from(([0, 0, 0, 0], 7443)),
+            quic_advertise: Vec::new(),
             congestion_control: CongestionControl::Cubic,
             peer_frame_bytes: 256 * KIB,
             peer_connect_timeout_ms: 3000,
@@ -120,6 +138,8 @@ impl PeeringConfig {
         checker: &mut Checker,
     ) {
         self.check_limits(checker);
+        self.check_advertised(checker);
+        let mut keys = BTreeSet::new();
         for (cluster, peer) in &self.peers {
             let table = key_path("peering.peers", cluster.as_str());
             checker.require(Some(cluster) != cluster_id, &table, || {
@@ -144,6 +164,37 @@ impl PeeringConfig {
                     )
                 });
             }
+            for key in &peer.s3_access_key_ids {
+                checker.require(
+                    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric()),
+                    &format!("{table}.s3_access_key_ids"),
+                    || format!("{key:?} is not an access key ID: ASCII letters and digits"),
+                );
+                checker.require(
+                    keys.insert(key),
+                    &format!("{table}.s3_access_key_ids"),
+                    || format!("{key} is listed twice, or for another peer too"),
+                );
+            }
+        }
+    }
+
+    /// Each advertised address is `host:port`, with a host of letters,
+    /// digits, `.`, `-`, or a bracketed IPv6 address, and a nonzero port.
+    fn check_advertised(&self, checker: &mut Checker) {
+        let key = "peering.quic_advertise";
+        checker.require(
+            self.quic_advertise.len() <= MAX_ADVERTISED_ADDRESSES,
+            key,
+            || format!("lists more than {MAX_ADVERTISED_ADDRESSES} addresses"),
+        );
+        for address in &self.quic_advertise {
+            checker.require(advertisable(address), key, || {
+                format!(
+                    "{address:?} is not host:port, with a port from 1 to 65535, in at most \
+                     {MAX_ADVERTISED_ADDRESS_LEN} bytes"
+                )
+            });
         }
     }
 
@@ -197,4 +248,24 @@ impl PeeringConfig {
             self.peer_staging_ttl_seconds,
         );
     }
+}
+
+/// Whether `address` is `host:port` as `quic_advertise` takes it.
+#[must_use]
+pub fn advertisable(address: &str) -> bool {
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        }
+    };
+    address.len() <= MAX_ADVERTISED_ADDRESS_LEN
+        && host_ok
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }

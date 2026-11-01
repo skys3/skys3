@@ -98,7 +98,10 @@ pub trait CommitSink: Clone + Send + Sync + 'static {
     ///
     /// A commit is applied at most once: a sink that finds the commit's
     /// write already applied, as after a lost `APPLIED`, answers with the
-    /// result it had.
+    /// result it had. A commit with an apply-by time
+    /// ([`Commit::apply_by_ms`]) is sequenced by then, on the wall clock of
+    /// the node that sequences it, or never, and answered `unavailable`
+    /// otherwise (§7.8).
     fn apply(
         &self,
         commit: &Commit,
@@ -215,19 +218,29 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     }
 
     /// Serves every stream a source opens on `connection`, each on its own
-    /// task, until the connection closes.
+    /// task, until the connection closes. The streams' tasks end with it:
+    /// nothing is read from a source, or applied for it, after its
+    /// connection is gone. A write already handed to its shard may still
+    /// be sequenced, which the `COMMIT`'s apply-by time bounds (§7.8).
     pub async fn serve_connection(&self, connection: PeerConnection) {
+        let mut streams = tokio::task::JoinSet::new();
         loop {
-            match connection.accept_stream().await {
+            let accepted = tokio::select! {
+                accepted = connection.accept_stream() => accepted,
+                // Reap the streams that ended, so the set stays small.
+                Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            };
+            match accepted {
                 Ok(stream) => {
                     let service = self.clone();
-                    tokio::spawn(async move {
+                    streams.spawn(async move {
                         if let Err(error) = service.serve(stream).await {
                             tracing::debug!(%error, "a peer stream ended with an error");
                         }
                     });
                 }
                 Err(StreamError::ZeroRtt) => {}
+                // Dropping the set aborts the streams still being served.
                 Err(_) => return,
             }
         }

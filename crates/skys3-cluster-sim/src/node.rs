@@ -58,7 +58,8 @@ use crate::cluster::HotCaches;
 use crate::faults::Fault;
 use crate::lifecycle::{self, Lifecycle};
 use crate::origin::{Origin, OriginBug};
-use crate::peer::Peer;
+use crate::peer::{self, Peer, PeerSide};
+use crate::peer_s3::{PeerS3, SimStore};
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -195,6 +196,8 @@ pub(crate) struct NodeSettings {
     /// The SkyS3 peer the buckets flush to over the native protocol, if
     /// any.
     pub peer: Option<Peer>,
+    /// What the nodes know of the peer, if any.
+    pub peer_side: Option<PeerSide>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -517,32 +520,43 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
 }
 
 /// The node's flushers: every `write_back` bucket flushes to `remote`, the
-/// harness's one remote store, whatever its target names; bucket prefixes
-/// keep their keys apart. Their capability probes take nonces from `seed`,
-/// so that a seed replays the scratch keys they write, which a parallel
-/// import's split points see.
+/// harness's one remote store, whatever its target names, but for a target
+/// at the SkyS3 peer, which they reach over S3 REST through its gateway;
+/// bucket prefixes keep their keys apart. Their capability probes take
+/// nonces from `seed`, so that a seed replays the scratch keys they write,
+/// which a parallel import's split points see.
 fn flush_service(
     settings: &NodeSettings,
     remote: &SimS3,
     seed: u64,
-) -> FlushService<SimS3, SimMount> {
+) -> FlushService<SimStore, SimMount> {
     let (remote, origin) = (remote.clone(), remote.clone());
+    let at_peer = settings
+        .peer_side
+        .as_ref()
+        .map(|side| PeerS3::new(peer::BUCKET, Arc::clone(&side.log)));
     let service = FlushService::new(
         settings.cluster.clone(),
         settings.flush.clone(),
-        Box::new(move |_| remote.clone()),
+        Box::new(move |target| match &at_peer {
+            Some(at_peer) if target.endpoint == peer::ENDPOINT => SimStore::Peer(at_peer.clone()),
+            _ => SimStore::Remote(remote.clone()),
+        }),
         FlushMetrics::register(&MetricsRegistry::new()),
     )
     // An origin is the remote store, read with the bucket's credentials.
     .with_origin_connect(Box::new(move |_, profile| {
-        origin.with_credentials(profile.unwrap_or(skys3_flush::DEFAULT_CREDENTIALS))
+        SimStore::Remote(
+            origin.with_credentials(profile.unwrap_or(skys3_flush::DEFAULT_CREDENTIALS)),
+        )
     }))
     .with_wall_clock(Arc::new(SimWallClock))
     .with_buckets(settings.buckets.clone())
     .with_probe_nonces(seed);
-    match settings.peer {
-        Some(peer) => service.with_peer_transport(peer.transport()),
-        None => service,
+    match (settings.peer, &settings.peer_side) {
+        (Some(peer), Some(side)) => service
+            .with_peer_transport(peer.transport(side.verifier.clone(), Arc::clone(&side.log))),
+        _ => service,
     }
 }
 
@@ -552,7 +566,7 @@ fn flush_service(
 /// each bucket's `clean_copies`, as the node binary does (§7.1, §8.9,
 /// §9.3); with `evict_local`, a seeded bug, the `local` buckets' too.
 async fn follow_flushes(
-    flush: &FlushService<SimS3, SimMount>,
+    flush: &FlushService<SimStore, SimMount>,
     snapshots: Option<&SnapshotService<SimS3, SimMount>>,
     gateway: &Gateway<TrustAll>,
     shards: &LocalShards<SimMount>,
@@ -593,7 +607,7 @@ fn install_clean_copies(
 #[derive(Debug)]
 struct SimFills {
     shards: LocalShards<SimMount>,
-    flush: Arc<FlushService<SimS3, SimMount>>,
+    flush: Arc<FlushService<SimStore, SimMount>>,
 }
 
 impl Fills for SimFills {

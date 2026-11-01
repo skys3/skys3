@@ -58,6 +58,7 @@ use skys3_types::{BucketDocument, BucketMode, ClusterId, WriteIdentity};
 
 use crate::backup::Flushers;
 use crate::cluster::{remote_prefix, written};
+use crate::peer_s3::SimStore;
 use crate::workload::{Client, Routes, Workload, etag_of};
 
 /// The conflict policy of the `write_back` buckets, the out-of-band
@@ -425,7 +426,7 @@ impl Final {
 }
 
 /// The live flush services.
-fn live(flushers: &Flushers) -> Vec<Arc<FlushService<SimS3, SimMount>>> {
+fn live(flushers: &Flushers) -> Vec<Arc<FlushService<SimStore, SimMount>>> {
     flushers
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
