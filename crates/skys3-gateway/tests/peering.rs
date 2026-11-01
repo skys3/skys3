@@ -572,7 +572,7 @@ async fn a_commit_replayed_after_a_primary_change_returns_the_stored_result() {
     let shards = MemoryShards::open_as(shards.disk().clone(), node.clone())
         .await
         .unwrap();
-    let mut epoch_two: ShardConfig = shards.local().config(&shard, &archive);
+    let mut epoch_two: ShardConfig = shards.local().config(&shard);
     epoch_two.epoch = Epoch::new(2);
     epoch_two.primary = node.clone();
     epoch_two.members = vec![node.clone()];
