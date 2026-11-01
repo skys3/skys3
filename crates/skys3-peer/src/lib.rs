@@ -154,8 +154,8 @@ pub use pool::{
 pub use ranges::ByteRanges;
 pub use staging::{Admitted, SWEEP_INTERVAL, StagedObject, Staging, StagingLimits};
 pub use stream::{
-    InboundSender, InboundStream, MessageReceiver, MessageSender, MessageStream, STREAM_REFUSED,
-    StreamError,
+    Inbound, InboundSender, InboundStream, MessageReceiver, MessageSender, MessageStream, Outbound,
+    STREAM_REFUSED, StreamError,
 };
 pub use tls::{ALPN, PeerTls};
 pub use trust::{PeerTrust, TrustError, Unauthorized};

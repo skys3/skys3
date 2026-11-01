@@ -103,6 +103,11 @@
 //!   and lost answers on every multipart step, and dropped links, with
 //!   every remote object audited as it appears: never partial, and with
 //!   the ETag its version must have; seeded bugs are caught.
+//! - [`peer`]: `write_back` buckets and backups flushed to a SkyS3 peer
+//!   over the native protocol, under cut and held links, takeovers, and
+//!   restarts of the peer: no key recorded flushed and no write-through
+//!   write acknowledged before the peer applied it, and every committed
+//!   change applied there once, with seeded bugs caught.
 //! - [`origin`]: `read_only` buckets over an origin that an out-of-band
 //!   writer changes while clients read through every node: every answer is
 //!   one the origin gave, as the reader's credentials see it, within the
@@ -146,6 +151,7 @@ mod learners;
 mod leases;
 mod lifecycle;
 mod origin;
+mod peer;
 mod reads;
 mod rebalancing;
 mod rebuild;

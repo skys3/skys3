@@ -3,6 +3,8 @@
 
 #![allow(dead_code, reason = "each test target uses part of the support")]
 
+pub mod peer;
+
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;

@@ -44,6 +44,7 @@ use crate::node::{
     Shared, TRANSPORT_PORT,
 };
 use crate::origin::{self, Origin, OriginAudit, OriginLog, OriginRoutes};
+use crate::peer::{self, Destination, Peer, PeerAudit};
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
@@ -167,6 +168,10 @@ pub struct ClusterConfig {
     /// audit of what every copy's flush left there ([`Copies`]). `None` by
     /// default.
     pub copies: Option<Copies>,
+    /// A SkyS3 peer that the `write_back` buckets and the `local` buckets'
+    /// backups flush to over the native protocol, instead of the remote
+    /// store, and its audits ([`Peer`]). `None` by default.
+    pub peer: Option<Peer>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -244,6 +249,7 @@ impl Default for ClusterConfig {
             conflicts: None,
             large_objects: None,
             copies: None,
+            peer: None,
         }
     }
 }
@@ -355,6 +361,8 @@ pub struct Report {
     /// What the copier did and the audit of its copies found
     /// ([`ClusterConfig::copies`]).
     pub copies: CopyAudit,
+    /// What the audits of the SkyS3 peer found ([`ClusterConfig::peer`]).
+    pub peer: PeerAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -655,6 +663,13 @@ impl<S: NodeServices> Cluster<S> {
         skys3_flush::test_hooks::seed_copy_bug(
             self.config.copies.map_or_else(Default::default, |c| c.bug),
         );
+        skys3_flush::test_hooks::seed_peer_bug(
+            self.config.peer.map_or_else(Default::default, |p| p.bug),
+        );
+        match &world.destination {
+            Some(destination) => destination.observe(),
+            None => skys3_flush::test_hooks::observe_flushed(None),
+        }
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
@@ -681,6 +696,23 @@ impl<S: NodeServices> Cluster<S> {
                 }
             });
         }
+        if let Some(destination) = &world.destination {
+            let destination = Arc::clone(destination);
+            sim.host(peer::HOST, move || {
+                let destination = Arc::clone(&destination);
+                async move {
+                    if let Err(error) = peer::run(destination).await {
+                        tracing::warn!(%error, "the peer stopped");
+                    }
+                    Ok(())
+                }
+            });
+        }
+        if let Some(peer) = self.config.peer {
+            for slot in &world.slots {
+                sim.set_link_latency(slot.host.as_str(), peer::HOST, peer.latency);
+            }
+        }
         let joining = self.config.nodes.saturating_sub(self.config.joining).max(1);
         let mut down = vec![None; world.slots.len()];
         for (index, slot) in world.slots.iter().enumerate().skip(joining) {
@@ -704,6 +736,7 @@ impl<S: NodeServices> Cluster<S> {
             rebuilds: Vec::new(),
             failure: None,
             audit: None,
+            peer_down: None,
             large: None,
             drill: self.config.snapshots.map(|config| {
                 let mut rng = SmallRng::seed_from_u64(context.fork_seed());
@@ -743,7 +776,7 @@ impl<S: NodeServices> Cluster<S> {
         let (write_through, backup) = (self.config.write_through, self.config.backup);
         driver.audit = (write_through.audited() || backup.audited_at_ack()).then(|| {
             RemoteAudit::new(
-                world.remote.clone(),
+                world.lookup(),
                 &routes,
                 workload.keys,
                 history.clone(),
@@ -884,11 +917,19 @@ impl<S: NodeServices> Cluster<S> {
         // Every committed change of a `local` bucket reaches its backup:
         // wait until the flushers have sent everything.
         let drained = Arc::new(AtomicBool::new(false));
-        if self.config.backup.enabled() {
-            let (flushers, routes) = (Arc::clone(&world.shared.flushers), routes.clone());
+        if self.config.backup.enabled() || self.config.peer.is_some() {
+            let flushers = Arc::clone(&world.shared.flushers);
+            // With a peer, the `write_back` buckets flush to it too.
+            let peer = self.config.peer.is_some();
+            let buckets = routes
+                .buckets
+                .iter()
+                .filter(|bucket| bucket.mode == BucketMode::Local || peer)
+                .cloned()
+                .collect();
             let done = Arc::clone(&drained);
             sim.client("backup-drain", async move {
-                let drained = backup::drain(flushers, routes, BACKUP_DRAIN_LIMIT).await;
+                let drained = backup::drain(flushers, buckets, BACKUP_DRAIN_LIMIT).await;
                 done.store(drained, Ordering::SeqCst);
                 Ok(())
             });
@@ -956,6 +997,24 @@ impl<S: NodeServices> Cluster<S> {
             slot.stop_disks(true);
             sim.crash(slot.host.as_str());
         }
+        let (at_peer, peer_audit) = match &world.destination {
+            Some(destination) => {
+                destination.stop(true);
+                sim.crash(peer::HOST);
+                let finished = destination.finish()?.map_err(RunError::Check)?;
+                (Some(finished.objects), finished.audit)
+            }
+            None => (None, PeerAudit::default()),
+        };
+        // What the targets hold at the end: the peer's objects, or the
+        // remote store's.
+        let held = |key: &str| match &at_peer {
+            Some(objects) => objects.get(key).cloned(),
+            None => world
+                .remote
+                .object(key)
+                .map(|object| written(&object.body, &object.info.etag)),
+        };
         let operations = history.operations();
         let lifecycle = match &self.config.lifecycle {
             Some(lifecycle) => {
@@ -966,7 +1025,7 @@ impl<S: NodeServices> Cluster<S> {
             }
             None => LifecycleAudit::default(),
         };
-        let (survivors, evicted) = world.survivors(&routes, workload.keys)?;
+        let (survivors, evicted) = world.survivors(&routes, workload.keys, &held)?;
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
         if self.config.every_member_durable {
@@ -991,9 +1050,17 @@ impl<S: NodeServices> Cluster<S> {
         }
         // Once the flushers are idle, the backup holds what the members
         // hold (§8.9).
-        let backed_up = if self.config.backup.enabled() {
+        let peer = self.config.peer.is_some();
+        let backed_up = if self.config.backup.enabled() || peer {
+            // With a peer, the `write_back` buckets' targets too.
+            let prefix = |bucket: &BucketDocument| match bucket.mode {
+                BucketMode::Local if self.config.backup.enabled() => backup::backup_prefix(bucket),
+                BucketMode::WriteBack if peer => write_back_prefix(bucket),
+                _ => None,
+            };
             backup::audit(
-                &world.remote,
+                &held,
+                prefix,
                 &routes,
                 workload.keys,
                 &survivors,
@@ -1066,6 +1133,7 @@ impl<S: NodeServices> Cluster<S> {
             conflicts,
             large_objects,
             copies,
+            peer: peer_audit,
             history: operations,
             faults: driver.faults,
             lives: world.slots.iter().map(|slot| slot.lives()).sum(),
@@ -1202,6 +1270,8 @@ struct World<S> {
     /// The `read_only` buckets of [`ClusterConfig::origin`], which the
     /// workload's clients leave alone.
     origin_buckets: Vec<BucketDocument>,
+    /// The SkyS3 peer of [`ClusterConfig::peer`].
+    destination: Option<Arc<Destination>>,
 }
 
 impl<S: NodeServices> World<S> {
@@ -1279,6 +1349,20 @@ impl<S: NodeServices> World<S> {
                 seed,
             )));
         }
+        let destination = config
+            .peer
+            .map(|peer| {
+                Destination::new(
+                    context.disk_with_faults(config.disk_faults.clone()),
+                    &cluster,
+                    peer,
+                    settings.log.clone(),
+                    node::index_config(&settings),
+                    settings.checkpoint_interval,
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
         let peers = node_ids
             .iter()
             .map(|id| Ok((id.clone(), format!("{id}:{TRANSPORT_PORT}").parse()?)))
@@ -1314,7 +1398,27 @@ impl<S: NodeServices> World<S> {
             rates: config.control_rates,
             remote,
             origin_buckets,
+            destination,
         })
+    }
+
+    /// What a target holds for a key, as audits during the run read it:
+    /// the peer's object, or the remote store's.
+    fn lookup(&self) -> write_through::Lookup {
+        match &self.destination {
+            Some(destination) => {
+                let destination = Arc::clone(destination);
+                Arc::new(move |key: &str| destination.value(key))
+            }
+            None => {
+                let remote = self.remote.clone();
+                Arc::new(move |key: &str| {
+                    remote
+                        .object(key)
+                        .map(|object| written(&object.body, &object.info.etag))
+                })
+            }
+        }
     }
 
     /// The routes to the `planned` buckets as the gateways created them,
@@ -1411,6 +1515,7 @@ impl<S: NodeServices> World<S> {
         &self,
         routes: &Routes,
         keys: usize,
+        held: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(BTreeMap<String, Survivors>, usize), BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -1497,8 +1602,7 @@ impl<S: NodeServices> World<S> {
             }
             if write_back {
                 let remote_key = format!("{}{key}", remote_prefix(&bucket));
-                let object = self.remote.object(&remote_key);
-                survivor.flushed = Some(object.map(|o| written(&o.body, &o.info.etag)));
+                survivor.flushed = Some(held(&remote_key));
             }
             survivors.insert(name, survivor);
         }
@@ -1727,10 +1831,16 @@ impl<S: NodeServices> World<S> {
 /// a body deadline of half the compaction TTL (§10.3).
 fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, BoxError> {
     // Buckets the gateways create get the shape's shards and replicas.
+    // With a peer, every target is flushed to over the native protocol.
     let defaults = format!(
-        "[buckets.defaults]\nshards_per_bucket = {}\nreplicas = {}\nmin_write_replicas = 1\n",
+        "[buckets.defaults]\nshards_per_bucket = {}\nreplicas = {}\nmin_write_replicas = 1\n{}",
         shape.shards_per_bucket,
         shape.replicas.clamp(1, shape.nodes.max(1)),
+        if shape.peer.is_some() {
+            "target_transport = \"native\"\n"
+        } else {
+            ""
+        },
     );
     let ack_policy = if shape.write_through.waits() {
         "write_through"
@@ -1754,9 +1864,11 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         .map(|conflicts| conflicts.configuration(write_back.iter().map(String::as_str)))
         .unwrap_or_default();
     let parse = |gateway: bool| -> Result<skys3_config::Config, BoxError> {
-        let backups = shape
-            .backup
-            .tables(local.iter().map(String::as_str), gateway);
+        let backups = shape.backup.tables(
+            local.iter().map(String::as_str),
+            gateway,
+            shape.peer.is_some(),
+        );
         let origin = shape
             .origin
             .as_ref()
@@ -1839,6 +1951,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         evict_local: shape.backup.evicts_local(),
         snapshots: shape.snapshots.is_some(),
         origin: shape.origin.clone(),
+        peer: shape.peer,
     })
 }
 
@@ -1877,9 +1990,13 @@ fn registers(
         } else if b < local_buckets {
             (BucketMode::Local, None)
         } else {
+            let (endpoint, remote) = match config.peer {
+                Some(_) => (peer::ENDPOINT, peer::BUCKET),
+                None => ("https://remote.sim.internal", "remote"),
+            };
             let target = RemoteTarget {
-                endpoint: "https://remote.sim.internal".to_owned(),
-                bucket: "remote".to_owned(),
+                endpoint: endpoint.to_owned(),
+                bucket: remote.to_owned(),
                 prefix: Some(format!("{name}/")),
             };
             (BucketMode::WriteBack, Some(target))
@@ -1993,6 +2110,8 @@ struct Driver<'a, S> {
     failure: Option<String>,
     /// The audit of write-through acknowledgements, once the clients run.
     audit: Option<RemoteAudit>,
+    /// When the SkyS3 peer restarts, while it is down.
+    peer_down: Option<Duration>,
     /// The audit of large objects, which also aims crashes at the steps
     /// of multipart uploads, once the clients run.
     large: Option<Versions>,
@@ -2011,6 +2130,10 @@ impl<S: NodeServices> Driver<'_, S> {
         if let Some(violation) = self.large.as_ref().and_then(Versions::violation) {
             return Err(RunError::Check(violation));
         }
+        let destination = self.world.destination.as_ref();
+        if let Some(violation) = destination.and_then(|d| d.violation()) {
+            return Err(RunError::Check(violation));
+        }
         match self.failure.take() {
             Some(failure) => Err(RunError::Simulation(failure)),
             None => Ok(()),
@@ -2021,6 +2144,7 @@ impl<S: NodeServices> Driver<'_, S> {
         match endpoint {
             Endpoint::Node(index) => self.world.slots[index].host.clone(),
             Endpoint::Client(index) => client_host(index),
+            Endpoint::Peer => peer::HOST.to_owned(),
         }
     }
 
@@ -2077,6 +2201,21 @@ impl<S: NodeServices> Driver<'_, S> {
                 // them now.
                 self.cut[index] = true;
                 self.crash(sim, now, index, true, CUT_DOWNTIME);
+            }
+        }
+        if let Some(destination) = &self.world.destination {
+            match self.peer_down {
+                Some(at) if heal_all || at <= now => {
+                    self.peer_down = None;
+                    sim.bounce(peer::HOST);
+                }
+                Some(_) => {}
+                None if !sim.is_host_running(peer::HOST) => {
+                    // The peer stopped by itself: a supervisor restarts it.
+                    destination.stop(true);
+                    self.peer_down = Some(now + SUPERVISOR_DELAY);
+                }
+                None => {}
             }
         }
         for index in 0..self.world.slots.len() {
@@ -2151,6 +2290,18 @@ impl<S: NodeServices> Driver<'_, S> {
                 let life = self.life[node];
                 self.heals
                     .push((now + FENCE_DELAY, Heal::Fence { node, life }));
+            }
+            Fault::PeerRestart {
+                power_loss,
+                downtime,
+            } => {
+                if let Some(destination) = &self.world.destination
+                    && self.peer_down.is_none()
+                {
+                    destination.stop(power_loss);
+                    sim.crash(peer::HOST);
+                    self.peer_down = Some(now + downtime);
+                }
             }
             Fault::RemoteLink { node, .. } => {
                 let host = &self.world.slots[node].host;

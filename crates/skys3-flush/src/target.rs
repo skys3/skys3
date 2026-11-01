@@ -18,6 +18,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::concurrency::{ConcurrencyBug, ConcurrencyStatus, Membership, Paced, Window, hooks};
 use crate::metrics::Counters;
+use crate::peer::{Native, PeerLink};
 
 /// The most abandoned remote uploads a target keeps to abort; beyond it,
 /// they are left to the remote bucket's lifecycle rule (§7.3).
@@ -216,6 +217,9 @@ pub struct Target<S> {
     inflight_bytes: AtomicU64,
     /// Remote multipart uploads that flushes left open, oldest first.
     orphans: Mutex<Orphans>,
+    /// For a SkyS3 peer reached over the native protocol (§7.8), how; its
+    /// flushes then send no S3 request.
+    pub(crate) native: Option<Native>,
 }
 
 impl<S> fmt::Debug for Target<S> {
@@ -268,7 +272,35 @@ impl<S> Target<S> {
             inflight_kib,
             inflight_bytes: AtomicU64::new(0),
             orphans: Mutex::default(),
+            native: None,
         }
+    }
+
+    /// Flushes to a SkyS3 peer over the native protocol (§7.8) instead of
+    /// the store: `COMMIT`s reach the destination bucket `bucket` through
+    /// `link`, large objects staged in `DATA` frames of `frame_bytes`
+    /// (`peer_frame_bytes`), and each stream must make progress within
+    /// `timeout`. Starts the target's batcher on the current Tokio runtime.
+    #[must_use]
+    pub fn with_peer(
+        mut self,
+        link: Arc<dyn PeerLink>,
+        bucket: skys3_types::BucketName,
+        frame_bytes: u64,
+        timeout: Duration,
+    ) -> Self {
+        self.native = Some(Native::new(link, bucket, frame_bytes, timeout));
+        self
+    }
+
+    /// Whether the target is a SkyS3 peer reached over the native protocol.
+    pub fn is_native(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub(crate) fn with_native(mut self, native: Option<Native>) -> Self {
+        self.native = native;
+        self
     }
 
     /// Sets how far the bucket's import has got.
