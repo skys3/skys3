@@ -793,6 +793,9 @@ pub struct RemoteObject {
     pub object: ObjectVersion,
     /// The remote version ID, on a versioned remote.
     pub version_id: Option<String>,
+    /// The `Last-Modified` the remote sent, if it sent one. Without it,
+    /// `object` carries when the remote was asked instead.
+    pub last_modified_ms: Option<u64>,
 }
 
 impl<S: ObjectStore> RemoteReader<S> {
@@ -927,6 +930,7 @@ impl<S: ObjectStore> RemoteReader<S> {
                 coded: None,
             },
             version_id: info.version_id.map(|id| id.0),
+            last_modified_ms: info.last_modified_ms,
         }
     }
 }

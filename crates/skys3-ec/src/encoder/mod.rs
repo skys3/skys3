@@ -611,41 +611,54 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
     ) -> Result<Encoded, EncodeError> {
         let body = RecordBody::EcPublish(publish_record);
         let appended = || self.emit(key, attempt, EncodeStep::Appended);
-        let committed = match publish(&self.shard, &self.attempts, attempt, body, appended).await {
-            Publication::Committed(committed) => committed,
-            Publication::Abandoned => {
-                self.emit(key, attempt, EncodeStep::Abandoned);
-                return Err(EncodeError::Abandoned(attempt));
-            }
-            Publication::NotAppended(error) => {
-                self.emit(key, attempt, EncodeStep::Abandoned);
-                return Err(EncodeError::Publish(error));
-            }
-            Publication::Unconfirmed(error) => return Err(EncodeError::Publish(error)),
+        // The outcome is reported on the commit's task, even if this future
+        // is dropped.
+        let (observer, owned) = (self.observer.clone(), key.to_owned());
+        let settled = move |publication: &Publication| {
+            let step = match publication {
+                Publication::Committed(committed) => EncodeStep::Committed {
+                    position: committed.position,
+                    published: committed.outcome == Outcome::Applied(Effect::Published),
+                },
+                Publication::Abandoned | Publication::NotAppended(_) => EncodeStep::Abandoned,
+                Publication::Unconfirmed(_) => return,
+            };
+            emit(observer.as_ref(), &owned, attempt, step);
         };
-        let published = committed.outcome == Outcome::Applied(Effect::Published);
-        self.emit(
-            key,
+        match publish(
+            &self.shard,
+            &self.attempts,
             attempt,
-            EncodeStep::Committed {
-                position: committed.position,
-                published,
-            },
-        );
-        Ok(match committed.outcome {
-            Outcome::Rejected(rejection) => Encoded::Rejected(rejection),
-            _ => Encoded::Published(committed.position),
-        })
+            body,
+            appended,
+            settled,
+        )
+        .await
+        {
+            Publication::Committed(committed) => Ok(match committed.outcome {
+                Outcome::Rejected(rejection) => Encoded::Rejected(rejection),
+                _ => Encoded::Published(committed.position),
+            }),
+            Publication::Abandoned => Err(EncodeError::Abandoned(attempt)),
+            Publication::NotAppended(error) | Publication::Unconfirmed(error) => {
+                Err(EncodeError::Publish(error))
+            }
+        }
     }
 
     fn emit(&self, key: &str, attempt: AttemptId, step: EncodeStep) {
-        if let Some(observer) = &self.observer {
-            observer(&EncodeEvent {
-                key: key.to_owned(),
-                attempt,
-                step,
-            });
-        }
+        emit(self.observer.as_ref(), key, attempt, step);
+    }
+}
+
+/// Reports `step` of `key`'s `attempt` to `observer`, if any.
+fn emit(observer: Option<&EncodeObserver>, key: &str, attempt: AttemptId, step: EncodeStep) {
+    if let Some(observer) = observer {
+        observer(&EncodeEvent {
+            key: key.to_owned(),
+            attempt,
+            step,
+        });
     }
 }
 
